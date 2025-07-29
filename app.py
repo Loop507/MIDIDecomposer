@@ -1,4 +1,4 @@
-# midi_decomposer_app.py - VERSIONE AGGIORNATA CON MIDI DENSITY TRANSFORMER IMPLEMENTATO
+# midi_decomposer_app.py - VERSIONE AGGIORNATA CON MIDI RANDOM PITCH TRANSFORMER
 
 import streamlit as st
 import mido
@@ -435,6 +435,31 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
         new_midi.tracks.append(new_track)
     return new_midi
 
+# --- NUOVA FUNZIONE: MIDI Random Pitch Transformer ---
+def midi_random_pitch_transformer(original_midi, random_pitch_strength):
+    """
+    Randomizes the pitch of notes based on a given strength (probability).
+    Each note has a 'random_pitch_strength' % chance of having its pitch completely randomized (0-127).
+    """
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+
+    for original_track in original_midi.tracks:
+        new_track = mido.MidiTrack()
+        for msg in original_track:
+            if msg.type == 'note_on' or msg.type == 'note_off':
+                if random.randint(0, 100) < random_pitch_strength:
+                    # Randomize pitch for this note
+                    new_pitch = random.randint(0, 127) # Full MIDI pitch range
+                    new_msg = msg.copy(note=new_pitch)
+                else:
+                    new_msg = msg.copy() # Keep original pitch
+            else:
+                new_msg = msg.copy() # Copy other messages as is
+            new_track.append(new_msg)
+        new_midi.tracks.append(new_track)
+    return new_midi
+
+
 # --- Sezione Upload File MIDI ---
 st.subheader("🎵 Carica il tuo file MIDI (.mid o .midi)")
 uploaded_midi_file = st.file_uploader(
@@ -465,7 +490,8 @@ if uploaded_midi_file is not None:
             "MIDI Note Remapper": "🎶 Remapping di Note (Verticale)",
             "MIDI Phrase Reconstructor": "🔄 Riorganizzazione Frasi (Orizzontale)",
             "MIDI Time Scrambler": "⏳ Manipolazione Ritmo/Durata (Orizzontale)",
-            "MIDI Density Transformer": "🎲 Controllo Densità (Armonia/Contrappunto)"
+            "MIDI Density Transformer": "🎲 Controllo Densità (Armonia/Contrappunto)",
+            "MIDI Random Pitch Transformer": "❓ Randomizzazione Totale Pitch (Caos)" # NUOVA OPZIONE
         }
 
         selected_midi_method = st.selectbox(
@@ -544,6 +570,12 @@ if uploaded_midi_file is not None:
                 ["Nessuna", "Riempi Accordo (Triadi)", "Aggiungi Contro-Melodia", "Droni"],
                 help="Come le nuove note verranno generate per influenzare la densità."
             )
+        
+        elif selected_midi_method == "MIDI Random Pitch Transformer": # NUOVI CONTROLLI
+            random_pitch_strength = st.slider(
+                "Forza Randomizzazione Pitch (%):", 0, 100, 100,
+                help="Probabilità che ogni nota (on/off) abbia il suo pitch completamente randomizzato (0-127)."
+            )
 
 
         if st.button("🎶 DECOMPONI MIDI", type="primary", use_container_width=True):
@@ -564,6 +596,10 @@ if uploaded_midi_file is not None:
                 elif selected_midi_method == "MIDI Density Transformer":
                     decomposed_midi_file = midi_density_transformer(
                         midi_data, add_note_probability, remove_note_probability, polyphony_mode
+                    )
+                elif selected_midi_method == "MIDI Random Pitch Transformer": # NUOVA CHIAMATA
+                    decomposed_midi_file = midi_random_pitch_transformer(
+                        midi_data, random_pitch_strength
                     )
 
                 if decomposed_midi_file:
@@ -667,9 +703,8 @@ else:
         * **⏳ MIDI Time Scrambler**: Modifica il timing e la durata delle note per creare nuovi groove.
             * _Parametri:_ Fattore di Stiramento/Compressione, Forza Quantizzazione, Quantità di Swing.
         * **🎲 MIDI Density Transformer**: Aggiunge o rimuove note per alterare la densità armonica.
+        * **❓ MIDI Random Pitch Transformer**: Randomizza completamente l'altezza di ogni nota (pitch) per un caos melodico.
         
-        Questi metodi sono progettati per fornirti strumenti per la **composizione algoritmica** e la manipolazione strutturale delle tue idee musicali MIDI!
-
         **Risoluzione Problemi:**
         
         - Assicurati che il file sia un MIDI valido (.mid o .midi)
