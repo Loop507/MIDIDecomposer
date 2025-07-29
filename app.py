@@ -1,4 +1,4 @@
-# midi_decomposer_app.py - VERSIONE AGGIORNATA CON CORREZIONE A-B-A e implementazione Dal Più Corto al Più Lungo
+# midi_decomposer_app.py - VERSIONE AGGIORNATA CON MIDI TIME SCRAMBLER IMPLEMENTATO
 
 import streamlit as st
 import mido
@@ -240,7 +240,11 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
             abs_time = event_data['abs_time']
             
             delta_time = abs_time - last_abs_time
-            new_track.append(msg.copy(time=delta_time))
+            if delta_time < 0: # Difensivo, non dovrebbe succedere se ordinato correttamente
+                delta_time = 0
+            
+            new_msg = msg.copy(time=delta_time)
+            new_track.append(new_msg)
             last_abs_time = abs_time
             
         new_midi.tracks.append(new_track)
@@ -250,11 +254,80 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
 def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, swing_amount):
     """
     Modifica il timing e la durata delle note MIDI.
-    (Logica da implementare)
+    - stretch_factor: Allunga o comprime il tempo complessivo.
+    - quantization_strength: Forza le note a "snappare" a una griglia ritmica (0-100%).
+    - swing_amount: Aggiunge un "groove" swing alle note (0-100%).
     """
-    st.info(f"Applico MIDI Time Scrambler con Stretch: {stretch_factor}, Quantizzazione: {quantization_strength}, Swing: {swing_amount}")
-    # Questa è una placeholder: restituisce il MIDI originale
-    return original_midi # Placeholder: restituisce l'originale
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    
+    # Define the base subdivision for quantization (e.g., 16th notes)
+    ticks_per_subdivision = original_midi.ticks_per_beat / 4 # By default, 16th notes are our grid
+    if original_midi.ticks_per_beat == 0 or ticks_per_subdivision == 0:
+        st.warning("Ticks per beat è zero o troppo basso per applicare Time Scrambler. Restituito il MIDI originale.")
+        return original_midi
+
+    for track_index, original_track in enumerate(original_midi.tracks):
+        new_track = mido.MidiTrack()
+        events_with_abs_time = []
+        current_abs_time_stretched = 0
+
+        # Step 1: Accumulate absolute times, applying stretch factor to delta times
+        for msg in original_track:
+            stretched_delta_time = int(round(msg.time * stretch_factor))
+            current_abs_time_stretched += stretched_delta_time
+            # Store a copy of the message and its stretched absolute time
+            events_with_abs_time.append({'msg': msg.copy(), 'abs_time_mod': current_abs_time_stretched})
+
+        # Step 2: Apply Quantization and Swing to the modified absolute times
+        if quantization_strength > 0:
+            for event_data in events_with_abs_time:
+                msg = event_data['msg']
+                abs_time_before_quant = event_data['abs_time_mod']
+
+                # Only apply quantization/swing to note-related messages
+                if msg.type == 'note_on' or msg.type == 'note_off':
+                    # Calculate the nearest grid point for quantization
+                    snapped_abs_time = round(abs_time_before_quant / ticks_per_subdivision) * ticks_per_subdivision
+
+                    # Apply Swing if active (for 'off-beat' subdivisions)
+                    if swing_amount > 0:
+                        # Determine which subdivision this snapped time falls into
+                        # e.g., for 16th notes (4 per beat), subdivision_index 0, 1, 2, 3 per beat
+                        subdivision_index_in_beat = int(round((snapped_abs_time % original_midi.ticks_per_beat) / ticks_per_subdivision))
+                        
+                        # Swing typically shifts the "even" (or "off") subdivisions
+                        # For a 16th note grid, this affects subdivision_index 1 and 3 within a beat (0-indexed)
+                        if subdivision_index_in_beat % 2 == 1: # If it's the 2nd or 4th 16th note of a beat
+                            # Swing shift amount: percentage of half a subdivision
+                            swing_shift_ticks = (ticks_per_subdivision / 2) * (swing_amount / 100.0)
+                            snapped_abs_time += swing_shift_ticks
+                            
+                    # Apply quantization strength: interpolate between original (stretched) and snapped time
+                    quant_factor = quantization_strength / 100.0
+                    event_data['abs_time_mod'] = int(round(abs_time_before_quant * (1 - quant_factor) + snapped_abs_time * quant_factor))
+                    
+                    # Ensure absolute time is non-negative
+                    event_data['abs_time_mod'] = max(0, event_data['abs_time_mod'])
+        
+        # Step 3: Sort events by their new absolute times and rebuild the track with new delta times
+        events_with_abs_time.sort(key=lambda x: x['abs_time_mod'])
+
+        last_abs_time_mod = 0
+        for event_data in events_with_abs_time:
+            msg = event_data['msg']
+            abs_time_mod = event_data['abs_time_mod']
+
+            delta_time = abs_time_mod - last_abs_time_mod
+            if delta_time < 0: # Defensive check, should not happen after sort and max(0)
+                delta_time = 0 
+            
+            # Append the original message type, but with the new delta time
+            new_msg = msg.copy(time=delta_time)
+            new_track.append(new_msg)
+            last_abs_time_mod = abs_time_mod
+
+        new_midi.tracks.append(new_track)
+    return new_midi
 
 def midi_density_transformer(original_midi, add_note_probability, remove_note_probability, polyphony_mode):
     """
@@ -353,11 +426,11 @@ if uploaded_midi_file is not None:
             )
             quantization_strength = st.slider(
                 "Forza Quantizzazione (0=libero, 100=rigido):", 0, 100, 50,
-                help="Quanto le note verranno 'allineate' a una griglia ritmica."
+                help="Quanto le note verranno 'allineate' a una griglia ritmica (es. a 16esimi)."
             )
             swing_amount = st.slider(
                 "Quantità di Swing (%):", 0, 100, 0,
-                help="Aggiunge un 'groove' swing al ritmo (se la quantizzazione è attiva)."
+                help="Aggiunge un 'groove' swing ritardando alcune suddivisioni (solo con quantizzazione attiva)."
             )
 
         elif selected_midi_method == "MIDI Density Transformer":
@@ -495,6 +568,7 @@ else:
         * **🔄 MIDI Phrase Reconstructor**: Riorganizza e ricompone blocchi o "frasi" musicali (orizzontale).
             * _Parametri:_ Lunghezza Frase (battute), Stile Riorganizzazione Frasi (Casuale, Inversione, Ciclico A-B-A, Dal Più Corto al Più Lungo).
         * **⏳ MIDI Time Scrambler**: Modifica il timing e la durata delle note per creare nuovi groove.
+            * _Parametri:_ Fattore di Stiramento/Compressione, Forza Quantizzazione, Quantità di Swing.
         * **🎲 MIDI Density Transformer**: Aggiunge o rimuove note per alterare la densità armonica.
         
         Questi metodi sono progettati per fornirti strumenti per la **composizione algoritmica** e la manipolazione strutturale delle tue idee musicali MIDI!
