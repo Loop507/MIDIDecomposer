@@ -1,4 +1,4 @@
-# midi_decomposer_app.py - VERSIONE AGGIORNATA CON MIDI PHRASE RECONSTRUCTOR
+# midi_decomposer_app.py - VERSIONE AGGIORNATA CON CORREZIONE mido.tempo2bpm
 
 import streamlit as st
 import mido
@@ -135,12 +135,9 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
     for track in original_midi.tracks:
         for msg in track:
             if msg.type == 'set_tempo':
-                tempo_bpm = mido.tempo_to_bpm(msg.tempo)
+                # CORREZIONE QUI: mido.tempo_to_bpm -> mido.tempo2bpm
+                tempo_bpm = mido.tempo2bpm(msg.tempo)
                 break # Prendiamo il primo, o l'ultimo per semplicità
-    
-    # Calcola ticks per beat dal tempo_bpm e ticks_per_beat del file
-    # beats_per_second = tempo_bpm / 60
-    # ticks_per_second = beats_per_second * original_midi.ticks_per_beat
     
     ticks_per_phrase = original_midi.ticks_per_beat * phrase_length_beats
 
@@ -216,97 +213,35 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
             reorganized_phrases = list(phrases) # Fallback
 
         new_track = mido.MidiTrack()
-        last_message_abs_time = 0 # Usato per calcolare i delta time
-        
-        # Ri-assembla la nuova traccia con delta times corretti
-        for phrase in reorganized_phrases:
-            if not phrase:
-                continue
-
-            # Calcola l'offset per questa frase
-            phrase_start_abs_time = phrase[0].time if phrase else 0 # Il primo time è già un delta relativo all'inizio del phrase
-            
-            # Appendi i messaggi della frase, ricalcolando i delta time
-            for msg_idx, msg in enumerate(phrase):
-                # Se è il primo messaggio della frase o se il messaggio precedente era già aggiunto
-                # il suo time è un delta dal precedente. Dobbiamo assicurare che il primo messaggio
-                # della frase sia relativo al 'last_message_abs_time' della traccia risultante.
-                
-                # Converti il tempo relativo del messaggio in tempo assoluto all'interno della sua frase originale
-                # Questo è un punto critico: mido.Message.time è un delta.
-                # Per riassemblare, abbiamo bisogno del tempo assoluto originale all'interno della frase
-                # per poi ricalcolare i delta per la nuova sequenza.
-
-                # Il modo più semplice è trattare il primo messaggio della frase come time=0
-                # e poi riassemblare i delta successivi, e infine fare un grande delta
-                # tra la fine della frase precedente e l'inizio di questa.
-
-                # Per riassemblare, creiamo una traccia temporanea per ogni frase per normalizzare i delta
-                temp_phrase_track = mido.MidiTrack()
-                for m in phrase:
-                    temp_phrase_track.append(m.copy()) # Usa copy() per non modificare gli originali
-                
-                # Ora che i delta sono normalizzati all'inizio della frase
-                # possiamo calcolare il tempo assoluto relativo alla *nuova* posizione
-
-                # Ottieni i messaggi normalizzati (con tempo 0 all'inizio della frase)
-                normalized_messages = []
-                current_delta = 0
-                for m in temp_phrase_track:
-                    current_delta += m.time
-                    normalized_messages.append({'msg': m.copy(), 'abs_time_in_phrase': current_delta})
-                
-                # Aggiungi alla nuova traccia
-                if normalized_messages:
-                    first_msg = normalized_messages[0]['msg']
-                    first_msg_time = normalized_messages[0]['abs_time_in_phrase'] # Questo dovrebbe essere 0
-                    
-                    # Calcola il delta dal messaggio precedente nella nuova traccia
-                    delta_to_add = first_msg_time - last_message_abs_time
-                    
-                    # Se non è il primo messaggio della traccia riorganizzata
-                    if new_track:
-                        # Il delta del primo messaggio della frase deve essere rispetto all'ultimo messaggio della traccia
-                        new_msg_with_delta = first_msg.copy(time=first_msg.time) # Mantiene il suo delta originale
-                        new_track.append(new_msg_with_delta)
-                        
-                        # Aggiorna il last_message_abs_time in base al delta appena aggiunto
-                        last_message_abs_time += first_msg.time
-                    else:
-                        # Se è il primo messaggio in assoluto della nuova traccia, il suo time rimane 0
-                        new_track.append(first_msg.copy(time=first_msg.time))
-                        last_message_abs_time = first_msg.time # Inizializza
-                        
-                    # Aggiungi i messaggi rimanenti della frase
-                    for j in range(1, len(normalized_messages)):
-                        msg = normalized_messages[j]['msg']
-                        new_track.append(msg.copy())
-                        last_message_abs_time += msg.time # Questo è già un delta time valido
-        
-        # Una soluzione più robusta per riassemblare i delta time:
-        # Ricostruire una traccia temporanea per ogni frase, poi concatenarle
-        # e infine ricalcolare i delta time per tutta la traccia.
-        
-        reconstructed_events_flat = []
-        for phrase in reorganized_phrases:
-            current_abs_time_in_phrase = 0
-            for msg in phrase:
-                current_abs_time_in_phrase += msg.time
-                reconstructed_events_flat.append({'msg': msg.copy(), 'abs_time_track': current_abs_time_in_phrase})
-        
-        new_track_final = mido.MidiTrack()
         current_tick = 0
-        for event_data in reconstructed_events_flat:
-            msg = event_data['msg']
-            abs_time = event_data['abs_time_track']
-            
-            # Calcola il delta time rispetto all'evento precedente
-            delta_time = abs_time - current_tick
-            current_tick = abs_time
-            
-            new_track_final.append(msg.copy(time=delta_time)) # Appendi il messaggio con il delta ricalcolato
         
-        new_midi.tracks.append(new_track_final)
+        # Ricalcola i delta time per la nuova traccia
+        # Unisci tutti gli eventi delle frasi riorganizzate in una lista piatta di (messaggio, tempo_assoluto_nella_nuova_sequenza)
+        # Questo è il modo più affidabile per ricostruire i delta time
+        
+        flat_events_for_reconstruction = []
+        absolute_time_in_reorganized_seq = 0
+        
+        for phrase_block in reorganized_phrases:
+            for msg_in_phrase in phrase_block:
+                # Il msg.time qui è il delta rispetto al messaggio precedente all'interno della sua frase originale.
+                # Per ricostruire una sequenza piatta, sommiamo i delta per ottenere il tempo assoluto
+                # all'interno della sequenza riorganizzata.
+                absolute_time_in_reorganized_seq += msg_in_phrase.time
+                flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': absolute_time_in_reorganized_seq})
+
+        # Ora che abbiamo tutti i messaggi con i loro tempi assoluti nella sequenza riorganizzata,
+        # possiamo creare la nuova traccia ricalcolando i delta time
+        last_abs_time = 0
+        for event_data in flat_events_for_reconstruction:
+            msg = event_data['msg']
+            abs_time = event_data['abs_time']
+            
+            delta_time = abs_time - last_abs_time
+            new_track.append(msg.copy(time=delta_time))
+            last_abs_time = abs_time
+            
+        new_midi.tracks.append(new_track)
     return new_midi
 
 
