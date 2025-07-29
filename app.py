@@ -1,4 +1,4 @@
-# midi_decomposer_app.py - VERSIONE AGGIORNATA CON CORREZIONE mido.tempo2bpm
+# midi_decomposer_app.py - VERSIONE AGGIORNATA CON CORREZIONE A-B-A e implementazione Dal Più Corto al Più Lungo
 
 import streamlit as st
 import mido
@@ -135,7 +135,6 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
     for track in original_midi.tracks:
         for msg in track:
             if msg.type == 'set_tempo':
-                # CORREZIONE QUI: mido.tempo_to_bpm -> mido.tempo2bpm
                 tempo_bpm = mido.tempo2bpm(msg.tempo)
                 break # Prendiamo il primo, o l'ultimo per semplicità
     
@@ -149,7 +148,6 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
         phrases = []
         current_phrase_events = []
         current_phrase_start_tick = 0
-        absolute_tick_counter = 0
 
         # Raccogli tutti gli eventi con tempo assoluto e poi segmenta
         events_with_abs_time = []
@@ -193,22 +191,29 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
                 b_phrase = phrases[1]
                 c_phrase = phrases[2] if len(phrases) > 2 else phrases[1] # Usa B se non c'è C
                 
-                # Crea una sequenza ABAC... ripetuta per una lunghezza ragionevole
-                # Per semplicità, possiamo ripeterla un paio di volte o per la lunghezza originale
+                # CORREZIONE QUI: Usare append() per aggiungere intere frasi alla lista
+                # invece di extend() che aggiunge i singoli messaggi, causando l'errore.
                 num_repetitions = max(1, len(phrases) // 3) # Ripeti per avere lunghezza simile all'originale
                 for _ in range(num_repetitions):
-                    reorganized_phrases.extend(a_phrase)
-                    reorganized_phrases.extend(b_phrase)
-                    reorganized_phrases.extend(a_phrase)
-                    reorganized_phrases.extend(c_phrase)
+                    reorganized_phrases.append(a_phrase)
+                    reorganized_phrases.append(b_phrase)
+                    reorganized_phrases.append(a_phrase)
+                    reorganized_phrases.append(c_phrase)
             else:
                 st.warning(f"Troppo poche frasi ({len(phrases)}) per lo stile 'Ciclico A-B-A'. Verrà usata la riorganizzazione casuale.")
                 reorganized_phrases = list(phrases)
                 random.shuffle(reorganized_phrases)
         elif reassembly_style == "Dal Più Corto al Più Lungo":
-            st.warning("La modalità 'Dal Più Corto al Più Lungo' non è ancora implementata. Verrà usata la riorganizzazione casuale.")
-            reorganized_phrases = list(phrases)
-            random.shuffle(reorganized_phrases)
+            # IMPLEMENTAZIONE QUI:
+            def get_phrase_duration_in_ticks(phrase_events_list):
+                """Calcola la durata totale di una frase in tick MIDI."""
+                if not phrase_events_list:
+                    return 0
+                # La durata è la somma dei delta time degli eventi nella frase
+                return sum(msg.time for msg in phrase_events_list)
+
+            # Ordina le frasi in base alla loro durata (dal più corto al più lungo)
+            reorganized_phrases = sorted(phrases, key=get_phrase_duration_in_ticks)
         else:
             reorganized_phrases = list(phrases) # Fallback
 
@@ -224,9 +229,6 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
         
         for phrase_block in reorganized_phrases:
             for msg_in_phrase in phrase_block:
-                # Il msg.time qui è il delta rispetto al messaggio precedente all'interno della sua frase originale.
-                # Per ricostruire una sequenza piatta, sommiamo i delta per ottenere il tempo assoluto
-                # all'interno della sequenza riorganizzata.
                 absolute_time_in_reorganized_seq += msg_in_phrase.time
                 flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': absolute_time_in_reorganized_seq})
 
@@ -341,7 +343,7 @@ if uploaded_midi_file is not None:
                 "Stile Riorganizzazione Frasi:",
                 ["Casuale", "Inversione", "Ciclico A-B-A", "Dal Più Corto al Più Lungo"],
                 index=0, # Default a Casuale
-                help="Come le frasi verranno riassemblate. 'Dal Più Corto al Più Lungo' non è ancora implementato."
+                help="Come le frasi verranno riassemblate. Dal Più Corto al Più Lungo è ora implementato."
             )
 
         elif selected_midi_method == "MIDI Time Scrambler":
@@ -491,7 +493,7 @@ else:
         * **🎶 MIDI Note Remapper**: Rimodella le note del pentagramma (verticale) in base a scale, tonalità e randomizzazione.
             * _Parametri:_ Scala Target (es. Maggiore, Cromatica), Tonalità Target (es. C, Am), Range Pitch Shift Randomico, Percentuale Randomizzazione Velocity.
         * **🔄 MIDI Phrase Reconstructor**: Riorganizza e ricompone blocchi o "frasi" musicali (orizzontale).
-            * _Parametri:_ Lunghezza Frase (battute), Stile Riorganizzazione Frasi (Casuale, Inversione, Ciclico A-B-A).
+            * _Parametri:_ Lunghezza Frase (battute), Stile Riorganizzazione Frasi (Casuale, Inversione, Ciclico A-B-A, Dal Più Corto al Più Lungo).
         * **⏳ MIDI Time Scrambler**: Modifica il timing e la durata delle note per creare nuovi groove.
         * **🎲 MIDI Density Transformer**: Aggiunge o rimuove note per alterare la densità armonica.
         
