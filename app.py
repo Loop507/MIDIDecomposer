@@ -1,4 +1,4 @@
-# midi_decomposer_app.py - VERSIONE AGGIORNATA CON MIDI NOTE REMAPPER
+# midi_decomposer_app.py - VERSIONE AGGIORNATA CON MIDI PHRASE RECONSTRUCTOR
 
 import streamlit as st
 import mido
@@ -120,14 +120,195 @@ def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_
         new_midi.tracks.append(new_track)
     return new_midi
 
+
 def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_style):
     """
     Riorganizza le frasi MIDI.
-    (Logica da implementare)
+    Divide ogni traccia in segmenti (frasi) e li riassembla in un nuovo ordine.
     """
-    st.info(f"Applico MIDI Phrase Reconstructor con Lunghezza Frase: {phrase_length_beats} battute, Stile: {reassembly_style}")
-    # Questa è una placeholder: restituisce il MIDI originale
-    return original_midi # Placeholder: restituisce l'originale
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+
+    # Determinare il tempo in microsecondi per beat (per gestire set_tempo)
+    # Assumiamo un tempo costante per semplicità. Se ci sono più messaggi set_tempo, prenderemo l'ultimo prima del beat.
+    # Per una gestione più precisa, si dovrebbe costruire una mappa del tempo.
+    tempo_bpm = 120 # Default
+    for track in original_midi.tracks:
+        for msg in track:
+            if msg.type == 'set_tempo':
+                tempo_bpm = mido.tempo_to_bpm(msg.tempo)
+                break # Prendiamo il primo, o l'ultimo per semplicità
+    
+    # Calcola ticks per beat dal tempo_bpm e ticks_per_beat del file
+    # beats_per_second = tempo_bpm / 60
+    # ticks_per_second = beats_per_second * original_midi.ticks_per_beat
+    
+    ticks_per_phrase = original_midi.ticks_per_beat * phrase_length_beats
+
+    if ticks_per_phrase == 0:
+        st.warning("La lunghezza della frase è zero. Nessuna riorganizzazione applicata.")
+        return original_midi
+
+    for original_track in original_midi.tracks:
+        phrases = []
+        current_phrase_events = []
+        current_phrase_start_tick = 0
+        absolute_tick_counter = 0
+
+        # Raccogli tutti gli eventi con tempo assoluto e poi segmenta
+        events_with_abs_time = []
+        time_since_last_event = 0
+        for msg in original_track:
+            time_since_last_event += msg.time
+            events_with_abs_time.append({'msg': msg, 'abs_time': time_since_last_event})
+
+        # Segmenta in frasi
+        for event_data in events_with_abs_time:
+            msg = event_data['msg']
+            abs_time = event_data['abs_time']
+
+            # Se l'evento supera il limite della frase corrente
+            while abs_time >= current_phrase_start_tick + ticks_per_phrase:
+                if current_phrase_events: # Aggiungi la frase completa se non è vuota
+                    phrases.append(current_phrase_events)
+                current_phrase_events = [] # Inizia una nuova frase
+                current_phrase_start_tick += ticks_per_phrase
+            
+            current_phrase_events.append(msg)
+        
+        # Aggiungi l'ultima frase incompleta se esiste
+        if current_phrase_events:
+            phrases.append(current_phrase_events)
+
+        if not phrases:
+            new_midi.tracks.append(mido.MidiTrack()) # Aggiungi una traccia vuota se non ci sono frasi
+            continue # Passa alla prossima traccia
+
+        # Riorganizza le frasi
+        reorganized_phrases = []
+        if reassembly_style == "Casuale":
+            reorganized_phrases = list(phrases) # Copia la lista
+            random.shuffle(reorganized_phrases)
+        elif reassembly_style == "Inversione":
+            reorganized_phrases = list(reversed(phrases))
+        elif reassembly_style == "Ciclico A-B-A":
+            if len(phrases) >= 3:
+                a_phrase = phrases[0]
+                b_phrase = phrases[1]
+                c_phrase = phrases[2] if len(phrases) > 2 else phrases[1] # Usa B se non c'è C
+                
+                # Crea una sequenza ABAC... ripetuta per una lunghezza ragionevole
+                # Per semplicità, possiamo ripeterla un paio di volte o per la lunghezza originale
+                num_repetitions = max(1, len(phrases) // 3) # Ripeti per avere lunghezza simile all'originale
+                for _ in range(num_repetitions):
+                    reorganized_phrases.extend(a_phrase)
+                    reorganized_phrases.extend(b_phrase)
+                    reorganized_phrases.extend(a_phrase)
+                    reorganized_phrases.extend(c_phrase)
+            else:
+                st.warning(f"Troppo poche frasi ({len(phrases)}) per lo stile 'Ciclico A-B-A'. Verrà usata la riorganizzazione casuale.")
+                reorganized_phrases = list(phrases)
+                random.shuffle(reorganized_phrases)
+        elif reassembly_style == "Dal Più Corto al Più Lungo":
+            st.warning("La modalità 'Dal Più Corto al Più Lungo' non è ancora implementata. Verrà usata la riorganizzazione casuale.")
+            reorganized_phrases = list(phrases)
+            random.shuffle(reorganized_phrases)
+        else:
+            reorganized_phrases = list(phrases) # Fallback
+
+        new_track = mido.MidiTrack()
+        last_message_abs_time = 0 # Usato per calcolare i delta time
+        
+        # Ri-assembla la nuova traccia con delta times corretti
+        for phrase in reorganized_phrases:
+            if not phrase:
+                continue
+
+            # Calcola l'offset per questa frase
+            phrase_start_abs_time = phrase[0].time if phrase else 0 # Il primo time è già un delta relativo all'inizio del phrase
+            
+            # Appendi i messaggi della frase, ricalcolando i delta time
+            for msg_idx, msg in enumerate(phrase):
+                # Se è il primo messaggio della frase o se il messaggio precedente era già aggiunto
+                # il suo time è un delta dal precedente. Dobbiamo assicurare che il primo messaggio
+                # della frase sia relativo al 'last_message_abs_time' della traccia risultante.
+                
+                # Converti il tempo relativo del messaggio in tempo assoluto all'interno della sua frase originale
+                # Questo è un punto critico: mido.Message.time è un delta.
+                # Per riassemblare, abbiamo bisogno del tempo assoluto originale all'interno della frase
+                # per poi ricalcolare i delta per la nuova sequenza.
+
+                # Il modo più semplice è trattare il primo messaggio della frase come time=0
+                # e poi riassemblare i delta successivi, e infine fare un grande delta
+                # tra la fine della frase precedente e l'inizio di questa.
+
+                # Per riassemblare, creiamo una traccia temporanea per ogni frase per normalizzare i delta
+                temp_phrase_track = mido.MidiTrack()
+                for m in phrase:
+                    temp_phrase_track.append(m.copy()) # Usa copy() per non modificare gli originali
+                
+                # Ora che i delta sono normalizzati all'inizio della frase
+                # possiamo calcolare il tempo assoluto relativo alla *nuova* posizione
+
+                # Ottieni i messaggi normalizzati (con tempo 0 all'inizio della frase)
+                normalized_messages = []
+                current_delta = 0
+                for m in temp_phrase_track:
+                    current_delta += m.time
+                    normalized_messages.append({'msg': m.copy(), 'abs_time_in_phrase': current_delta})
+                
+                # Aggiungi alla nuova traccia
+                if normalized_messages:
+                    first_msg = normalized_messages[0]['msg']
+                    first_msg_time = normalized_messages[0]['abs_time_in_phrase'] # Questo dovrebbe essere 0
+                    
+                    # Calcola il delta dal messaggio precedente nella nuova traccia
+                    delta_to_add = first_msg_time - last_message_abs_time
+                    
+                    # Se non è il primo messaggio della traccia riorganizzata
+                    if new_track:
+                        # Il delta del primo messaggio della frase deve essere rispetto all'ultimo messaggio della traccia
+                        new_msg_with_delta = first_msg.copy(time=first_msg.time) # Mantiene il suo delta originale
+                        new_track.append(new_msg_with_delta)
+                        
+                        # Aggiorna il last_message_abs_time in base al delta appena aggiunto
+                        last_message_abs_time += first_msg.time
+                    else:
+                        # Se è il primo messaggio in assoluto della nuova traccia, il suo time rimane 0
+                        new_track.append(first_msg.copy(time=first_msg.time))
+                        last_message_abs_time = first_msg.time # Inizializza
+                        
+                    # Aggiungi i messaggi rimanenti della frase
+                    for j in range(1, len(normalized_messages)):
+                        msg = normalized_messages[j]['msg']
+                        new_track.append(msg.copy())
+                        last_message_abs_time += msg.time # Questo è già un delta time valido
+        
+        # Una soluzione più robusta per riassemblare i delta time:
+        # Ricostruire una traccia temporanea per ogni frase, poi concatenarle
+        # e infine ricalcolare i delta time per tutta la traccia.
+        
+        reconstructed_events_flat = []
+        for phrase in reorganized_phrases:
+            current_abs_time_in_phrase = 0
+            for msg in phrase:
+                current_abs_time_in_phrase += msg.time
+                reconstructed_events_flat.append({'msg': msg.copy(), 'abs_time_track': current_abs_time_in_phrase})
+        
+        new_track_final = mido.MidiTrack()
+        current_tick = 0
+        for event_data in reconstructed_events_flat:
+            msg = event_data['msg']
+            abs_time = event_data['abs_time_track']
+            
+            # Calcola il delta time rispetto all'evento precedente
+            delta_time = abs_time - current_tick
+            current_tick = abs_time
+            
+            new_track_final.append(msg.copy(time=delta_time)) # Appendi il messaggio con il delta ricalcolato
+        
+        new_midi.tracks.append(new_track_final)
+    return new_midi
+
 
 def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, swing_amount):
     """
@@ -218,13 +399,14 @@ if uploaded_midi_file is not None:
 
         elif selected_midi_method == "MIDI Phrase Reconstructor":
             phrase_length_beats = st.slider(
-                "Lunghezza Frase (battute):", 1, 8, 4,
-                help="Definisce la dimensione dei blocchi musicali da riorganizzare."
+                "Lunghezza Frase (battute):", 1, 16, 4,
+                help="Definisce la dimensione dei blocchi musicali (in battute) da riorganizzare."
             )
             reassembly_style = st.selectbox(
                 "Stile Riorganizzazione Frasi:",
                 ["Casuale", "Inversione", "Ciclico A-B-A", "Dal Più Corto al Più Lungo"],
-                help="Come le frasi verranno riassemblate."
+                index=0, # Default a Casuale
+                help="Come le frasi verranno riassemblate. 'Dal Più Corto al Più Lungo' non è ancora implementato."
             )
 
         elif selected_midi_method == "MIDI Time Scrambler":
@@ -374,6 +556,7 @@ else:
         * **🎶 MIDI Note Remapper**: Rimodella le note del pentagramma (verticale) in base a scale, tonalità e randomizzazione.
             * _Parametri:_ Scala Target (es. Maggiore, Cromatica), Tonalità Target (es. C, Am), Range Pitch Shift Randomico, Percentuale Randomizzazione Velocity.
         * **🔄 MIDI Phrase Reconstructor**: Riorganizza e ricompone blocchi o "frasi" musicali (orizzontale).
+            * _Parametri:_ Lunghezza Frase (battute), Stile Riorganizzazione Frasi (Casuale, Inversione, Ciclico A-B-A).
         * **⏳ MIDI Time Scrambler**: Modifica il timing e la durata delle note per creare nuovi groove.
         * **🎲 MIDI Density Transformer**: Aggiunge o rimuove note per alterare la densità armonica.
         
