@@ -1,10 +1,10 @@
-# midi_decomposer_app.py
+# midi_decomposer_app.py - VERSIONE CORRETTA
 
 import streamlit as st
 import mido
 import random
 import numpy as np
-import io # Necessario per gestire i file in memoria
+import io
 
 # --- Configurazione della Pagina ---
 st.set_page_config(
@@ -22,18 +22,35 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# --- Funzioni di Decomposizione (PLACEHOLDER per ora) ---
+# --- Funzioni di Utilità ---
+def get_key_offset(key_name):
+    """Converte il nome della tonalità in offset semitonale"""
+    key_map = {
+        'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4, 'F': 5, 
+        'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11,
+        'Cm': 0, 'C#m': 1, 'Dm': 2, 'D#m': 3, 'Em': 4, 'Fm': 5, 
+        'F#m': 6, 'Gm': 7, 'G#m': 8, 'Am': 9, 'A#m': 10, 'Bm': 11
+    }
+    return key_map.get(key_name, 0)
 
+def get_track_name(track):
+    """Estrae il nome di una traccia MIDI"""
+    for msg in track:
+        if msg.type == 'track_name':
+            return msg.name
+    return None
+
+# --- Funzioni di Decomposizione ---
 def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
     """
     Rimodella le note MIDI in base a una scala, tonalità e randomizzazione di pitch/velocity.
-    (Logica da implementare)
     """
     st.info(f"Applico MIDI Note Remapper con Scala: {target_scale_name}, Tonalità: {target_key_name}, Pitch Shift: {pitch_shift_range}, Velocity Rand: {velocity_randomization}")
-    new_midi = mido.MidiFile()
     
-    # Mappa note per scala e tonalità (esempio molto semplificato)
-    # Questa è una logica PLACEHOLDER. Dovrà essere molto più sofisticata.
+    new_midi = mido.MidiFile()
+    new_midi.ticks_per_beat = original_midi.ticks_per_beat
+    
+    # Mappa delle scale
     scales = {
         "Cromatica": list(range(12)),
         "Maggiore": [0, 2, 4, 5, 7, 9, 11],
@@ -41,90 +58,137 @@ def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_
         "Pentatonica Maggiore": [0, 2, 4, 7, 9],
         "Blues": [0, 3, 5, 6, 7, 10]
     }
-    key_offset = mido.MidiFile()._key_to_note_number(target_key_name) if target_key_name else 0
+    
+    key_offset = get_key_offset(target_key_name)
     target_scale = scales.get(target_scale_name, scales["Cromatica"])
     
     for i, track in enumerate(original_midi.tracks):
         new_track = mido.MidiTrack()
+        
         for msg in track:
-            if msg.type == 'note_on' or msg.type == 'note_off':
+            if msg.type in ['note_on', 'note_off'] and hasattr(msg, 'note'):
                 original_note = msg.note
                 
                 # Applica Pitch Shift randomico
                 shifted_note = original_note + random.randint(-pitch_shift_range, pitch_shift_range)
                 
                 # Adatta alla scala target e tonalità
-                # Trova la nota più vicina nella scala target, considerando l'offset della tonalità
                 octave = shifted_note // 12
                 note_in_octave = shifted_note % 12
                 
                 # Trova la nota più vicina nella scala selezionata
-                closest_scale_note = min(target_scale, key=lambda x: min(abs(note_in_octave - x), abs(note_in_octave - x - 12), abs(note_in_octave - x + 12)))
+                closest_scale_note = min(target_scale, key=lambda x: abs(note_in_octave - x))
                 new_note_pitch = octave * 12 + closest_scale_note + key_offset
                 
-                new_note_pitch = max(0, min(127, new_note_pitch)) # Clampa tra 0-127
+                # Limita il range MIDI (0-127)
+                new_note_pitch = max(0, min(127, new_note_pitch))
 
                 # Applica randomizzazione velocity
-                new_velocity = msg.velocity
-                if velocity_randomization > 0:
-                    new_velocity = int(new_velocity * (1 + random.uniform(-velocity_randomization/100, velocity_randomization/100)))
-                    new_velocity = max(1, min(127, new_velocity)) # Clampa tra 1-127 per velocity
+                new_velocity = msg.velocity if hasattr(msg, 'velocity') else 64
+                if velocity_randomization > 0 and new_velocity > 0:
+                    velocity_factor = 1 + random.uniform(-velocity_randomization/100, velocity_randomization/100)
+                    new_velocity = int(new_velocity * velocity_factor)
+                    new_velocity = max(1, min(127, new_velocity))
 
-                new_track.append(msg.copy(note=new_note_pitch, velocity=new_velocity))
+                # Crea il nuovo messaggio
+                new_msg = msg.copy(note=new_note_pitch)
+                if hasattr(msg, 'velocity'):
+                    new_msg = new_msg.copy(velocity=new_velocity)
+                new_track.append(new_msg)
             else:
-                new_track.append(msg.copy()) # Copia gli altri messaggi (control change, program change, etc.)
+                # Copia gli altri messaggi (control change, program change, etc.)
+                new_track.append(msg.copy())
+        
         new_midi.tracks.append(new_track)
+    
     return new_midi
 
 def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_style):
     """
     Riorganizza le frasi MIDI.
-    (Logica da implementare)
     """
     st.info(f"Applico MIDI Phrase Reconstructor con Lunghezza Frase: {phrase_length_beats} battute, Stile: {reassembly_style}")
-    # Questa è una placeholder: restituisce il MIDI originale
-    return mido.MidiFile() # Placeholder: restituisce l'originale
+    # Per ora restituisce una copia dell'originale
+    new_midi = mido.MidiFile()
+    new_midi.ticks_per_beat = original_midi.ticks_per_beat
+    
+    for track in original_midi.tracks:
+        new_track = mido.MidiTrack()
+        for msg in track:
+            new_track.append(msg.copy())
+        new_midi.tracks.append(new_track)
+    
+    return new_midi
 
 def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, swing_amount):
     """
     Modifica il timing e la durata delle note MIDI.
-    (Logica da implementare)
     """
     st.info(f"Applico MIDI Time Scrambler con Stretch: {stretch_factor}, Quantizzazione: {quantization_strength}, Swing: {swing_amount}")
-    # Questa è una placeholder: restituisce il MIDI originale
-    return mido.MidiFile() # Placeholder: restituisce l'originale
+    # Per ora restituisce una copia dell'originale
+    new_midi = mido.MidiFile()
+    new_midi.ticks_per_beat = original_midi.ticks_per_beat
+    
+    for track in original_midi.tracks:
+        new_track = mido.MidiTrack()
+        for msg in track:
+            new_track.append(msg.copy())
+        new_midi.tracks.append(new_track)
+    
+    return new_midi
 
 def midi_density_transformer(original_midi, add_note_probability, remove_note_probability, polyphony_mode):
     """
     Aggiunge o rimuove note per alterare la densità MIDI.
-    (Logica da implementare)
     """
     st.info(f"Applico MIDI Density Transformer con Probabilità Aggiunta: {add_note_probability}, Rimozione: {remove_note_probability}, Modalità Polifonia: {polyphony_mode}")
-    # Questa è una placeholder: restituisce il MIDI originale
-    return mido.MidiFile() # Placeholder: restituisce l'originale
+    # Per ora restituisce una copia dell'originale
+    new_midi = mido.MidiFile()
+    new_midi.ticks_per_beat = original_midi.ticks_per_beat
+    
+    for track in original_midi.tracks:
+        new_track = mido.MidiTrack()
+        for msg in track:
+            new_track.append(msg.copy())
+        new_midi.tracks.append(new_track)
+    
+    return new_midi
 
 # --- Sezione Upload File MIDI ---
 st.subheader("🎵 Carica il tuo file MIDI (.mid)")
 uploaded_midi_file = st.file_uploader(
     "Trascina qui il tuo file MIDI o clicca per sfogliare",
-    type=["mid"],
+    type=["mid", "midi"],
     help="Carica un file MIDI per iniziare la decomposizione."
 )
 
-decomposed_midi_file = None # Variabile per memorizzare il MIDI decomposto
+decomposed_midi_file = None
 
 if uploaded_midi_file is not None:
     st.success("File MIDI caricato con successo!")
 
     try:
+        # Leggi il file MIDI
         midi_data = mido.MidiFile(file=uploaded_midi_file)
 
         st.subheader("File MIDI Caricato: Panoramica")
         st.write(f"Nome file: **{uploaded_midi_file.name}**")
         st.write(f"Numero di tracce: **{len(midi_data.tracks)}**")
-        # Per la durata MIDI è più complesso di un semplice .length, spesso è basato sui tick/tempo map
-        # Per ora usiamo il length di mido che è una stima in secondi
-        st.write(f"Durata (stimata): **{midi_data.length:.2f} secondi**")
+        st.write(f"Ticks per beat: **{midi_data.ticks_per_beat}**")
+        
+        # Calcola la durata più accuratamente
+        try:
+            duration = midi_data.length
+            st.write(f"Durata (stimata): **{duration:.2f} secondi**")
+        except:
+            st.write("Durata: **Non disponibile**")
+
+        # Mostra informazioni sulle tracce
+        with st.expander("Dettagli Tracce"):
+            for i, track in enumerate(midi_data.tracks):
+                track_name = get_track_name(track) or f"Traccia {i}"
+                note_count = sum(1 for msg in track if msg.type in ['note_on', 'note_off'])
+                st.write(f"**{track_name}**: {len(track)} messaggi, {note_count} eventi note")
 
         st.markdown("---")
         st.subheader("⚙️ Scegli il Metodo di Decomposizione MIDI")
@@ -154,13 +218,11 @@ if uploaded_midi_file is not None:
                     help="Le note verranno adattate a questa scala."
                 )
             with col2_remap:
-                # Mido supporta nomi di chiave come 'C', 'C#m', 'Db' ecc.
-                # Questa lista è un esempio, si potrebbe espanderla
                 target_key = st.selectbox(
                     "Tonalità Target:",
                     ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B',
                      'Cm', 'C#m', 'Dm', 'D#m', 'Em', 'Fm', 'F#m', 'Gm', 'G#m', 'Am', 'A#m', 'Bm'],
-                    index=0, # Default C
+                    index=0,
                     help="La tonalità di destinazione per la decomposizione."
                 )
             pitch_shift_range = st.slider(
@@ -212,91 +274,108 @@ if uploaded_midi_file is not None:
                 help="Come le nuove note verranno generate per influenzare la densità."
             )
 
-
         if st.button("🎶 DECOMPONI MIDI", type="primary", use_container_width=True):
             with st.spinner(f"Applicando {midi_methods[selected_midi_method]}..."):
-                # Esegui la funzione di decomposizione appropriata
-                if selected_midi_method == "MIDI Note Remapper":
-                    decomposed_midi_file = midi_note_remapper(
-                        midi_data, target_scale, target_key, int(pitch_shift_range), int(velocity_randomization)
-                    )
-                elif selected_midi_method == "MIDI Phrase Reconstructor":
-                    decomposed_midi_file = midi_phrase_reconstructor(
-                        midi_data, phrase_length_beats, reassembly_style
-                    )
-                elif selected_midi_method == "MIDI Time Scrambler":
-                    decomposed_midi_file = midi_time_scrambler(
-                        midi_data, stretch_factor, quantization_strength, swing_amount
-                    )
-                elif selected_midi_method == "MIDI Density Transformer":
-                    decomposed_midi_file = midi_density_transformer(
-                        midi_data, add_note_probability, remove_note_probability, polyphony_mode
-                    )
-
-                if decomposed_midi_file:
-                    st.success("Decomposizione MIDI completata!")
-                    st.subheader("Scarica il tuo MIDI Decomposto (Completo)")
-
-                    # Salva il file MIDI decomposto completo in un buffer di memoria per il download
-                    decomposed_midi_bytes = io.BytesIO()
-                    decomposed_midi_file.save(file=decomposed_midi_bytes)
-                    decomposed_midi_bytes.seek(0)
-
-                    st.download_button(
-                        label="💾 Scarica MIDI Decomposto Completo",
-                        data=decomposed_midi_bytes,
-                        file_name=f"{uploaded_midi_file.name.split('.')[0]}_{selected_midi_method.replace(' ', '_')}_Decomposed.mid",
-                        mime="audio/midi",
-                        use_container_width=True
-                    )
-                    st.info("Apri il file MIDI scaricato nel tuo software musicale preferito per ascoltare il risultato completo!")
-
-                    # --- NUOVA SEZIONE: Download Singole Tracce ---
-                    if len(decomposed_midi_file.tracks) > 1:
-                        st.markdown("---")
-                        st.subheader("Scarica Singole Tracce del MIDI Decomposto")
-                        
-                        # Creare un elenco di opzioni per le tracce
-                        track_options = [f"Traccia {i}: {mido.midifiles.tracks.get_track_name(track)}" if mido.midifiles.tracks.get_track_name(track) else f"Traccia {i} (Senza Nome)" for i, track in enumerate(decomposed_midi_file.tracks)]
-                        
-                        selected_tracks_indices = st.multiselect(
-                            "Seleziona una o più tracce da scaricare singolarmente:",
-                            options=list(range(len(decomposed_midi_file.tracks))), # Usiamo gli indici come valori
-                            format_func=lambda x: track_options[x], # Mostriamo i nomi delle tracce
-                            default=None, # Nessuna selezione di default
-                            help="Seleziona le tracce che vuoi scaricare come file MIDI separati."
+                try:
+                    # Esegui la funzione di decomposizione appropriata
+                    if selected_midi_method == "MIDI Note Remapper":
+                        decomposed_midi_file = midi_note_remapper(
+                            midi_data, target_scale, target_key, int(pitch_shift_range), int(velocity_randomization)
+                        )
+                    elif selected_midi_method == "MIDI Phrase Reconstructor":
+                        decomposed_midi_file = midi_phrase_reconstructor(
+                            midi_data, phrase_length_beats, reassembly_style
+                        )
+                    elif selected_midi_method == "MIDI Time Scrambler":
+                        decomposed_midi_file = midi_time_scrambler(
+                            midi_data, stretch_factor, quantization_strength, swing_amount
+                        )
+                    elif selected_midi_method == "MIDI Density Transformer":
+                        decomposed_midi_file = midi_density_transformer(
+                            midi_data, add_note_probability, remove_note_probability, polyphony_mode
                         )
 
-                        if selected_tracks_indices:
-                            for track_index in selected_tracks_indices:
-                                single_track_midi = mido.MidiFile()
-                                single_track_midi.tracks.append(decomposed_midi_file.tracks[track_index])
+                    if decomposed_midi_file and len(decomposed_midi_file.tracks) > 0:
+                        st.success("Decomposizione MIDI completata!")
+                        st.subheader("Scarica il tuo MIDI Decomposto (Completo)")
 
-                                single_track_bytes = io.BytesIO()
-                                single_track_midi.save(file=single_track_bytes)
-                                single_track_bytes.seek(0)
+                        # Salva il file MIDI decomposto completo in un buffer di memoria per il download
+                        decomposed_midi_bytes = io.BytesIO()
+                        decomposed_midi_file.save(file=decomposed_midi_bytes)
+                        decomposed_midi_bytes.seek(0)
 
-                                track_name_for_file = mido.midifiles.tracks.get_track_name(decomposed_midi_file.tracks[track_index]).replace(' ', '_') if mido.midifiles.tracks.get_track_name(decomposed_midi_file.tracks[track_index]) else f"Track_{track_index}"
+                        st.download_button(
+                            label="💾 Scarica MIDI Decomposto Completo",
+                            data=decomposed_midi_bytes.getvalue(),
+                            file_name=f"{uploaded_midi_file.name.split('.')[0]}_{selected_midi_method.replace(' ', '_')}_Decomposed.mid",
+                            mime="audio/midi",
+                            use_container_width=True
+                        )
+                        st.info("Apri il file MIDI scaricato nel tuo software musicale preferito per ascoltare il risultato completo!")
 
-                                st.download_button(
-                                    label=f"💾 Scarica {track_options[track_index]}",
-                                    data=single_track_bytes,
-                                    file_name=f"{uploaded_midi_file.name.split('.')[0]}_{selected_midi_method.replace(' ', '_')}_{track_name_for_file}.mid",
-                                    mime="audio/midi",
-                                    key=f"download_track_{track_index}" # Chiave unica per ogni pulsante
-                                )
-                    elif len(decomposed_midi_file.tracks) == 1:
-                        st.info("Il MIDI decomposto contiene una sola traccia, scarica il file completo qui sopra.")
+                        # --- Sezione Download Singole Tracce ---
+                        if len(decomposed_midi_file.tracks) > 1:
+                            st.markdown("---")
+                            st.subheader("Scarica Singole Tracce del MIDI Decomposto")
+                            
+                            # Creare un elenco di opzioni per le tracce
+                            track_options = []
+                            for i, track in enumerate(decomposed_midi_file.tracks):
+                                track_name = get_track_name(track)
+                                if track_name:
+                                    track_options.append(f"Traccia {i}: {track_name}")
+                                else:
+                                    track_options.append(f"Traccia {i} (Senza Nome)")
+                            
+                            selected_tracks_indices = st.multiselect(
+                                "Seleziona una o più tracce da scaricare singolarmente:",
+                                options=list(range(len(decomposed_midi_file.tracks))),
+                                format_func=lambda x: track_options[x],
+                                default=None,
+                                help="Seleziona le tracce che vuoi scaricare come file MIDI separati."
+                            )
+
+                            if selected_tracks_indices:
+                                for track_index in selected_tracks_indices:
+                                    single_track_midi = mido.MidiFile()
+                                    single_track_midi.ticks_per_beat = decomposed_midi_file.ticks_per_beat
+                                    single_track_midi.tracks.append(decomposed_midi_file.tracks[track_index])
+
+                                    single_track_bytes = io.BytesIO()
+                                    single_track_midi.save(file=single_track_bytes)
+                                    single_track_bytes.seek(0)
+
+                                    track_name = get_track_name(decomposed_midi_file.tracks[track_index])
+                                    track_name_for_file = track_name.replace(' ', '_') if track_name else f"Track_{track_index}"
+
+                                    st.download_button(
+                                        label=f"💾 Scarica {track_options[track_index]}",
+                                        data=single_track_bytes.getvalue(),
+                                        file_name=f"{uploaded_midi_file.name.split('.')[0]}_{selected_midi_method.replace(' ', '_')}_{track_name_for_file}.mid",
+                                        mime="audio/midi",
+                                        key=f"download_track_{track_index}"
+                                    )
+                        elif len(decomposed_midi_file.tracks) == 1:
+                            st.info("Il MIDI decomposto contiene una sola traccia, scarica il file completo qui sopra.")
+                        else:
+                            st.warning("Il MIDI decomposto non contiene tracce.")
                     else:
-                        st.warning("Il MIDI decomposto non contiene tracce.")
-
-                else:
-                    st.error("Impossibile generare il MIDI decomposto. Controlla i messaggi di avviso.")
+                        st.error("Impossibile generare il MIDI decomposto. Il file risultante è vuoto.")
+                        
+                except Exception as decomp_error:
+                    st.error(f"❌ Errore durante la decomposizione: {str(decomp_error)}")
+                    st.exception(decomp_error)
 
     except Exception as e:
-        st.error(f"❌ Errore durante la lettura o l'elaborazione del file MIDI: {str(e)}")
-        st.error("Assicurati che sia un file MIDI valido e riprova.")
-        st.exception(e) # Mostra i dettagli completi dell'errore per il debug
+        st.error(f"❌ Errore durante la lettura del file MIDI: {str(e)}")
+        st.error("Possibili cause:")
+        st.error("- Il file non è un MIDI valido")
+        st.error("- Il file è corrotto")
+        st.error("- Il formato MIDI non è supportato")
+        
+        # Informazioni di debug
+        st.error("**Dettagli tecnici:**")
+        st.exception(e)
 
 else:
     st.info("👆 Carica un file MIDI (.mid) per iniziare la decomposizione.")
@@ -309,7 +388,7 @@ else:
 
         **Come funziona:**
 
-        1.  **Carica il tuo file MIDI** (con estensione `.mid`).
+        1.  **Carica il tuo file MIDI** (con estensione `.mid` o `.midi`).
         2.  Scegli il **metodo di decomposizione** e imposta i suoi **parametri**.
         3.  Clicca su **"DECOMPONI MIDI"**.
         4.  Scarica il **file MIDI completo** o seleziona le **singole tracce** da scaricare.
@@ -317,12 +396,16 @@ else:
 
         **Metodi di Decomposizione Disponibili:**
 
-        * **🎶 MIDI Note Remapper**: Rimodella le note del pentagramma (verticale) in base a scale, tonalità e randomizzazione, agendo anche su registri specifici.
-        * **🔄 MIDI Phrase Reconstructor**: Riorganizza e ricompone blocchi o "frasi" musicali (orizzontale), creando nuove strutture compositive.
-        * **⏳ MIDI Time Scrambler**: Modifica il timing e la durata delle note, intervenendo su ritmo, swing e quantizzazione per creare nuovi groove.
-        * **🎲 MIDI Density Transformer**: Aggiunge o rimuove note in modo intelligente per alterare la densità armonica e contrappuntistica, influenzando la "tessitura" del brano.
+        * **🎶 MIDI Note Remapper**: Rimodella le note del pentagramma (verticale) in base a scale, tonalità e randomizzazione.
+        * **🔄 MIDI Phrase Reconstructor**: Riorganizza e ricompone blocchi o "frasi" musicali (orizzontale).
+        * **⏳ MIDI Time Scrambler**: Modifica il timing e la durata delle note per creare nuovi groove.
+        * **🎲 MIDI Density Transformer**: Aggiunge o rimuove note per alterare la densità armonica.
         
-        Questi metodi sono progettati per fornirti strumenti per la **composizione algoritmica** e la manipolazione strutturale delle tue idee musicali MIDI!
+        **Risoluzione Problemi:**
+        
+        - Assicurati che il file sia un MIDI valido (.mid o .midi)
+        - Controlla che il file non sia corrotto
+        - Prova con un file MIDI più semplice se hai problemi
         """)
 
 # --- Footer ---
