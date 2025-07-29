@@ -1,4 +1,4 @@
-# midi_decomposer_app.py - VERSIONE AGGIORNATA CON MIDI RANDOM PITCH TRANSFORMER
+# midi_decomposer_app.py - VERSIONE AGGIORNATA CON CONTROLLO VELOCITÀ ESTESO NEL TIME SCRAMBLER
 
 import streamlit as st
 import mido
@@ -491,7 +491,7 @@ if uploaded_midi_file is not None:
             "MIDI Phrase Reconstructor": "🔄 Riorganizzazione Frasi (Orizzontale)",
             "MIDI Time Scrambler": "⏳ Manipolazione Ritmo/Durata (Orizzontale)",
             "MIDI Density Transformer": "🎲 Controllo Densità (Armonia/Contrappunto)",
-            "MIDI Random Pitch Transformer": "❓ Randomizzazione Totale Pitch (Caos)" # NUOVA OPZIONE
+            "MIDI Random Pitch Transformer": "❓ Randomizzazione Totale Pitch (Caos)"
         }
 
         selected_midi_method = st.selectbox(
@@ -543,9 +543,28 @@ if uploaded_midi_file is not None:
             )
 
         elif selected_midi_method == "MIDI Time Scrambler":
+            # NUOVO CONTROLLO: Velocità di Esecuzione
+            execution_speed_preset = st.selectbox(
+                "Velocità di Esecuzione:",
+                ["Medio (Originale)", "Lento (Metà velocità)", "Molto Lento (Un quarto velocità)", "Veloce (Doppia velocità)", "Molto Veloce (Quattro volte velocità)"],
+                index=0, # Default a Medio
+                help="Imposta un preset per lo stiramento/compressione del tempo."
+            )
+            
+            # Mappa il preset al valore di default dello slider
+            default_stretch_factor = 1.0
+            if execution_speed_preset == "Lento (Metà velocità)":
+                default_stretch_factor = 2.0
+            elif execution_speed_preset == "Molto Lento (Un quarto velocità)":
+                default_stretch_factor = 4.0
+            elif execution_speed_preset == "Veloce (Doppia velocità)":
+                default_stretch_factor = 0.5
+            elif execution_speed_preset == "Molto Veloce (Quattro volte velocità)":
+                default_stretch_factor = 0.25
+
             stretch_factor = st.slider(
-                "Fattore di Stiramento/Compressione (Time Warp):", 0.5, 2.0, 1.0, 0.1,
-                help="Allunga (valori > 1) o comprime (valori < 1) il tempo generale del MIDI."
+                "Fattore di Stiramento/Compressione (Time Warp):", 0.1, 5.0, default_stretch_factor, 0.1,
+                help="Allunga (valori > 1) o comprime (valori < 1) il tempo generale del MIDI. Regola per fine-tuning."
             )
             quantization_strength = st.slider(
                 "Forza Quantizzazione (0=libero, 100=rigido):", 0, 100, 50,
@@ -571,7 +590,7 @@ if uploaded_midi_file is not None:
                 help="Come le nuove note verranno generate per influenzare la densità."
             )
         
-        elif selected_midi_method == "MIDI Random Pitch Transformer": # NUOVI CONTROLLI
+        elif selected_midi_method == "MIDI Random Pitch Transformer":
             random_pitch_strength = st.slider(
                 "Forza Randomizzazione Pitch (%):", 0, 100, 100,
                 help="Probabilità che ogni nota (on/off) abbia il suo pitch completamente randomizzato (0-127)."
@@ -597,7 +616,7 @@ if uploaded_midi_file is not None:
                     decomposed_midi_file = midi_density_transformer(
                         midi_data, add_note_probability, remove_note_probability, polyphony_mode
                     )
-                elif selected_midi_method == "MIDI Random Pitch Transformer": # NUOVA CHIAMATA
+                elif selected_midi_method == "MIDI Random Pitch Transformer":
                     decomposed_midi_file = midi_random_pitch_transformer(
                         midi_data, random_pitch_strength
                     )
@@ -694,6 +713,12 @@ else:
         4.  Scarica il **file MIDI completo** o seleziona le **singole tracce** da scaricare.
         5.  Apri il file MIDI scaricato nel tuo software musicale (DAW) preferito per ascoltare il risultato.
 
+        **Combinare gli Effetti:**
+        Se desideri applicare più effetti (es. prima un remapping di note e poi un cambio di velocità), dovrai:
+        1. Applicare il primo effetto e scaricare il file MIDI risultante.
+        2. Ricaricare questo nuovo file MIDI nel Decomposer.
+        3. Applicare il secondo effetto (es. "MIDI Time Scrambler" per la velocità).
+
         **Metodi di Decomposizione Disponibili:**
 
         * **🎶 MIDI Note Remapper**: Rimodella le note del pentagramma (verticale) in base a scale, tonalità e randomizzazione.
@@ -701,7 +726,7 @@ else:
         * **🔄 MIDI Phrase Reconstructor**: Riorganizza e ricompone blocchi o "frasi" musicali (orizzontale).
             * _Parametri:_ Lunghezza Frase (battute), Stile Riorganizzazione Frasi (Casuale, Inversione, Ciclico A-B-A, Dal Più Corto al Più Lungo).
         * **⏳ MIDI Time Scrambler**: Modifica il timing e la durata delle note per creare nuovi groove.
-            * _Parametri:_ Fattore di Stiramento/Compressione, Forza Quantizzazione, Quantità di Swing.
+            * _Parametri:_ **Velocità di Esecuzione (Lento, Medio, Veloce)**, Fattore di Stiramento/Compressione, Forza Quantizzazione, Quantità di Swing.
         * **🎲 MIDI Density Transformer**: Aggiunge o rimuove note per alterare la densità armonica.
         * **❓ MIDI Random Pitch Transformer**: Randomizza completamente l'altezza di ogni nota (pitch) per un caos melodico.
         
