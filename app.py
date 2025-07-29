@@ -1,4 +1,4 @@
-# midi_decomposer_app.py - VERSIONE AGGIORNATA CON MIDI TIME SCRAMBLER IMPLEMENTATO
+# midi_decomposer_app.py - VERSIONE AGGIORNATA CON MIDI DENSITY TRANSFORMER IMPLEMENTATO
 
 import streamlit as st
 import mido
@@ -332,11 +332,108 @@ def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, sw
 def midi_density_transformer(original_midi, add_note_probability, remove_note_probability, polyphony_mode):
     """
     Aggiunge o rimuove note per alterare la densità MIDI.
-    (Logica da implementare)
     """
-    st.info(f"Applico MIDI Density Transformer con Probabilità Aggiunta: {add_note_probability}, Rimozione: {remove_note_probability}, Modalità Polifonia: {polyphony_mode}")
-    # Questa è una placeholder: restituisce il MIDI originale
-    return original_midi # Placeholder: restituisce l'originale
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+
+    for track_index, original_track in enumerate(original_midi.tracks):
+        # 1. Convert track MIDI messages into a list of (start_abs_time, end_abs_time, pitch, velocity, channel) notes
+        extracted_notes = [] 
+        active_notes_map = {} # { (pitch, channel): {'start_abs_time': X, 'velocity': Y} }
+        
+        current_abs_time_track = 0
+        for msg in original_track:
+            current_abs_time_track += msg.time
+            if msg.type == 'note_on' and msg.velocity > 0:
+                active_notes_map[(msg.note, msg.channel)] = {'start_abs_time': current_abs_time_track, 'velocity': msg.velocity}
+            elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                key = (msg.note, msg.channel)
+                if key in active_notes_map:
+                    start_data = active_notes_map.pop(key)
+                    extracted_notes.append({
+                        'start': start_data['start_abs_time'],
+                        'end': current_abs_time_track,
+                        'pitch': msg.note,
+                        'velocity': start_data['velocity'],
+                        'channel': msg.channel
+                    })
+        # Handle any hanging notes (notes still active at the end of the track)
+        for key, start_data in active_notes_map.items():
+             extracted_notes.append({
+                'start': start_data['start_abs_time'],
+                'end': current_abs_time_track, # Assume it ends at the last event's time for this track
+                'pitch': key[0],
+                'velocity': start_data['velocity'],
+                'channel': key[1]
+            })
+
+        modified_notes_for_track = [] # List of notes that will be used to generate MIDI events
+
+        # 2. Phase: Remove Notes based on remove_note_probability
+        for note in extracted_notes:
+            if random.randint(0, 100) >= remove_note_probability: # Keep if random number is NOT below probability
+                modified_notes_for_track.append(note)
+
+        # Initialize list of final MIDI events with absolute times for this track
+        final_events_for_track = [] 
+
+        # 3. Phase: Add Drone Notes (if Drones mode selected and probability met)
+        # This is added once per track, at the beginning, for the track's duration.
+        if polyphony_mode == "Droni" and add_note_probability > 0:
+            if random.randint(0, 100) < add_note_probability: # Roll dice for the drone
+                drone_pitch = 36 # C3 (a common low drone pitch)
+                drone_velocity = 64
+                
+                # Determine the effective end time of the track for drone duration
+                track_effective_end_time = current_abs_time_track # Use the total absolute time of the original track
+                # Ensure it's at least a minimum length if the track was very short or empty
+                if track_effective_end_time < original_midi.ticks_per_beat * 4: 
+                    track_effective_end_time = original_midi.ticks_per_beat * 4 # Default to 4 beats if too short
+                
+                final_events_for_track.append({'msg': mido.Message('note_on', note=drone_pitch, velocity=drone_velocity, channel=0, time=0), 'abs_time': 0})
+                final_events_for_track.append({'msg': mido.Message('note_off', note=drone_pitch, velocity=0, channel=0, time=0), 'abs_time': track_effective_end_time + original_midi.ticks_per_beat * 4}) # Drone extends a bit beyond
+
+        # 4. Phase: Add other types of notes (Triads, Counter-Melody) based on existing notes
+        for note_data in modified_notes_for_track:
+            # Add original note_on and note_off for the processed note
+            final_events_for_track.append({'msg': mido.Message('note_on', note=note_data['pitch'], velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': note_data['start']})
+            final_events_for_track.append({'msg': mido.Message('note_off', note=note_data['pitch'], velocity=0, channel=note_data['channel'], time=0), 'abs_time': note_data['end']})
+
+            if random.randint(0, 100) < add_note_probability:
+                if polyphony_mode == "Riempi Accordo (Triadi)":
+                    # Add notes for a major triad above the current note
+                    for interval in [4, 7]: # Major 3rd, Perfect 5th (for a major triad)
+                        new_pitch = note_data['pitch'] + interval
+                        if 0 <= new_pitch <= 127: # Ensure pitch is within MIDI range
+                            final_events_for_track.append({'msg': mido.Message('note_on', note=new_pitch, velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': note_data['start']})
+                            final_events_for_track.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=note_data['channel'], time=0), 'abs_time': note_data['end']})
+                elif polyphony_mode == "Aggiungi Contro-Melodia":
+                    # Simple harmony/counter-melody: add a note a few semitones away from the original
+                    interval_choice = random.choice([-5, -3, -2, 2, 3, 5]) # Example intervals: P4 down, m3 down, m2 down, M2 up, M3 up, P4 up
+                    new_pitch = note_data['pitch'] + interval_choice
+                    if 0 <= new_pitch <= 127: # Ensure pitch is within MIDI range
+                        final_events_for_track.append({'msg': mido.Message('note_on', note=new_pitch, velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': note_data['start']})
+                        final_events_for_track.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=note_data['channel'], time=0), 'abs_time': note_data['end']})
+                # "Nessuna" implies no additional notes added here.
+
+        # 5. Phase: Sort all final events by absolute time and rebuild the MIDI track
+        final_events_for_track.sort(key=lambda x: x['abs_time'])
+
+        last_abs_time = 0
+        new_track = mido.MidiTrack()
+        for event_data in final_events_for_track:
+            msg = event_data['msg']
+            abs_time = event_data['abs_time']
+
+            delta_time = abs_time - last_abs_time
+            if delta_time < 0: # Defensive check, should not happen if sorted and logic is correct
+                delta_time = 0 
+            
+            new_msg = msg.copy(time=delta_time)
+            new_track.append(new_msg)
+            last_abs_time = abs_time
+        
+        new_midi.tracks.append(new_track)
+    return new_midi
 
 # --- Sezione Upload File MIDI ---
 st.subheader("🎵 Carica il tuo file MIDI (.mid o .midi)")
@@ -545,7 +642,7 @@ if uploaded_midi_file is not None:
         st.exception(e) # Mostra i dettagli completi dell'errore per il debug
 
 else:
-    st.info("👆 Carica un file MIDI (.mid o .midi) per iniziare la decomposizione.")
+    st.info("👆 Carica un file MIDI (.mid o (.midi) per iniziare la decomposizione.")
 
     with st.expander("📖 Come usare MIDI Decomposer"):
         st.markdown("""
