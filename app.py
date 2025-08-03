@@ -1,4 +1,4 @@
-# midi_decomposer_app.py - VERSIONE AGGIORNATA E CORRETTA (RITMO ADATTIVO, METRICA MANUALE, RITMICA SINGOLA)
+# midi_decomposer_app.py - VERSIONE AGGIORNATA (STRUTTURA RITMICA NON IN LOOP)
 
 import streamlit as st
 import mido
@@ -387,7 +387,6 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
     Aggiunge una o più tracce con una base ritmica, generate come un brano normale,
     rispettando la metrica, l'opzione di loop e lo stile del pattern.
     """
-    # Creiamo una nuova copia del MIDI per non modificare l'originale
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
     for track in original_midi.tracks:
         new_midi.tracks.append(track)
@@ -398,7 +397,6 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
         "hihat_closed": 42,
     }
     
-    # Parsing della metrica manuale
     try:
         beats_per_measure, note_value = map(int, time_signature.split('/'))
         if beats_per_measure <= 0 or note_value <= 0:
@@ -414,11 +412,10 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
         st.warning("Ticks per misura è zero. Non è possibile aggiungere la base ritmica.")
         return new_midi
 
-    # Genera il pattern ritmico in base allo stile scelto
     rhythmic_patterns = {
         "kick": [],
         "snare": [],
-        "hihat_closed": [] # Corretto il nome della chiave per coerenza
+        "hihat_closed": []
     }
     
     if rhythmic_pattern_style == "Pattern Fisso (Pop/Rock)":
@@ -471,30 +468,26 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
         if note_on_counts:
             most_common_ticks = sorted(note_on_counts, key=note_on_counts.get, reverse=True)
             
-            # Cassa: i 2-3 tick più frequenti, specialmente sul beat 1
             kick_ticks = []
             if kick:
                 for tick in most_common_ticks:
-                    if len(kick_ticks) >= 3:
-                        break
-                    # Priorità al beat 1 e 3 in 4/4
+                    if len(kick_ticks) >= 3: break
                     if (beats_per_measure == 4 and (tick == 0 or tick == ticks_per_beat * 2)) or (len(kick_ticks) < 2 and note_on_counts[tick] > 1):
                          kick_ticks.append(tick)
-                if not kick_ticks: # Se non trova accenti, metti cassa sui beat 1 e 3
+                if not kick_ticks:
                     kick_ticks.append(0)
                     if beats_per_measure >= 4:
                         kick_ticks.append(ticks_per_beat*2)
                 for tick in kick_ticks:
                     rhythmic_patterns["kick"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
             
-            # Rullante: i tick successivi ai più frequenti, ma non troppo vicini alla cassa
             snare_ticks = []
             if snare:
                 for tick in most_common_ticks:
                     is_kick_tick = any(abs(tick - kt) < ticks_per_beat / 4 for kt in kick_ticks)
                     if not is_kick_tick and len(snare_ticks) < 2:
                         snare_ticks.append(tick)
-                if not snare_ticks: # Se non trova accenti per il rullante, metti su beat 2 e 4
+                if not snare_ticks:
                     if beats_per_measure >= 2:
                         snare_ticks.append(ticks_per_beat)
                     if beats_per_measure >= 4:
@@ -502,7 +495,6 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
                 for tick in snare_ticks:
                     rhythmic_patterns["snare"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
 
-            # Hi-hat: su ogni ottavo
             if hihat:
                 ticks_per_eighth = ticks_per_beat // 2
                 for i in range(int(ticks_per_measure / ticks_per_eighth)):
@@ -525,7 +517,6 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
     if total_ticks == 0:
         total_ticks = ticks_per_measure
 
-    # Creazione delle tracce separate per ogni strumento
     instrument_names = {
         "kick": "Cassa",
         "snare": "Rullante",
