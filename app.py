@@ -418,7 +418,7 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
     rhythmic_patterns = {
         "kick": [],
         "snare": [],
-        "hihat": []
+        "hihat_closed": [] # Corretto il nome della chiave per coerenza
     }
     
     if rhythmic_pattern_style == "Pattern Fisso (Pop/Rock)":
@@ -433,7 +433,7 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
                 rhythmic_patterns["snare"].append({'start_tick': ticks_per_beat * 3, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
         if hihat:
             for i in range(beats_per_measure * 2):
-                rhythmic_patterns["hihat"].append({'start_tick': i * ticks_per_beat // 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 80})
+                rhythmic_patterns["hihat_closed"].append({'start_tick': i * ticks_per_beat // 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 80})
 
     elif rhythmic_pattern_style == "Pattern Casuale":
         kick_prob = 0.2
@@ -452,7 +452,7 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
             if snare and random.random() < snare_prob:
                 rhythmic_patterns["snare"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': random.randint(80, 110)})
             if hihat and random.random() < hihat_prob:
-                rhythmic_patterns["hihat"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': random.randint(60, 90)})
+                rhythmic_patterns["hihat_closed"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': random.randint(60, 90)})
 
     elif rhythmic_pattern_style == "Pattern Adattivo":
         note_on_counts = defaultdict(int)
@@ -463,37 +463,55 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
                 abs_time += msg.time
                 if msg.type == 'note_on' and msg.velocity > 0 and msg.channel != 9:
                     tick_in_measure = abs_time % ticks_per_measure
-                    note_on_counts[tick_in_measure] += 1
+                    # Arrotonda al sedicesimo più vicino
+                    subdivision_ticks = ticks_per_beat // 4
+                    snapped_tick = round(tick_in_measure / subdivision_ticks) * subdivision_ticks
+                    note_on_counts[snapped_tick] += 1
         
         if note_on_counts:
-            # Determinare gli accenti per cassa, rullante e hi-hat in base ai conteggi
-            total_events = sum(note_on_counts.values())
-            if total_events > 0:
-                most_common_ticks = sorted(note_on_counts, key=note_on_counts.get, reverse=True)
-                
-                # Cassa: i 2-3 tick più frequenti
-                kick_ticks = most_common_ticks[:min(3, len(most_common_ticks))]
-                if kick:
-                    for tick in kick_ticks:
-                        rhythmic_patterns["kick"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-                
-                # Rullante: i tick successivi ai più frequenti, ma non troppo vicini
-                if snare:
-                    for tick in most_common_ticks:
-                        is_kick_tick = any(abs(tick - kt) < ticks_per_beat/2 for kt in kick_ticks)
-                        if not is_kick_tick and len(rhythmic_patterns["snare"]) < 2:
-                            rhythmic_patterns["snare"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+            most_common_ticks = sorted(note_on_counts, key=note_on_counts.get, reverse=True)
+            
+            # Cassa: i 2-3 tick più frequenti, specialmente sul beat 1
+            kick_ticks = []
+            if kick:
+                for tick in most_common_ticks:
+                    if len(kick_ticks) >= 3:
+                        break
+                    # Priorità al beat 1 e 3 in 4/4
+                    if (beats_per_measure == 4 and (tick == 0 or tick == ticks_per_beat * 2)) or (len(kick_ticks) < 2 and note_on_counts[tick] > 1):
+                         kick_ticks.append(tick)
+                if not kick_ticks: # Se non trova accenti, metti cassa sui beat 1 e 3
+                    kick_ticks.append(0)
+                    if beats_per_measure >= 4:
+                        kick_ticks.append(ticks_per_beat*2)
+                for tick in kick_ticks:
+                    rhythmic_patterns["kick"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+            
+            # Rullante: i tick successivi ai più frequenti, ma non troppo vicini alla cassa
+            snare_ticks = []
+            if snare:
+                for tick in most_common_ticks:
+                    is_kick_tick = any(abs(tick - kt) < ticks_per_beat / 4 for kt in kick_ticks)
+                    if not is_kick_tick and len(snare_ticks) < 2:
+                        snare_ticks.append(tick)
+                if not snare_ticks: # Se non trova accenti per il rullante, metti su beat 2 e 4
+                    if beats_per_measure >= 2:
+                        snare_ticks.append(ticks_per_beat)
+                    if beats_per_measure >= 4:
+                        snare_ticks.append(ticks_per_beat*3)
+                for tick in snare_ticks:
+                    rhythmic_patterns["snare"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
 
-                # Hi-hat: su ogni ottavo o sedicesimo
-                if hihat:
-                    ticks_per_eighth = ticks_per_beat // 2
-                    for i in range(int(ticks_per_measure / ticks_per_eighth)):
-                        rhythmic_patterns["hihat"].append({'start_tick': i * ticks_per_eighth, 'duration_ticks': ticks_per_eighth // 2, 'velocity': random.randint(60, 90)})
-            else:
-                 st.warning("Nessuna nota trovata nel MIDI per creare un pattern adattivo. Verrà usato un pattern fisso.")
-                 if kick: rhythmic_patterns["kick"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-                 if snare: rhythmic_patterns["snare"].append({'start_tick': ticks_per_beat, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-                 if hihat: rhythmic_patterns["hihat"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 2, 'velocity': 80})
+            # Hi-hat: su ogni ottavo
+            if hihat:
+                ticks_per_eighth = ticks_per_beat // 2
+                for i in range(int(ticks_per_measure / ticks_per_eighth)):
+                    rhythmic_patterns["hihat_closed"].append({'start_tick': i * ticks_per_eighth, 'duration_ticks': ticks_per_eighth // 2, 'velocity': random.randint(60, 90)})
+        else:
+            st.warning("Nessuna nota trovata nel MIDI per creare un pattern adattivo. Verrà usato un pattern fisso.")
+            if kick: rhythmic_patterns["kick"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+            if snare: rhythmic_patterns["snare"].append({'start_tick': ticks_per_beat, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+            if hihat: rhythmic_patterns["hihat_closed"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 2, 'velocity': 80})
 
     max_abs_time = 0
     for track in original_midi.tracks:
@@ -508,12 +526,18 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
         total_ticks = ticks_per_measure
 
     # Creazione delle tracce separate per ogni strumento
+    instrument_names = {
+        "kick": "Cassa",
+        "snare": "Rullante",
+        "hihat_closed": "Hi-hat"
+    }
+
     for drum_note_name, patterns in rhythmic_patterns.items():
         if not patterns:
             continue
             
         new_drum_track = mido.MidiTrack()
-        new_drum_track.name = f"Ritmica: {drum_note_name.capitalize()}"
+        new_drum_track.name = f"Ritmica: {instrument_names[drum_note_name]}"
         new_drum_track.append(mido.Message('program_change', program=0, channel=9, time=0))
         
         all_drum_events = []
@@ -526,12 +550,12 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
                 
                 if start_abs_time < total_ticks:
                     all_drum_events.append({
-                        'msg': mido.Message('note_on', note=DRUM_MAP[f'{drum_note_name}'], velocity=event['velocity'], channel=9),
+                        'msg': mido.Message('note_on', note=DRUM_MAP[drum_note_name], velocity=event['velocity'], channel=9),
                         'abs_time': start_abs_time
                     })
                     if end_abs_time < total_ticks:
                         all_drum_events.append({
-                            'msg': mido.Message('note_off', note=DRUM_MAP[f'{drum_note_name}'], velocity=0, channel=9),
+                            'msg': mido.Message('note_off', note=DRUM_MAP[drum_note_name], velocity=0, channel=9),
                             'abs_time': end_abs_time
                         })
             
@@ -710,13 +734,8 @@ if uploaded_midi_file is not None:
                                 track_name = msg.name
                                 break
                         
-                        if not track_name and any(msg.type == 'note_on' and msg.channel == 9 for msg in track):
-                             if 'Cassa' in track.name:
-                                 return f"Ritmica: Cassa"
-                             if 'Rullante' in track.name:
-                                 return f"Ritmica: Rullante"
-                             if 'Hi-hat' in track.name:
-                                 return f"Ritmica: Hi-hat"
+                        if not track_name and 'Ritmica:' in track.name:
+                             return track.name
                              
                         return f"Traccia {index}: {track_name if track_name else '(Senza Nome)'}"
 
