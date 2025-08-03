@@ -361,11 +361,18 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
     if ticks_per_measure == 0:
         st.warning("Ticks per misura è zero. Non è possibile aggiungere la base ritmica.")
         return new_midi
-    
-    max_abs_time = sum(m.time for t in original_midi.tracks for m in t) if original_midi.tracks else 0
-    total_ticks = max_abs_time
+
+    # Calcolo della durata totale del brano originale in ticks
+    total_ticks = 0
+    for track in original_midi.tracks:
+        current_time = 0
+        for msg in track:
+            current_time += msg.time
+        total_ticks = max(total_ticks, current_time)
+
     if total_ticks == 0:
-        total_ticks = ticks_per_measure
+        st.warning("Il brano originale non contiene eventi validi per calcolare la lunghezza. La base ritmica non verrà aggiunta.")
+        return new_midi
 
     rhythmic_patterns_in_measure = {
         "kick": [],
