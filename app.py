@@ -1,4 +1,4 @@
- # midi_decomposer_app.py - VERSIONE AGGIORNATA CON TUTTE LE MODIFICHE RICHIESTE
+# midi_decomposer_app.py - VERSIONE AGGIORNATA CON TUTTE LE MODIFICHE RICHIESTE
 
 import streamlit as st
 import mido
@@ -381,6 +381,73 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength):
         new_midi.tracks.append(new_track)
     return new_midi
 
+def midi_add_rhythmic_base(original_midi, kick, snare, hihat):
+    """
+    Aggiunge una nuova traccia con una base ritmica, generata come un brano normale.
+    """
+    new_midi = original_midi.copy()
+    new_drum_track = mido.MidiTrack()
+    
+    # Mappa le note MIDI standard della batteria (GM Drum Map)
+    DRUM_MAP = {
+        "kick": 36,     # Cassa (C1)
+        "snare": 38,    # Rullante (D1)
+        "hihat_closed": 42, # Hi-hat chiuso (F#1)
+    }
+    
+    ticks_per_beat = new_midi.ticks_per_beat
+    
+    rhythmic_pattern = []
+    
+    if kick:
+        # Pattern cassa in 4/4
+        rhythmic_pattern.append({'note': "kick", 'start_tick': 0, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+        rhythmic_pattern.append({'note': "kick", 'start_tick': ticks_per_beat * 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+    if snare:
+        # Rullante su 2 e 4
+        rhythmic_pattern.append({'note': "snare", 'start_tick': ticks_per_beat, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+        rhythmic_pattern.append({'note': "snare", 'start_tick': ticks_per_beat * 3, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+    if hihat:
+        # Hi-hat sugli ottavi
+        rhythmic_pattern.append({'note': "hihat_closed", 'start_tick': ticks_per_beat // 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 80})
+        rhythmic_pattern.append({'note': "hihat_closed", 'start_tick': ticks_per_beat + ticks_per_beat // 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 80})
+        rhythmic_pattern.append({'note': "hihat_closed", 'start_tick': ticks_per_beat * 2 + ticks_per_beat // 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 80})
+        rhythmic_pattern.append({'note': "hihat_closed", 'start_tick': ticks_per_beat * 3 + ticks_per_beat // 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 80})
+
+    
+    total_ticks = new_midi.length * new_midi.ticks_per_beat
+    
+    new_drum_track.append(mido.Message('program_change', program=0, channel=9, time=0))
+    
+    current_time_ticks = 0
+    all_drum_events = []
+    
+    while current_time_ticks < total_ticks:
+        for event in rhythmic_pattern:
+            all_drum_events.append({
+                'msg': mido.Message('note_on', note=DRUM_MAP[event['note']], velocity=event['velocity'], channel=9),
+                'abs_time': current_time_ticks + event['start_tick']
+            })
+            all_drum_events.append({
+                'msg': mido.Message('note_off', note=DRUM_MAP[event['note']], velocity=0, channel=9),
+                'abs_time': current_time_ticks + event['start_tick'] + event['duration_ticks']
+            })
+        
+        current_time_ticks += ticks_per_beat * 4 
+
+    all_drum_events.sort(key=lambda x: x['abs_time'])
+    
+    last_abs_time = 0
+    for event in all_drum_events:
+        delta_time = event['abs_time'] - last_abs_time
+        if delta_time < 0:
+            delta_time = 0
+        new_msg = event['msg'].copy(time=delta_time)
+        new_drum_track.append(new_msg)
+        last_abs_time = event['abs_time']
+
+    new_midi.tracks.append(new_drum_track)
+    return new_midi
 
 # --- Sezione Upload File MIDI ---
 st.subheader("🎵 Carica il tuo file MIDI (.mid o .midi)")
@@ -411,7 +478,8 @@ if uploaded_midi_file is not None:
             "MIDI Phrase Reconstructor": "🔄 Riorganizzazione Frasi (Orizzontale)",
             "MIDI Time Scrambler": "⏳ Manipolazione Ritmo/Durata (Orizzontale)",
             "MIDI Density Transformer": "🎲 Controllo Densità (Armonia/Contrappunto)",
-            "MIDI Random Pitch Transformer": "❓ Randomizzazione Totale Pitch (Caos)"
+            "MIDI Random Pitch Transformer": "❓ Randomizzazione Totale Pitch (Caos)",
+            "MIDI Rhythmic Base": "🥁 Aggiungi Base Ritmica" # Nuovo nome
         }
 
         # MODIFICA: Utilizzo di st.multiselect invece di st.selectbox
@@ -461,7 +529,6 @@ if uploaded_midi_file is not None:
                 quantization_strength = st.slider("Forza Quantizzazione (0=libero, 100=rigido):", 0, 100, 50, help="Quanto le note verranno 'allineate' a una griglia ritmica (es. a 16esimi).", key=f"time_quant_strength_{selected_method}")
                 swing_amount = st.slider("Quantità di Swing (%):", 0, 100, 0, help="Aggiunge un 'groove' swing ritardando alcune suddivisioni (solo con quantizzazione attiva).", key=f"time_swing_amount_{selected_method}")
 
-                # Se l'utente vuole mantenere la durata, forziamo il fattore di stiramento a 1.0
                 if keep_original_duration:
                     stretch_factor = 1.0
                 
@@ -476,6 +543,13 @@ if uploaded_midi_file is not None:
             elif selected_method == "MIDI Random Pitch Transformer":
                 random_pitch_strength = st.slider("Forza Randomizzazione Pitch (%):", 0, 100, 100, help="Probabilità che ogni nota (on/off) abbia il suo pitch completamente randomizzato (0-127).", key=f"random_pitch_strength_{selected_method}")
                 parameters[selected_method] = (random_pitch_strength,)
+
+            elif selected_method == "MIDI Rhythmic Base":
+                st.markdown("Seleziona gli elementi ritmici per costruire il tuo pattern:")
+                kick_enabled = st.checkbox("Cassa (4/4)", value=True, key="rhythm_kick")
+                snare_enabled = st.checkbox("Rullante (su 2 e 4)", value=True, key="rhythm_snare")
+                hihat_enabled = st.checkbox("Hi-hat (su ottavi)", value=True, key="rhythm_hihat")
+                parameters[selected_method] = (kick_enabled, snare_enabled, hihat_enabled)
 
         if st.button("🎶 DECOMPONI MIDI", type="primary", use_container_width=True):
             with st.spinner("Applicando le decomposizioni..."):
@@ -492,6 +566,8 @@ if uploaded_midi_file is not None:
                         current_midi = midi_density_transformer(current_midi, *method_params)
                     elif method_key == "MIDI Random Pitch Transformer":
                         current_midi = midi_random_pitch_transformer(current_midi, *method_params)
+                    elif method_key == "MIDI Rhythmic Base":
+                        current_midi = midi_add_rhythmic_base(current_midi, *method_params)
 
                 decomposed_midi_file = current_midi
 
@@ -518,6 +594,8 @@ if uploaded_midi_file is not None:
                             if msg.type == 'track_name':
                                 track_name = msg.name
                                 break
+                        if not track_name and any(msg.type == 'note_on' and msg.channel == 9 for msg in track):
+                            return f"Traccia {index}: Ritmica (Drums)"
                         return f"Traccia {index}: {track_name if track_name else '(Senza Nome)'}"
 
                     if len(decomposed_midi_file.tracks) > 0:
@@ -589,6 +667,7 @@ else:
         * **⏳ MIDI Time Scrambler**: Modifica il timing e la durata delle note per creare nuovi groove. Ora puoi scegliere se mantenere la durata originale del brano!
         * **🎲 MIDI Density Transformer**: Aggiunge o rimuove note per alterare la densità armonica.
         * **❓ MIDI Random Pitch Transformer**: Randomizza completamente l'altezza di ogni nota (pitch) per un caos melodico.
+        * **🥁 Aggiungi Base Ritmica**: Aggiunge una nuova traccia di batteria al tuo brano per creare un sound dance o pop!
         
         **Risoluzione Problemi:**
         
