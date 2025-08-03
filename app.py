@@ -333,10 +333,10 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength):
         new_midi.tracks.append(new_track)
     return new_midi
 
-def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, loop_rhythmic_base, rhythmic_pattern_style):
+def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rhythmic_pattern_style):
     """
     Aggiunge una o più tracce con una base ritmica, generate come un brano normale,
-    rispettando la metrica, l'opzione di loop e lo stile del pattern.
+    rispettando la metrica e lo stile del pattern.
     """
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
     for track in original_midi.tracks:
@@ -362,6 +362,11 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
     if ticks_per_measure == 0:
         st.warning("Ticks per misura è zero. Non è possibile aggiungere la base ritmica.")
         return new_midi
+    
+    max_abs_time = sum(m.time for t in original_midi.tracks for m in t) if original_midi.tracks else 0
+    total_ticks = max_abs_time
+    if total_ticks == 0:
+        total_ticks = ticks_per_measure
 
     rhythmic_patterns = {
         "kick": [],
@@ -437,10 +442,6 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
             if snare: rhythmic_patterns["snare"].append({'start_tick': ticks_per_beat, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
             if hihat: rhythmic_patterns["hihat_closed"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 2, 'velocity': 80})
 
-    max_abs_time = sum(m.time for t in original_midi.tracks for m in t) if original_midi.tracks else 0
-    total_ticks = max_abs_time if loop_rhythmic_base else ticks_per_measure
-    if total_ticks == 0: total_ticks = ticks_per_measure
-
     instrument_names = {"kick": "Cassa", "snare": "Rullante", "hihat_closed": "Hi-hat"}
 
     for drum_note_name, patterns in rhythmic_patterns.items():
@@ -459,8 +460,8 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, lo
                     all_drum_events.append({'msg': mido.Message('note_on', note=DRUM_MAP[drum_note_name], velocity=event['velocity'], channel=9), 'abs_time': start_abs_time})
                     if end_abs_time < total_ticks:
                         all_drum_events.append({'msg': mido.Message('note_off', note=DRUM_MAP[drum_note_name], velocity=0, channel=9), 'abs_time': end_abs_time})
-            if not loop_rhythmic_base: break
-            current_time_ticks += ticks_per_measure 
+            
+            current_time_ticks += ticks_per_measure
 
         all_drum_events.sort(key=lambda x: x['abs_time'])
         last_abs_time = 0
@@ -559,8 +560,7 @@ if uploaded_midi_file is not None:
                 with col_rhythm2:
                     time_signature = st.text_input("Metrica (es. '4/4', '3/4', '5/8'):", value="4/4", key=f"rhythm_time_sig_{selected_method}")
                     rhythmic_pattern_style = st.selectbox("Stile Pattern Ritmico:", ["Pattern Adattivo", "Pattern Fisso (Pop/Rock)", "Pattern Casuale"], key=f"rhythm_pattern_style_{selected_method}")
-                    loop_rhythmic_base = st.checkbox("Ripeti Base Ritmica (Loop)", value=True, key=f"rhythm_loop_{selected_method}")
-                parameters[selected_method] = (kick_enabled, snare_enabled, hihat_enabled, time_signature, loop_rhythmic_base, rhythmic_pattern_style)
+                parameters[selected_method] = (kick_enabled, snare_enabled, hihat_enabled, time_signature, rhythmic_pattern_style)
 
         if st.button("🎶 DECOMPONI MIDI", type="primary", use_container_width=True):
             with st.spinner("Applicando le decomposizioni..."):
@@ -597,7 +597,7 @@ if uploaded_midi_file is not None:
                     
                     def get_track_display_name(track, index):
                         track_name = next((msg.name for msg in track if msg.type == 'track_name'), None)
-                        if not track_name and 'Ritmica:' in track.name:
+                        if not track_name and hasattr(track, 'name') and 'Ritmica:' in track.name:
                              return track.name
                         return f"Traccia {index}: {track_name if track_name else '(Senza Nome)'}"
 
