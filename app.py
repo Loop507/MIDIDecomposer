@@ -1,4 +1,4 @@
-# midi_decomposer_app.py - VERSIONE AGGIORNATA CON TUTTE LE MODIFICHE RICHIESTE
+# midi_decomposer_app.py - VERSIONE AGGIORNATA E CORRETTA
 
 import streamlit as st
 import mido
@@ -381,11 +381,16 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength):
         new_midi.tracks.append(new_track)
     return new_midi
 
+
 def midi_add_rhythmic_base(original_midi, kick, snare, hihat):
     """
     Aggiunge una nuova traccia con una base ritmica, generata come un brano normale.
     """
-    new_midi = original_midi.copy()
+    # CORREZIONE: Creiamo un nuovo oggetto MidiFile e copiamo le tracce esistenti
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    for track in original_midi.tracks:
+        new_midi.tracks.append(track)
+    
     new_drum_track = mido.MidiTrack()
     
     # Mappa le note MIDI standard della batteria (GM Drum Map)
