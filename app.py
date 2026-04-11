@@ -1,3 +1,5 @@
+# midi_decomposer_app.py - VERSIONE INTEGRALE DEFINITIVA
+
 import streamlit as st
 import mido
 import random
@@ -25,142 +27,114 @@ st.markdown("""
 def get_key_offset(key_name):
     note_offsets = {'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4, 'F': 5,
                     'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11}
-    # AGGIORNAMENTO: Supporto per tonalità minori
     clean_key = key_name.replace('m', '')
     return note_offsets.get(clean_key, 0)
+
+def get_scale_notes(scale_name):
+    scales = {
+        "Cromatica": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        "Maggiore": [0, 2, 4, 5, 7, 9, 11],
+        "Minore Naturale": [0, 2, 3, 5, 7, 8, 10],
+        "Pentatonica Maggiore": [0, 2, 4, 7, 9],
+        "Blues": [0, 3, 5, 6, 7, 10]
+    }
+    return scales.get(scale_name, scales["Cromatica"])
 
 def extract_notes(track):
     notes = []
     active_notes = {}
-    current_time = 0
+    current_abs_time = 0
     for msg in track:
-        current_time += msg.time
+        current_abs_time += msg.time
         if msg.type == 'note_on' and msg.velocity > 0:
-            active_notes[(msg.note, msg.channel)] = (current_time, msg.velocity)
-        elif (msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0)):
+            active_notes[(msg.note, msg.channel)] = {'start': current_abs_time, 'velocity': msg.velocity}
+        elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
             key = (msg.note, msg.channel)
             if key in active_notes:
-                start_time, velocity = active_notes.pop(key)
-                notes.append({
-                    'pitch': msg.note, 'start': start_time, 'end': current_time,
-                    'velocity': velocity, 'channel': msg.channel
-                })
+                start_data = active_notes.pop(key)
+                notes.append({'start': start_data['start'], 'end': current_abs_time, 'pitch': msg.note, 'velocity': start_data['velocity'], 'channel': key[1]})
     return notes
 
 def reconstruct_track(notes, ticks_per_beat):
-    events = []
-    for n in notes:
-        events.append({'time': n['start'], 'type': 'note_on', 'note': n['pitch'], 'velocity': n['velocity'], 'channel': n['channel']})
-        events.append({'time': n['end'], 'type': 'note_off', 'note': n['pitch'], 'velocity': 0, 'channel': n['channel']})
-    events.sort(key=lambda x: x['time'])
     new_track = mido.MidiTrack()
-    last_time = 0
-    for e in events:
-        delta = max(0, e['time'] - last_time)
-        new_track.append(mido.Message(e['type'], note=e['note'], velocity=e['velocity'], time=delta, channel=e['channel']))
-        last_time = e['time']
+    events = []
+    for note in notes:
+        events.append({'msg': mido.Message('note_on', note=note['pitch'], velocity=note['velocity'], channel=note['channel'], time=0), 'abs_time': note['start']})
+        events.append({'msg': mido.Message('note_off', note=note['pitch'], velocity=0, channel=note['channel'], time=0), 'abs_time': note['end']})
+    events.sort(key=lambda x: x['abs_time'])
+    last_abs_time = 0
+    for event in events:
+        delta_time = max(0, event['abs_time'] - last_abs_time)
+        new_msg = event['msg'].copy(time=delta_time)
+        new_track.append(new_msg)
+        last_abs_time = event['abs_time']
     return new_track
 
-# --- Moduli di Decomposizione (TUOI ORIGINALI) ---
+# --- MODULI ORIGINALI ---
 
-def midi_note_remapper(mid, key_offset, scale_type, randomization_level):
-    new_mid = mido.MidiFile(ticks_per_beat=mid.ticks_per_beat)
-    scales = {
-        "Maggiore": [0, 2, 4, 5, 7, 9, 11],
-        "Minore Naturale": [0, 2, 3, 5, 7, 8, 10],
-        "Pentatonica Maggiore": [0, 2, 4, 7, 9],
-        "Pentatonica Minore": [0, 3, 5, 7, 10],
-        "Cromatica": list(range(12))
-    }
-    allowed_steps = scales.get(scale_type, list(range(12)))
-    for track in mid.tracks:
+def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    target_scale_intervals = get_scale_notes(target_scale_name)
+    key_offset = get_key_offset(target_key_name)
+    for track in original_midi.tracks:
         new_track = mido.MidiTrack()
         for msg in track:
-            if msg.type in ['note_on', 'note_off'] and msg.channel != 9:
-                new_note = msg.note + key_offset
-                if randomization_level > 0:
-                    new_note += random.randint(-randomization_level, randomization_level)
-                octave, pitch_in_octave = divmod(new_note, 12)
-                if pitch_in_octave not in allowed_steps:
-                    pitch_in_octave = min(allowed_steps, key=lambda x: abs(x - pitch_in_octave))
-                msg.note = max(0, min(127, octave * 12 + pitch_in_octave))
-            new_track.append(msg)
-        new_mid.tracks.append(new_track)
-    return new_mid
+            if msg.type in ['note_on', 'note_off']:
+                new_note = max(0, min(127, msg.note + random.randint(-pitch_shift_range, pitch_shift_range)))
+                note_in_octave = (new_note - key_offset) % 12
+                closest_scale = min(target_scale_intervals, key=lambda x: abs(note_in_octave - x))
+                new_pitch = ((new_note - key_offset) // 12) * 12 + closest_scale + key_offset
+                new_vel = msg.velocity
+                if msg.type == 'note_on' and velocity_randomization > 0:
+                    new_vel = max(1, min(127, int(msg.velocity * (1 + random.uniform(-velocity_randomization/100, velocity_randomization/100)))))
+                new_track.append(msg.copy(note=max(0, min(127, new_pitch)), velocity=new_vel))
+            else: new_track.append(msg.copy())
+        new_midi.tracks.append(new_track)
+    return new_midi
 
-# [Qui si intendono incluse le tue altre funzioni originali: Phrase Reconstructor, Time Scrambler, etc.]
-# Per brevità ho mantenuto la logica di chiamata, ma ecco i NUOVI MODULI integrati:
+def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_style):
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    ticks_per_phrase = original_midi.ticks_per_beat * phrase_length_beats
+    for track in original_midi.tracks:
+        notes = extract_notes(track)
+        if not notes:
+            new_midi.tracks.append(track)
+            continue
+        max_time = max(n['end'] for n in notes)
+        phrases = []
+        for t in range(0, max_time, ticks_per_phrase):
+            p_notes = [n for n in notes if t <= n['start'] < t + ticks_per_phrase]
+            if p_notes: phrases.append((t, p_notes))
+        if reassembly_style == "Casuale": random.shuffle(phrases)
+        elif reassembly_style == "Inversione": phrases.reverse()
+        new_notes = []
+        curr_offset = 0
+        for orig_start, p_n in phrases:
+            for n in p_n:
+                new_notes.append({'pitch': n['pitch'], 'start': n['start'] - orig_start + curr_offset, 'end': n['end'] - orig_start + curr_offset, 'velocity': n['velocity'], 'channel': n['channel']})
+            curr_offset += ticks_per_phrase
+        new_midi.tracks.append(reconstruct_track(new_notes, original_midi.ticks_per_beat))
+    return new_midi
 
-def midi_genetic_shuffler(mid, complexity):
-    new_mid = mido.MidiFile(ticks_per_beat=mid.ticks_per_beat)
-    all_p = [m.note for t in mid.tracks for m in t if m.type == 'note_on' and m.velocity > 0]
-    if not all_p: return mid
-    new_t = mido.MidiTrack()
-    step = mid.ticks_per_beat // 2
-    for _ in range(64):
-        if random.randint(1, 10) <= complexity:
-            p = random.choice(all_p)
-            new_t.append(mido.Message('note_on', note=p, velocity=80, time=0))
-            new_t.append(mido.Message('note_off', note=p, velocity=0, time=step))
-        else: new_t.append(mido.Message('note_off', note=0, velocity=0, time=step))
-    new_mid.tracks.append(new_t)
-    return new_mid
+def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, swing_amount):
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    tpb = original_midi.ticks_per_beat
+    for track in original_midi.tracks:
+        notes = extract_notes(track)
+        if not notes:
+            new_midi.tracks.append(track)
+            continue
+        for n in notes:
+            n['start'] = int(n['start'] * stretch_factor)
+            n['end'] = int(n['end'] * stretch_factor)
+            if quantization_strength > 0:
+                grid = tpb / 4
+                snap = round(n['start'] / grid) * grid
+                n['start'] = int(n['start'] * (1 - quantization_strength/100) + snap * (quantization_strength/100))
+        new_midi.tracks.append(reconstruct_track(notes, tpb))
+    return new_midi
 
-def midi_stochastic_composer(mid, density, dur_range):
-    new_mid = mido.MidiFile(ticks_per_beat=mid.ticks_per_beat)
-    all_p = [m.note for t in mid.tracks for m in t if m.type == 'note_on']
-    notes_gen, curr = [], 0
-    while curr < 10000:
-        if random.randint(0, 100) < density:
-            p = random.choice(all_p)
-            d = random.randint(dur_range[0], dur_range[1])
-            notes_gen.append({'pitch': p, 'start': curr, 'end': curr+d, 'velocity': 70, 'channel': 0})
-        curr += random.randint(100, 400)
-    new_mid.tracks.append(reconstruct_track(notes_gen, mid.ticks_per_beat))
-    return new_mid
+# --- NUOVI MODULI ALGORITMICI (INTEGRATI) ---
 
-# --- Interfaccia Sidebar ---
-st.sidebar.header("⚙️ Impostazioni")
-uploaded_file = st.sidebar.file_uploader("Carica MIDI", type=['mid', 'midi'])
-
-midi_methods = {
-    "Remapper": "🎶 MIDI Note Remapper",
-    "Genetic": "🧬 Genetic Shuffler (Nuovo Brano)",
-    "Stochastic": "🎲 Stochastic Cloud (Stocastica)",
-    "Brownian": "🚶 Brownian Walker",
-    "Cellular": "🦠 Automi Cellulari",
-    "Fractal": "❄️ Frattali L-System"
-}
-
-selected_names = st.sidebar.multiselect("Scegli Metodi:", list(midi_methods.values()))
-selected_keys = [k for k, v in midi_methods.items() if v in selected_names]
-
-params = {}
-for k in selected_keys:
-    if k == "Remapper":
-        key = st.sidebar.selectbox("Tonalità:", ["C", "Cm", "D", "Dm", "E", "Em", "F", "Fm", "G", "Gm", "A", "Am", "B"])
-        scale = st.sidebar.selectbox("Scala:", ["Maggiore", "Minore Naturale", "Pentatonica"])
-        rand = st.sidebar.slider("Random Pitch:", 0, 12, 0)
-        params[k] = (get_key_offset(key), scale, rand)
-    elif k == "Genetic":
-        params[k] = (st.sidebar.slider("Complessità:", 1, 10, 5),)
-    elif k == "Stochastic":
-        params[k] = (st.sidebar.slider("Densità:", 10, 100, 50), (240, 960))
-
-# --- Logica di Esecuzione ---
-if uploaded_file and st.button("🎶 DECOMPONI MIDI"):
-    mid = mido.MidiFile(file=io.BytesIO(uploaded_file.getvalue()))
-    current_midi = mid
-    
-    for k in selected_keys:
-        if k == "Remapper": current_midi = midi_note_remapper(current_midi, *params[k])
-        elif k == "Genetic": current_midi = midi_genetic_shuffler(current_midi, *params[k])
-        elif k == "Stochastic": current_midi = midi_stochastic_composer(current_midi, *params[k])
-        # [E così via per tutti i metodi...]
-
-    buf = io.BytesIO()
-    current_midi.save(file=buf)
-    st.download_button("💾 Scarica Risultato", buf.getvalue(), "decomposed.mid")
-
-st.markdown("---")
-st.info("Questa versione mantiene le tue prestazioni originali aggiungendo i nuovi moduli algoritmici.")
+def midi_stochastic_composer(original_midi, density, dur_range):
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.
