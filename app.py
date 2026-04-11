@@ -1,5 +1,3 @@
-# midi_decomposer_app.py - VERSIONE INTEGRALE DEFINITIVA
-
 import streamlit as st
 import mido
 import random
@@ -19,7 +17,6 @@ st.markdown("""
 <div style='text-align: center; padding: 20px;'>
     <h1> MIDI Decomposer <span style='font-size:0.6em; color: #666;'>by <span style='font-size:0.8em;'>loop507</span></span></h1>
     <p style='font-size: 1.2em; color: #888;'>Scomponi e Ricomponi File MIDI in Nuove Strutture Musicali</p>
-    <p style='font-style: italic;'>Esplora il caos e l'ordine nella generazione MIDI</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -32,7 +29,7 @@ def get_key_offset(key_name):
 
 def get_scale_notes(scale_name):
     scales = {
-        "Cromatica": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        "Cromatica": list(range(12)),
         "Maggiore": [0, 2, 4, 5, 7, 9, 11],
         "Minore Naturale": [0, 2, 3, 5, 7, 8, 10],
         "Pentatonica Maggiore": [0, 2, 4, 7, 9],
@@ -65,76 +62,98 @@ def reconstruct_track(notes, ticks_per_beat):
     last_abs_time = 0
     for event in events:
         delta_time = max(0, event['abs_time'] - last_abs_time)
-        new_msg = event['msg'].copy(time=delta_time)
-        new_track.append(new_msg)
+        new_track.append(event['msg'].copy(time=delta_time))
         last_abs_time = event['abs_time']
     return new_track
 
-# --- MODULI ORIGINALI ---
+# --- Metodi di Elaborazione ---
 
-def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
+def midi_note_remapper(original_midi, scale_name, key_name, shift, vel_rand):
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
-    target_scale_intervals = get_scale_notes(target_scale_name)
-    key_offset = get_key_offset(target_key_name)
+    intervals = get_scale_notes(scale_name)
+    offset = get_key_offset(key_name)
     for track in original_midi.tracks:
         new_track = mido.MidiTrack()
         for msg in track:
             if msg.type in ['note_on', 'note_off']:
-                new_note = max(0, min(127, msg.note + random.randint(-pitch_shift_range, pitch_shift_range)))
-                note_in_octave = (new_note - key_offset) % 12
-                closest_scale = min(target_scale_intervals, key=lambda x: abs(note_in_octave - x))
-                new_pitch = ((new_note - key_offset) // 12) * 12 + closest_scale + key_offset
-                new_vel = msg.velocity
-                if msg.type == 'note_on' and velocity_randomization > 0:
-                    new_vel = max(1, min(127, int(msg.velocity * (1 + random.uniform(-velocity_randomization/100, velocity_randomization/100)))))
-                new_track.append(msg.copy(note=max(0, min(127, new_pitch)), velocity=new_vel))
+                new_p = max(0, min(127, msg.note + random.randint(-shift, shift)))
+                note_in_oct = (new_p - offset) % 12
+                closest = min(intervals, key=lambda x: abs(note_in_oct - x))
+                final_p = ((new_p - offset) // 12) * 12 + closest + offset
+                v = msg.velocity
+                if msg.type == 'note_on' and vel_rand > 0:
+                    v = max(1, min(127, int(v * (1 + random.uniform(-vel_rand/100, vel_rand/100)))))
+                new_track.append(msg.copy(note=max(0, min(127, final_p)), velocity=v))
             else: new_track.append(msg.copy())
         new_midi.tracks.append(new_track)
     return new_midi
 
-def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_style):
+def midi_cellular_automata(original_midi, generations):
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
-    ticks_per_phrase = original_midi.ticks_per_beat * phrase_length_beats
-    for track in original_midi.tracks:
-        notes = extract_notes(track)
-        if not notes:
-            new_midi.tracks.append(track)
-            continue
-        max_time = max(n['end'] for n in notes)
-        phrases = []
-        for t in range(0, max_time, ticks_per_phrase):
-            p_notes = [n for n in notes if t <= n['start'] < t + ticks_per_phrase]
-            if p_notes: phrases.append((t, p_notes))
-        if reassembly_style == "Casuale": random.shuffle(phrases)
-        elif reassembly_style == "Inversione": phrases.reverse()
-        new_notes = []
-        curr_offset = 0
-        for orig_start, p_n in phrases:
-            for n in p_n:
-                new_notes.append({'pitch': n['pitch'], 'start': n['start'] - orig_start + curr_offset, 'end': n['end'] - orig_start + curr_offset, 'velocity': n['velocity'], 'channel': n['channel']})
-            curr_offset += ticks_per_phrase
-        new_midi.tracks.append(reconstruct_track(new_notes, original_midi.ticks_per_beat))
+    all_n = [n for t in original_midi.tracks for n in extract_notes(t)]
+    if not all_n: return original_midi
+    max_t = max(n['end'] for n in all_n)
+    pitches = sorted(list(set([n['pitch'] for n in all_n])))
+    state = [1 if i in pitches else 0 for i in range(128)]
+    step = original_midi.ticks_per_beat // 2
+    new_notes, curr_t = [], 0
+    for _ in range(generations):
+        if curr_t >= max_t: break
+        new_s = [0]*128
+        for i in range(1, 127):
+            neighbors = state[i-1] + state[i+1]
+            if neighbors == 1: new_s[i] = 1
+        for p, active in enumerate(new_s):
+            if active: new_notes.append({'pitch': p, 'start': curr_t, 'end': curr_t + step, 'velocity': 70, 'channel': 0})
+        state = new_s
+        curr_t += step
+    new_midi.tracks.append(reconstruct_track(new_notes, original_midi.ticks_per_beat))
     return new_midi
 
-def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, swing_amount):
+def midi_fractal_generator(original_midi, iterations):
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
-    tpb = original_midi.ticks_per_beat
-    for track in original_midi.tracks:
-        notes = extract_notes(track)
-        if not notes:
-            new_midi.tracks.append(track)
-            continue
-        for n in notes:
-            n['start'] = int(n['start'] * stretch_factor)
-            n['end'] = int(n['end'] * stretch_factor)
-            if quantization_strength > 0:
-                grid = tpb / 4
-                snap = round(n['start'] / grid) * grid
-                n['start'] = int(n['start'] * (1 - quantization_strength/100) + snap * (quantization_strength/100))
-        new_midi.tracks.append(reconstruct_track(notes, tpb))
+    notes = [n for t in original_midi.tracks for n in extract_notes(t)][:4]
+    if not notes: return original_midi
+    motif = [n['pitch'] for n in notes]
+    def expand(seq, lev):
+        if lev == 0: return seq
+        res = []
+        for p in seq: res.extend([m + (p - motif[0]) for m in motif])
+        return expand(res, lev - 1)
+    f_pitches = expand(motif, iterations)[:200]
+    step = original_midi.ticks_per_beat // 4
+    new_notes = [{'pitch': max(0, min(127, p)), 'start': i*step, 'end': (i+1)*step, 'velocity': 70, 'channel': 0} for i, p in enumerate(f_pitches)]
+    new_midi.tracks.append(reconstruct_track(new_notes, original_midi.ticks_per_beat))
     return new_midi
 
-# --- NUOVI MODULI ALGORITMICI (INTEGRATI) ---
+# --- Sidebar ---
+st.sidebar.header("⚙️ Parametri")
+uploaded = st.sidebar.file_uploader("Carica MIDI", type=['mid', 'midi'])
 
-def midi_stochastic_composer(original_midi, density, dur_range):
-    new_midi = mido.MidiFile(ticks_per_beat=original_midi.
+methods = {
+    "Remapper": "🎶 Note Remapper",
+    "Cellular": "🦠 Automi Cellulari",
+    "Fractal": "❄️ L-System Frattali"
+}
+sel = st.sidebar.multiselect("Metodi:", list(methods.values()))
+
+params = {}
+for s in sel:
+    if s == methods["Remapper"]:
+        params["Remapper"] = (st.sidebar.selectbox("Scala:", ["Maggiore", "Blues"]), st.sidebar.selectbox("Chiave:", ["C", "G"]), st.sidebar.slider("Shift:", 0, 12, 0), st.sidebar.slider("Vel Rand:", 0, 100, 0))
+    elif s == methods["Cellular"]:
+        params["Cellular"] = (st.sidebar.slider("Generazioni:", 4, 64, 16),)
+    elif s == methods["Fractal"]:
+        params["Fractal"] = (st.sidebar.slider("Iterazioni:", 1, 3, 2),)
+
+# --- Esecuzione ---
+if uploaded and st.button("🎶 DECOMPONI"):
+    mid = mido.MidiFile(file=io.BytesIO(uploaded.getvalue()))
+    curr = mid
+    if methods["Remapper"] in sel: curr = midi_note_remapper(curr, *params["Remapper"])
+    if methods["Cellular"] in sel: curr = midi_cellular_automata(curr, *params["Cellular"])
+    if methods["Fractal"] in sel: curr = midi_fractal_generator(curr, *params["Fractal"])
+    
+    buf = io.BytesIO()
+    curr.save(file=buf)
+    st.download_button("💾 Scarica", buf.getvalue(), "decomposed.mid")
