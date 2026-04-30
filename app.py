@@ -102,7 +102,8 @@ def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_
 
     for i, track in enumerate(original_midi.tracks):
         new_track = mido.MidiTrack()
-        
+        if hasattr(track, 'name') and track.name:
+            new_track.name = track.name
         for msg in track:
             if msg.type == 'note_on' or msg.type == 'note_off':
                 original_note = msg.note
@@ -146,6 +147,7 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
     for original_track in original_midi.tracks:
         phrases = []
         current_phrase_events = []
+        _track_name = original_track.name if hasattr(original_track, 'name') else ''
         current_phrase_start_tick = 0
 
         events_with_abs_time = []
@@ -195,6 +197,8 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
             reorganized_phrases = list(phrases)
 
         new_track = mido.MidiTrack()
+        if _track_name:
+            new_track.name = _track_name
         flat_events_for_reconstruction = []
         absolute_time_in_reorganized_seq = 0
         
@@ -227,6 +231,8 @@ def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, sw
 
     for original_track in original_midi.tracks:
         new_track = mido.MidiTrack()
+        if hasattr(original_track, 'name') and original_track.name:
+            new_track.name = original_track.name
         events_with_abs_time = []
         current_abs_time_stretched = 0
 
@@ -271,6 +277,7 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
 
     for original_track in original_midi.tracks:
+        _dens_name = original_track.name if hasattr(original_track, 'name') else ''
         notes = extract_notes(original_track)
         modified_notes = [note for note in notes if random.randint(0, 100) >= remove_note_probability]
         
@@ -303,6 +310,8 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
         
         final_events.sort(key=lambda x: x['abs_time'])
         new_track = mido.MidiTrack()
+        if _dens_name:
+            new_track.name = _dens_name
         last_abs_time = 0
         for event_data in final_events:
             msg = event_data['msg']
@@ -323,6 +332,8 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength):
 
     for original_track in original_midi.tracks:
         new_track = mido.MidiTrack()
+        if hasattr(original_track, 'name') and original_track.name:
+            new_track.name = original_track.name
         for msg in original_track:
             if msg.type in ['note_on', 'note_off'] and random.randint(0, 100) < random_pitch_strength:
                 new_pitch = random.randint(0, 127)
