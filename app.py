@@ -488,6 +488,70 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
 
     return new_midi
 
+
+# --- Session State ---
+if 'midi_ready'   not in st.session_state: st.session_state.midi_ready   = False
+if 'midi_bytes'   not in st.session_state: st.session_state.midi_bytes   = None
+if 'midi_report'  not in st.session_state: st.session_state.midi_report  = ""
+if 'midi_filename' not in st.session_state: st.session_state.midi_filename = ""
+
+# --- Funzione Report ---
+def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods):
+    n_tracks_in  = len(original_midi.tracks)
+    n_tracks_out = len(output_midi.tracks)
+    duration     = round(original_midi.length, 2)
+    tpb          = original_midi.ticks_per_beat
+
+    method_lines = []
+    for i, method_key in enumerate(selected_methods):
+        params = parameters.get(method_key, [])
+        label  = midi_methods[method_key]
+        method_lines.append(f"{i+1}. {label}")
+
+        if method_key == "MIDI Note Remapper":
+            method_lines.append(f"   * Scala: {params[0]} | Tonalita': {params[1]}")
+            method_lines.append(f"   * Pitch Shift: +/-{params[2]} semitoni | Velocity: {params[3]}%")
+
+        elif method_key == "MIDI Phrase Reconstructor":
+            method_lines.append(f"   * Lunghezza frase: {params[0]} battute | Stile: {params[1]}")
+
+        elif method_key == "MIDI Time Scrambler":
+            method_lines.append(f"   * Stretch: {params[0]}x | Quantizzazione: {params[1]}% | Swing: {params[2]}%")
+
+        elif method_key == "MIDI Density Transformer":
+            method_lines.append(f"   * Aggiungi note: {params[0]}% | Rimuovi note: {params[1]}% | Polifonia: {params[2]}")
+
+        elif method_key == "MIDI Random Pitch Transformer":
+            method_lines.append(f"   * Forza randomizzazione: {params[0]}%")
+
+        elif method_key == "MIDI Rhythmic Base":
+            drums = []
+            if params[0]: drums.append("Cassa")
+            if params[1]: drums.append("Rullante")
+            if params[2]: drums.append("Hi-hat")
+            method_lines.append(f"   * Elementi: {', '.join(drums) if drums else 'Nessuno'}")
+            method_lines.append(f"   * Metrica: {params[3]} | Pattern: {params[4]}")
+
+    report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
+    report += ":: MOTORE: midi_decomposer [v1.0]\n"
+    report += f":: FILE: {original_file}\n"
+    report += f":: TRACCE: {n_tracks_in} | DURATA: {duration} sec | TICKS/BEAT: {tpb}\n"
+    report += "\n"
+    report += "\"Il file e' entrato come partitura. E' uscito come esperimento.\"\n"
+    report += "\n"
+    report += "> METODI APPLICATI (in ordine):\n"
+    report += "\n".join(method_lines) + "\n"
+    report += "\n"
+    report += "> TECHNICAL LOG SHEET:\n"
+    report += f"* Tracce originali: {n_tracks_in} -> Tracce output: {n_tracks_out}\n"
+    report += f"* Metodi applicati: {len(selected_methods)}\n"
+    report += "\n"
+    report += "> Regia e Algoritmo: Loop507\n"
+    report += "\n"
+    report += "#loop507 #mididecomposer #generativemusic #midiprocessing\n"
+    report += "#structuraldecomposition #algorithmicmusic #experimentalmusic"
+    return report
+
 # --- Sezione Upload File MIDI ---
 st.subheader("🎵 Carica il tuo file MIDI (.mid o .midi)")
 uploaded_midi_file = st.file_uploader(
@@ -597,17 +661,18 @@ if uploaded_midi_file is not None:
 
                 if decomposed_midi_file:
                     st.success("Decomposizione MIDI completata!")
-                    st.subheader("Scarica il tuo MIDI Decomposto (Completo)")
-                    decomposed_midi_bytes = io.BytesIO()
-                    decomposed_midi_file.save(file=decomposed_midi_bytes)
-                    decomposed_midi_bytes.seek(0)
-                    st.download_button(
-                        label="💾 Scarica MIDI Decomposto Completo",
-                        data=decomposed_midi_bytes,
-                        file_name=f"{uploaded_midi_file.name.split('.')[0]}_Decomposed.mid",
-                        mime="audio/midi",
-                        use_container_width=True
+
+                    # Salva in session_state
+                    midi_out_bytes = io.BytesIO()
+                    decomposed_midi_file.save(file=midi_out_bytes)
+                    midi_out_bytes.seek(0)
+                    st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                    st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Decomposed.mid"
+                    st.session_state.midi_report   = build_report(
+                        uploaded_midi_file.name, midi_data, decomposed_midi_file,
+                        selected_methods_keys, parameters, midi_methods
                     )
+                    st.session_state.midi_ready = True
                     
                     def get_track_display_name(track, index):
                         track_name = next((msg.name for msg in track if msg.type == 'track_name'), None)
@@ -672,6 +737,29 @@ else:
         * **❓ MIDI Random Pitch Transformer**: Randomizza completamente l'altezza di ogni nota (pitch) per un caos melodico.
         * **🥁 Aggiungi Base Ritmica**: Aggiunge una nuova traccia di batteria al tuo brano per creare un sound dance o pop!
         """)
+# RISULTATI PERSISTENTI
+if st.session_state.midi_ready and st.session_state.midi_bytes:
+    st.markdown("---")
+    st.subheader("Scarica il tuo MIDI Decomposto")
+    c_d1, c_d2 = st.columns(2)
+    with c_d1:
+        st.download_button(
+            label="💾 Scarica MIDI Decomposto",
+            data=st.session_state.midi_bytes,
+            file_name=st.session_state.midi_filename,
+            mime="audio/midi",
+            use_container_width=True,
+            key="down_midi"
+        )
+    with c_d2:
+        st.download_button(
+            label="📄 Scarica Report",
+            data=st.session_state.midi_report,
+            file_name="report_midi_decomposer.txt",
+            key="down_report"
+        )
+    st.text_area("📄 REPORT", st.session_state.midi_report, height=300)
+
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
