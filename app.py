@@ -579,7 +579,7 @@ if 'midi_report'  not in st.session_state: st.session_state.midi_report  = ""
 if 'midi_filename' not in st.session_state: st.session_state.midi_filename = ""
 
 # --- Funzione Report ---
-def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods):
+def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, stile=None):
     n_tracks_in  = len(original_midi.tracks)
     n_tracks_out = len(output_midi.tracks)
     duration     = round(original_midi.length, 2)
@@ -618,6 +618,8 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
     report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
     report += ":: MOTORE: midi_decomposer [v1.0]\n"
     report += f":: FILE: {original_file}\n"
+    if stile:
+        report += f":: STILE: {stile}\n"
     report += f":: TRACCE: {n_tracks_in} | DURATA: {duration} sec | TICKS/BEAT: {tpb}\n"
     report += "\n"
     report += "\"Il file e' entrato come partitura. E' uscito come esperimento.\"\n"
@@ -654,7 +656,7 @@ if uploaded_midi_file is not None:
         st.write(f"Numero di tracce: **{len(midi_data.tracks)}**")
         st.write(f"Durata (stimata): **{midi_data.length:.2f} secondi**")
         st.markdown("---")
-        st.subheader("⚙️ Scegli i Metodi di Decomposizione MIDI")
+        st.subheader("⚙️ Modalita' di Decomposizione")
 
         midi_methods = {
             "MIDI Note Remapper": "🎶 Remapping di Note (Verticale)",
@@ -664,10 +666,132 @@ if uploaded_midi_file is not None:
             "MIDI Random Pitch Transformer": "❓ Randomizzazione Totale Pitch (Caos)",
             "MIDI Rhythmic Base": "🥁 Aggiungi Base Ritmica"
         }
-        selected_methods_keys = st.multiselect("Seleziona uno o più metodi:", list(midi_methods.keys()), format_func=lambda x: midi_methods[x], help="Scegli come vuoi decomporre le note e la struttura del tuo MIDI.")
+
+        # --- PRESET DEFINIZIONI ---
+        PRESETS = {
+            "🎲 Sperimentale": {
+                "desc": "Tutti i metodi combinati con valori aggressivi. Massimo caos controllato.",
+                "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer","MIDI Random Pitch Transformer"],
+                "params": {
+                    "MIDI Phrase Reconstructor": (4, "Casuale"),
+                    "MIDI Time Scrambler": (1.2, 60, 40),
+                    "MIDI Density Transformer": (30, 10, "Riempi Accordo (Triadi)"),
+                    "MIDI Random Pitch Transformer": (60,),
+                }
+            },
+            "🔇 Minimal": {
+                "desc": "Rimozione massiccia di note, molto spazio, essenziale.",
+                "methods": ["MIDI Density Transformer","MIDI Time Scrambler"],
+                "params": {
+                    "MIDI Density Transformer": (0, 45, "Nessuna"),
+                    "MIDI Time Scrambler": (1.5, 80, 0),
+                }
+            },
+            "🎸 Elettroacustico": {
+                "desc": "Ritmo deformato ma riconoscibile, frasi rimescolate, groove organico.",
+                "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Rhythmic Base"],
+                "params": {
+                    "MIDI Phrase Reconstructor": (2, "Casuale"),
+                    "MIDI Time Scrambler": (1.0, 30, 55),
+                    "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Adattivo"),
+                }
+            },
+            "🌊 Ambient": {
+                "desc": "Stretch alto, note rade, atmosfera lenta e rarefatta.",
+                "methods": ["MIDI Time Scrambler","MIDI Density Transformer"],
+                "params": {
+                    "MIDI Time Scrambler": (3.0, 20, 0),
+                    "MIDI Density Transformer": (0, 35, "Nessuna"),
+                }
+            },
+            "⚡ Glitch": {
+                "desc": "Random Pitch aggressivo + frasi rimescolate + timing spezzato.",
+                "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Random Pitch Transformer"],
+                "params": {
+                    "MIDI Phrase Reconstructor": (2, "Inversione"),
+                    "MIDI Time Scrambler": (0.8, 90, 70),
+                    "MIDI Random Pitch Transformer": (80,),
+                }
+            },
+            "🎼 Armonico": {
+                "desc": "Scala pentatonica + Triadi leggere. Il piu' musicale dei preset.",
+                "methods": ["MIDI Note Remapper","MIDI Density Transformer"],
+                "params": {
+                    "MIDI Note Remapper": ("Pentatonica Maggiore", "C", 0, 0),
+                    "MIDI Density Transformer": (20, 0, "Riempi Accordo (Triadi)"),
+                }
+            },
+            "🎬 Cinematico": {
+                "desc": "Frasi riorganizzate + stretch lento + Triadi. Epico e atmosferico.",
+                "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer"],
+                "params": {
+                    "MIDI Phrase Reconstructor": (8, "Ciclico A-B-A"),
+                    "MIDI Time Scrambler": (2.0, 40, 0),
+                    "MIDI Density Transformer": (15, 0, "Riempi Accordo (Triadi)"),
+                }
+            },
+            "🤖 Elettronico": {
+                "desc": "Quantizzazione rigida + swing preciso + base ritmica. Groove meccanico.",
+                "methods": ["MIDI Time Scrambler","MIDI Rhythmic Base"],
+                "params": {
+                    "MIDI Time Scrambler": (1.0, 95, 30),
+                    "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Fisso (Pop/Rock)"),
+                }
+            },
+            "🎷 Jazz Decostruito": {
+                "desc": "Swing alto + contro-melodia + frasi rimescolate. Liberta' ritmica.",
+                "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer"],
+                "params": {
+                    "MIDI Phrase Reconstructor": (4, "Casuale"),
+                    "MIDI Time Scrambler": (1.0, 20, 75),
+                    "MIDI Density Transformer": (25, 0, "Aggiungi Contro-Melodia"),
+                }
+            },
+            "📢 Noise": {
+                "desc": "Random Pitch estremo + Density alta. Muro di suono.",
+                "methods": ["MIDI Density Transformer","MIDI Random Pitch Transformer"],
+                "params": {
+                    "MIDI Density Transformer": (45, 0, "Riempi Accordo (Triadi)"),
+                    "MIDI Random Pitch Transformer": (95,),
+                }
+            },
+            "🔔 Drone": {
+                "desc": "Stretch massimo + note rade + solo basse. Statico e ipnotico.",
+                "methods": ["MIDI Time Scrambler","MIDI Density Transformer"],
+                "params": {
+                    "MIDI Time Scrambler": (4.0, 10, 0),
+                    "MIDI Density Transformer": (10, 40, "Droni"),
+                }
+            },
+            "🥁 Minimalismo Ritmico": {
+                "desc": "Solo base ritmica + rimozione note alta. Percussivo e scarno.",
+                "methods": ["MIDI Density Transformer","MIDI Rhythmic Base"],
+                "params": {
+                    "MIDI Density Transformer": (0, 50, "Nessuna"),
+                    "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Adattivo"),
+                }
+            },
+        }
+
+        # Modalita' Preset / Avanzato
+        modalita = st.radio("Modalita':", ["🎨 Stile", "🔧 Avanzato"], horizontal=True)
+
         decomposed_midi_file = midi_data
-        st.markdown("#### Parametri per i Metodi Selezionati:")
         parameters = {}
+        selected_methods_keys = []
+
+        if modalita == "🎨 Stile":
+            preset_name = st.selectbox("Scegli uno stile:", list(PRESETS.keys()))
+            preset = PRESETS[preset_name]
+            st.info(preset["desc"])
+            selected_methods_keys = preset["methods"]
+            parameters = preset["params"]
+            st.caption("Metodi applicati: " + " → ".join([midi_methods[m] for m in selected_methods_keys]))
+
+        else:
+            st.markdown("#### Metodi di Decomposizione")
+            selected_methods_keys = st.multiselect("Seleziona uno o piu' metodi:", list(midi_methods.keys()), format_func=lambda x: midi_methods[x])
+            st.markdown("#### Parametri per i Metodi Selezionati:")
 
         for selected_method in selected_methods_keys:
             st.markdown(f"**Parametri per: {midi_methods[selected_method]}**")
@@ -753,7 +877,8 @@ if uploaded_midi_file is not None:
                     st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Decomposed.mid"
                     st.session_state.midi_report   = build_report(
                         uploaded_midi_file.name, midi_data, decomposed_midi_file,
-                        selected_methods_keys, parameters, midi_methods
+                        selected_methods_keys, parameters, midi_methods,
+                        stile=preset_name if modalita == '🎨 Stile' else None
                     )
                     st.session_state.midi_ready = True
                     
