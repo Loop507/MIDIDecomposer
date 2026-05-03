@@ -572,6 +572,193 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
     return new_midi
 
 
+
+def midi_recomposer(original_midi, style):
+    """
+    Estrae il materiale melodico (pitch pool) dal MIDI originale
+    e costruisce un brano completamente nuovo con ritmo e struttura diversi.
+    Non trasforma — ricompone.
+    """
+    tpb = original_midi.ticks_per_beat
+
+    # --- ESTRAZIONE MATERIALE ---
+    all_pitches = []
+    all_velocities = []
+
+    for track in original_midi.tracks:
+        for msg in track:
+            if msg.type == 'note_on' and msg.velocity > 0:
+                all_pitches.append(msg.note)
+                all_velocities.append(msg.velocity)
+
+    if not all_pitches:
+        return original_midi
+
+    # Pool pitch con frequenza proporzionale (note usate spesso restano prevalenti)
+    from collections import Counter
+    pitch_counts = Counter(all_pitches)
+    # Crea pool pesato — note piu' usate appaiono piu' volte
+    weighted_pool = []
+    for pitch, count in pitch_counts.items():
+        weighted_pool.extend([pitch] * max(1, count // 2))
+
+    vel_min = max(40, min(all_velocities))
+    vel_max = min(120, max(all_velocities))
+    tonica = pitch_counts.most_common(1)[0][0]
+
+    # Durata totale originale in ticks
+    total_ticks = int(original_midi.length * tpb * (original_midi.ticks_per_beat / tpb))
+    # Stima piu' precisa
+    total_ticks = 0
+    for track in original_midi.tracks:
+        t = sum(msg.time for msg in track)
+        total_ticks = max(total_ticks, t)
+    if total_ticks == 0:
+        total_ticks = tpb * 4 * 32  # fallback 32 battute
+
+    new_midi = mido.MidiFile(ticks_per_beat=tpb)
+
+    # --- DEFINIZIONE STILI ---
+    style_configs = {
+        "ambient": {
+            "note_dur_range": (tpb * 2, tpb * 6),      # 2-6 battute per nota
+            "gap_range":      (tpb // 2, tpb * 2),      # pause medie
+            "vel_factor":     0.6,                        # velocity bassa
+            "n_voices":       1,
+            "pitch_step":     4,                          # salta di 4 semitoni
+        },
+        "drone": {
+            "note_dur_range": (tpb * 4, tpb * 8),       # note lunghissime
+            "gap_range":      (tpb, tpb * 3),
+            "vel_factor":     0.5,
+            "n_voices":       2,                          # 2 voci: bassa + melodia
+            "pitch_step":     7,
+        },
+        "minimal": {
+            "note_dur_range": (tpb // 2, tpb * 2),      # note medie
+            "gap_range":      (tpb // 4, tpb),           # pause brevi
+            "vel_factor":     0.7,
+            "n_voices":       1,
+            "pitch_step":     2,
+        },
+        "armonico": {
+            "note_dur_range": (tpb // 2, tpb),
+            "gap_range":      (tpb // 8, tpb // 4),
+            "vel_factor":     0.85,
+            "n_voices":       3,                          # accordi
+            "pitch_step":     3,
+        },
+        "elettronico": {
+            "note_dur_range": (tpb // 4, tpb // 2),     # note corte su griglia
+            "gap_range":      (tpb // 8, tpb // 4),
+            "vel_factor":     0.9,
+            "n_voices":       1,
+            "pitch_step":     0,                          # no step — random dal pool
+        },
+        "minimalismo_ritmico": {
+            "note_dur_range": (tpb // 4, tpb // 2),
+            "gap_range":      (tpb // 2, tpb * 2),      # gap lunghi — sincopato
+            "vel_factor":     0.8,
+            "n_voices":       1,
+            "pitch_step":     5,
+        },
+    }
+
+    cfg = style_configs.get(style, style_configs["minimal"])
+
+    def pick_pitch(base=None):
+        if base is None or cfg["pitch_step"] == 0:
+            return random.choice(weighted_pool)
+        # Costruisce melodia per gradi — si muove per step
+        direction = random.choice([-1, 1])
+        candidate = base + direction * cfg["pitch_step"]
+        # Snappa al pitch piu' vicino nel pool
+        return min(weighted_pool, key=lambda p: abs(p - candidate))
+
+    def pick_vel():
+        v = random.randint(vel_min, vel_max)
+        return max(1, min(127, int(v * cfg["vel_factor"])))
+
+    # --- GENERAZIONE NUOVA MELODIA ---
+    def build_melody_track(channel=0, pitch_offset=0):
+        track = mido.MidiTrack()
+        track.name = f"Recomposed ch{channel+1}"
+        events = []
+        current_tick = 0
+        last_pitch = random.choice(weighted_pool)
+
+        while current_tick < total_ticks:
+            pitch = pick_pitch(last_pitch)
+            pitch = max(0, min(127, pitch + pitch_offset))
+            vel   = pick_vel()
+            dur   = random.randint(*cfg["note_dur_range"])
+            gap   = random.randint(*cfg["gap_range"])
+
+            # Per elettronico: snappa sulla griglia (tpb // 4)
+            if style == "elettronico":
+                grid = tpb // 4
+                current_tick = (current_tick // grid) * grid
+                dur = (dur // grid) * grid or grid
+
+            note_end = min(current_tick + dur, total_ticks)
+            events.append(("on",  current_tick,         pitch, vel,   channel))
+            events.append(("off", note_end,             pitch, 0,     channel))
+
+            last_pitch = pitch
+            current_tick += dur + gap
+
+        # Ordina: note_off prima di note_on allo stesso tick
+        events.sort(key=lambda e: (e[1], 0 if e[0] == "off" else 1))
+
+        last_t = 0
+        for ev in events:
+            kind, tick, pitch, vel, ch = ev
+            delta = max(0, tick - last_t)
+            if kind == "on":
+                track.append(mido.Message("note_on",  note=pitch, velocity=vel, channel=ch, time=delta))
+            else:
+                track.append(mido.Message("note_off", note=pitch, velocity=0,   channel=ch, time=delta))
+            last_t = tick
+
+        return track
+
+    # Aggiungi tracce recomposte
+    # Mantieni la traccia 0 (metadati) dell'originale
+    if original_midi.tracks:
+        new_midi.tracks.append(original_midi.tracks[0])
+
+    n_voices = cfg["n_voices"]
+    for v in range(n_voices):
+        offset = [0, 7, 12][v] if v < 3 else 0  # voci su ottave/quinte diverse
+        track = build_melody_track(channel=min(v, 8), pitch_offset=offset)
+        new_midi.tracks.append(track)
+
+    # Drone: aggiungi basso pedale sulla nota tonica
+    if style == "drone":
+        bass_track = mido.MidiTrack()
+        bass_track.name = "Drone Bass"
+        dur = tpb * 8
+        tick = 0
+        last_t = 0
+        evs = []
+        while tick < total_ticks:
+            note_end = min(tick + dur, total_ticks)
+            evs.append(("on",  tick,     tonica - 12 if tonica >= 12 else tonica, 55, 1))
+            evs.append(("off", note_end, tonica - 12 if tonica >= 12 else tonica, 0,  1))
+            tick += dur + tpb * 2
+        evs.sort(key=lambda e: (e[1], 0 if e[0] == "off" else 1))
+        for ev in evs:
+            kind, t, p, v2, ch = ev
+            delta = max(0, t - last_t)
+            if kind == "on":
+                bass_track.append(mido.Message("note_on",  note=p, velocity=v2, channel=ch, time=delta))
+            else:
+                bass_track.append(mido.Message("note_off", note=p, velocity=0,  channel=ch, time=delta))
+            last_t = t
+        new_midi.tracks.append(bass_track)
+
+    return new_midi
+
 # --- Session State ---
 if 'midi_ready'   not in st.session_state: st.session_state.midi_ready   = False
 if 'midi_bytes'   not in st.session_state: st.session_state.midi_bytes   = None
@@ -680,13 +867,9 @@ if uploaded_midi_file is not None:
                 }
             },
             "🔇 Minimal": {
-                "desc": "Frasi invertite + rimozione massiccia di note + scala minore. Il brano si svuota e cambia colore armonico.",
-                "methods": ["MIDI Note Remapper","MIDI Phrase Reconstructor","MIDI Density Transformer"],
-                "params": {
-                    "MIDI Note Remapper": ("Minore Naturale", "C", 3, 0),
-                    "MIDI Phrase Reconstructor": (2, "Inversione"),
-                    "MIDI Density Transformer": (0, 50, "Nessuna"),
-                }
+                "desc": "Ricompone un brano minimalista usando le note originali con ritmo completamente nuovo e pause ampie.",
+                "methods": ["MIDI Recomposer"],
+                "params": {"MIDI Recomposer": ("minimal",)}
             },
             "🎸 Elettroacustico": {
                 "desc": "Ritmo deformato, frasi rimescolate, groove organico con base ritmica adattiva.",
@@ -698,14 +881,9 @@ if uploaded_midi_file is not None:
                 }
             },
             "🌊 Ambient": {
-                "desc": "Frasi invertite + stretch lento + scala minore. Il brano rallenta e cambia identita' armonica.",
-                "methods": ["MIDI Note Remapper","MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer"],
-                "params": {
-                    "MIDI Note Remapper": ("Minore Naturale", "C", 2, 0),
-                    "MIDI Phrase Reconstructor": (8, "Inversione"),
-                    "MIDI Time Scrambler": (3.0, 20, 0),
-                    "MIDI Density Transformer": (0, 30, "Nessuna"),
-                }
+                "desc": "Ricompone un brano lento e rarefatto usando le note originali con note lunghe e pause ampie.",
+                "methods": ["MIDI Recomposer"],
+                "params": {"MIDI Recomposer": ("ambient",)}
             },
             "⚡ Glitch": {
                 "desc": "Random Pitch aggressivo + frasi rimescolate + timing spezzato.",
@@ -717,13 +895,9 @@ if uploaded_midi_file is not None:
                 }
             },
             "🎼 Armonico": {
-                "desc": "Scala pentatonica + pitch shift + frasi rimescolate. Riconosce la struttura ma la reinterpreta.",
-                "methods": ["MIDI Note Remapper","MIDI Phrase Reconstructor","MIDI Density Transformer"],
-                "params": {
-                    "MIDI Note Remapper": ("Pentatonica Maggiore", "C", 7, 20),
-                    "MIDI Phrase Reconstructor": (4, "Casuale"),
-                    "MIDI Density Transformer": (20, 0, "Riempi Accordo (Triadi)"),
-                }
+                "desc": "Ricompone un brano a 3 voci (melodia + quinta + ottava) usando le note originali come vocabolario armonico.",
+                "methods": ["MIDI Recomposer"],
+                "params": {"MIDI Recomposer": ("armonico",)}
             },
             "🎬 Cinematico": {
                 "desc": "Frasi riorganizzate + stretch lento + Triadi. Epico e atmosferico.",
@@ -735,11 +909,10 @@ if uploaded_midi_file is not None:
                 }
             },
             "🤖 Elettronico": {
-                "desc": "Frasi rimescolate + quantizzazione rigida + base ritmica. Il brano diventa meccanico e grid-locked.",
-                "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Rhythmic Base"],
+                "desc": "Ricompone un brano elettronico su griglia rigida usando le note originali in pattern meccanici e ripetitivi.",
+                "methods": ["MIDI Recomposer","MIDI Rhythmic Base"],
                 "params": {
-                    "MIDI Phrase Reconstructor": (2, "Casuale"),
-                    "MIDI Time Scrambler": (1.0, 95, 30),
+                    "MIDI Recomposer": ("elettronico",),
                     "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Fisso (Pop/Rock)"),
                 }
             },
@@ -762,21 +935,15 @@ if uploaded_midi_file is not None:
                 }
             },
             "🔔 Drone": {
-                "desc": "Scala Blues + stretch massimo + rimozione note. Il brano si trasforma in un paesaggio sonoro irriconoscibile.",
-                "methods": ["MIDI Note Remapper","MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer"],
-                "params": {
-                    "MIDI Note Remapper": ("Blues", "C", 5, 0),
-                    "MIDI Phrase Reconstructor": (8, "Inversione"),
-                    "MIDI Time Scrambler": (4.0, 10, 0),
-                    "MIDI Density Transformer": (10, 40, "Droni"),
-                }
+                "desc": "Ricompone un paesaggio sonoro statico con note lunghissime e basso pedale sulla nota tonica originale.",
+                "methods": ["MIDI Recomposer"],
+                "params": {"MIDI Recomposer": ("drone",)}
             },
             "🥁 Minimalismo Ritmico": {
-                "desc": "Scala Blues + rimozione massiccia + base ritmica adattiva. Solo lo scheletro ritmico sopravvive.",
-                "methods": ["MIDI Note Remapper","MIDI Density Transformer","MIDI Rhythmic Base"],
+                "desc": "Ricompone un brano sincopato con poche note sparse e ritmo completamente nuovo + base ritmica adattiva.",
+                "methods": ["MIDI Recomposer","MIDI Rhythmic Base"],
                 "params": {
-                    "MIDI Note Remapper": ("Blues", "C", 5, 0),
-                    "MIDI Density Transformer": (0, 55, "Nessuna"),
+                    "MIDI Recomposer": ("minimalismo_ritmico",),
                     "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Adattivo"),
                 }
             },
@@ -873,6 +1040,9 @@ if uploaded_midi_file is not None:
                         current_midi = midi_random_pitch_transformer(current_midi, *method_params)
                     elif method_key == "MIDI Rhythmic Base":
                         current_midi = midi_add_rhythmic_base(current_midi, *method_params)
+                    elif method_key == "MIDI Recomposer":
+                        recompose_style = method_params[0] if method_params else "minimal"
+                        current_midi = midi_recomposer(current_midi, recompose_style)
                 decomposed_midi_file = current_midi
 
                 if decomposed_midi_file:
