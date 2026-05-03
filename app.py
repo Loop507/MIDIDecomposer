@@ -272,17 +272,30 @@ def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, sw
 
 def midi_density_transformer(original_midi, add_note_probability, remove_note_probability, polyphony_mode):
     """
-    Aggiunge o rimuove note per alterare la densità MIDI.
+    Aggiunge o rimuove note per alterare la densita' MIDI.
+    Fix: tracce senza note vengono passate intatte.
+    Fix: note aggiunte hanno durata esplicita uguale alla nota originale.
+    Fix: note_off sempre dopo note_on — abs_time note_off = start + durata originale.
     """
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
 
     for original_track in original_midi.tracks:
         _dens_name = original_track.name if hasattr(original_track, 'name') else ''
         notes = extract_notes(original_track)
+
+        # Se la traccia non ha note (metadati, controller, ecc.) — passa intatta
+        if not notes:
+            new_midi.tracks.append(original_track)
+            continue
+
         modified_notes = [note for note in notes if random.randint(0, 100) >= remove_note_probability]
-        
+
+        # Durata minima garantita: almeno 1 tick
+        def safe_duration(note):
+            return max(1, note['end'] - note['start'])
+
         final_events = []
-        track_end_time = max(n['end'] for n in notes) if notes else 0
+        track_end_time = max(n['end'] for n in notes)
 
         if polyphony_mode == "Droni" and add_note_probability > 0 and random.randint(0, 100) < add_note_probability:
             drone_pitch = 36
@@ -291,8 +304,12 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
             final_events.append({'msg': mido.Message('note_off', note=drone_pitch, velocity=0, channel=0, time=0), 'abs_time': track_end_time + original_midi.ticks_per_beat * 4})
 
         for note_data in modified_notes:
-            final_events.append({'msg': mido.Message('note_on', note=note_data['pitch'], velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': note_data['start']})
-            final_events.append({'msg': mido.Message('note_off', note=note_data['pitch'], velocity=0, channel=note_data['channel'], time=0), 'abs_time': note_data['end']})
+            dur = safe_duration(note_data)
+            note_start = note_data['start']
+            note_end   = note_start + dur  # durata esplicita, non dipende da note_off originale
+
+            final_events.append({'msg': mido.Message('note_on',  note=note_data['pitch'], velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': note_start})
+            final_events.append({'msg': mido.Message('note_off', note=note_data['pitch'], velocity=0,                    channel=note_data['channel'], time=0), 'abs_time': note_end})
 
             if random.randint(0, 100) < add_note_probability:
                 if polyphony_mode == "Riempi Accordo (Triadi)":
@@ -301,26 +318,28 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
                     intervals = [random.choice([-5, -3, -2, 2, 3, 5])]
                 else:
                     intervals = []
-                
+
                 for interval in intervals:
                     new_pitch = note_data['pitch'] + interval
                     if 0 <= new_pitch <= 127:
-                        final_events.append({'msg': mido.Message('note_on', note=new_pitch, velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': note_data['start']})
-                        final_events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=note_data['channel'], time=0), 'abs_time': note_data['end']})
-        
-        final_events.sort(key=lambda x: x['abs_time'])
+                        # Nota aggiunta: stessa durata della nota originale, note_off esplicito
+                        final_events.append({'msg': mido.Message('note_on',  note=new_pitch, velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': note_start})
+                        final_events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0,                    channel=note_data['channel'], time=0), 'abs_time': note_end})
+
+        # Ordina per abs_time, note_off prima di note_on allo stesso tick (evita sovrapposizioni)
+        final_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+
         new_track = mido.MidiTrack()
         if _dens_name:
             new_track.name = _dens_name
         last_abs_time = 0
         for event_data in final_events:
-            msg = event_data['msg']
+            msg      = event_data['msg']
             abs_time = event_data['abs_time']
-            delta_time = max(0, abs_time - last_abs_time)
-            new_msg = msg.copy(time=delta_time)
-            new_track.append(new_msg)
+            delta    = max(0, abs_time - last_abs_time)
+            new_track.append(msg.copy(time=delta))
             last_abs_time = abs_time
-        
+
         new_midi.tracks.append(new_track)
     return new_midi
 
