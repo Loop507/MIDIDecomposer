@@ -851,7 +851,8 @@ if uploaded_midi_file is not None:
             "MIDI Time Scrambler": "⏳ Manipolazione Ritmo/Durata (Orizzontale)",
             "MIDI Density Transformer": "🎲 Controllo Densità (Armonia/Contrappunto)",
             "MIDI Random Pitch Transformer": "❓ Randomizzazione Totale Pitch (Caos)",
-            "MIDI Rhythmic Base": "🥁 Aggiungi Base Ritmica"
+            "MIDI Rhythmic Base": "🥁 Aggiungi Base Ritmica",
+            "MIDI Recomposer": "🔁 Ricomposizione (nuovo brano dal materiale originale)"
         }
 
         # --- PRESET DEFINIZIONI ---
