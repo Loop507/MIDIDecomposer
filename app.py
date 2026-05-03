@@ -327,7 +327,8 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
 def midi_random_pitch_transformer(original_midi, random_pitch_strength):
     """
     Randomizes the pitch of notes based on a given strength (probability).
-    note_on e note_off vengono sempre modificati con lo stesso pitch — nessuna nota resta aperta.
+    Usa (pitch, channel) come chiave e un contatore per gestire note duplicate
+    sullo stesso pitch/canale — nessuna nota resta aperta nel DAW.
     """
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
 
@@ -335,24 +336,39 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength):
         new_track = mido.MidiTrack()
         if hasattr(original_track, 'name') and original_track.name:
             new_track.name = original_track.name
-        # Mappa pitch originale -> pitch randomizzato per tenere note_on/note_off sincronizzati
-        pitch_map = {}
+
+        # pitch_map: (pitch_orig, channel) -> lista di pitch nuovi (stack LIFO)
+        # gestisce piu' note_on sullo stesso pitch prima del note_off
+        from collections import defaultdict
+        pitch_map = defaultdict(list)
+
         for msg in original_track:
             if msg.type == 'note_on' and msg.velocity > 0:
+                key = (msg.note, msg.channel)
                 if random.randint(0, 100) < random_pitch_strength:
                     new_pitch = random.randint(0, 127)
-                    pitch_map[msg.note] = new_pitch
                 else:
-                    pitch_map[msg.note] = msg.note
-                new_msg = msg.copy(note=pitch_map[msg.note])
-                new_track.append(new_msg)
+                    new_pitch = msg.note
+                pitch_map[key].append(new_pitch)
+                new_track.append(msg.copy(note=new_pitch))
+
             elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
-                # Usa lo stesso pitch mappato dal note_on corrispondente
-                mapped_pitch = pitch_map.pop(msg.note, msg.note)
-                new_msg = msg.copy(note=mapped_pitch)
-                new_track.append(new_msg)
+                key = (msg.note, msg.channel)
+                if pitch_map[key]:
+                    # LIFO: chiude l'ultima nota aperta su questo pitch/canale
+                    mapped_pitch = pitch_map[key].pop()
+                else:
+                    mapped_pitch = msg.note
+                new_track.append(msg.copy(note=mapped_pitch))
+
             else:
                 new_track.append(msg)
+
+        # Chiudi eventuali note rimaste aperte (note_on senza note_off)
+        for (orig_pitch, ch), pitches in pitch_map.items():
+            for p in pitches:
+                new_track.append(mido.Message('note_off', note=p, velocity=0, channel=ch, time=0))
+
         new_midi.tracks.append(new_track)
     return new_midi
 
