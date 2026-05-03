@@ -680,15 +680,16 @@ if uploaded_midi_file is not None:
                 }
             },
             "🔇 Minimal": {
-                "desc": "Rimozione massiccia di note, molto spazio, essenziale.",
-                "methods": ["MIDI Density Transformer","MIDI Time Scrambler"],
+                "desc": "Frasi invertite + rimozione massiccia di note + scala minore. Il brano si svuota e cambia colore armonico.",
+                "methods": ["MIDI Note Remapper","MIDI Phrase Reconstructor","MIDI Density Transformer"],
                 "params": {
-                    "MIDI Density Transformer": (0, 45, "Nessuna"),
-                    "MIDI Time Scrambler": (1.5, 80, 0),
+                    "MIDI Note Remapper": ("Minore Naturale", "C", 3, 0),
+                    "MIDI Phrase Reconstructor": (2, "Inversione"),
+                    "MIDI Density Transformer": (0, 50, "Nessuna"),
                 }
             },
             "🎸 Elettroacustico": {
-                "desc": "Ritmo deformato ma riconoscibile, frasi rimescolate, groove organico.",
+                "desc": "Ritmo deformato, frasi rimescolate, groove organico con base ritmica adattiva.",
                 "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Rhythmic Base"],
                 "params": {
                     "MIDI Phrase Reconstructor": (2, "Casuale"),
@@ -697,11 +698,13 @@ if uploaded_midi_file is not None:
                 }
             },
             "🌊 Ambient": {
-                "desc": "Stretch alto, note rade, atmosfera lenta e rarefatta.",
-                "methods": ["MIDI Time Scrambler","MIDI Density Transformer"],
+                "desc": "Frasi invertite + stretch lento + scala minore. Il brano rallenta e cambia identita' armonica.",
+                "methods": ["MIDI Note Remapper","MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer"],
                 "params": {
+                    "MIDI Note Remapper": ("Minore Naturale", "C", 2, 0),
+                    "MIDI Phrase Reconstructor": (8, "Inversione"),
                     "MIDI Time Scrambler": (3.0, 20, 0),
-                    "MIDI Density Transformer": (0, 35, "Nessuna"),
+                    "MIDI Density Transformer": (0, 30, "Nessuna"),
                 }
             },
             "⚡ Glitch": {
@@ -714,10 +717,11 @@ if uploaded_midi_file is not None:
                 }
             },
             "🎼 Armonico": {
-                "desc": "Scala pentatonica + Triadi leggere. Il piu' musicale dei preset.",
-                "methods": ["MIDI Note Remapper","MIDI Density Transformer"],
+                "desc": "Scala pentatonica + pitch shift + frasi rimescolate. Riconosce la struttura ma la reinterpreta.",
+                "methods": ["MIDI Note Remapper","MIDI Phrase Reconstructor","MIDI Density Transformer"],
                 "params": {
-                    "MIDI Note Remapper": ("Pentatonica Maggiore", "C", 0, 0),
+                    "MIDI Note Remapper": ("Pentatonica Maggiore", "C", 7, 20),
+                    "MIDI Phrase Reconstructor": (4, "Casuale"),
                     "MIDI Density Transformer": (20, 0, "Riempi Accordo (Triadi)"),
                 }
             },
@@ -731,9 +735,10 @@ if uploaded_midi_file is not None:
                 }
             },
             "🤖 Elettronico": {
-                "desc": "Quantizzazione rigida + swing preciso + base ritmica. Groove meccanico.",
-                "methods": ["MIDI Time Scrambler","MIDI Rhythmic Base"],
+                "desc": "Frasi rimescolate + quantizzazione rigida + base ritmica. Il brano diventa meccanico e grid-locked.",
+                "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Rhythmic Base"],
                 "params": {
+                    "MIDI Phrase Reconstructor": (2, "Casuale"),
                     "MIDI Time Scrambler": (1.0, 95, 30),
                     "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Fisso (Pop/Rock)"),
                 }
@@ -748,26 +753,30 @@ if uploaded_midi_file is not None:
                 }
             },
             "📢 Noise": {
-                "desc": "Random Pitch estremo + Density alta. Muro di suono.",
-                "methods": ["MIDI Density Transformer","MIDI Random Pitch Transformer"],
+                "desc": "Frasi invertite + Triadi dense + Random Pitch estremo. Il brano diventa un muro di suono irriconoscibile.",
+                "methods": ["MIDI Phrase Reconstructor","MIDI Density Transformer","MIDI Random Pitch Transformer"],
                 "params": {
-                    "MIDI Density Transformer": (45, 0, "Riempi Accordo (Triadi)"),
+                    "MIDI Phrase Reconstructor": (2, "Inversione"),
+                    "MIDI Density Transformer": (50, 0, "Riempi Accordo (Triadi)"),
                     "MIDI Random Pitch Transformer": (95,),
                 }
             },
             "🔔 Drone": {
-                "desc": "Stretch massimo + note rade + solo basse. Statico e ipnotico.",
-                "methods": ["MIDI Time Scrambler","MIDI Density Transformer"],
+                "desc": "Scala Blues + stretch massimo + rimozione note. Il brano si trasforma in un paesaggio sonoro irriconoscibile.",
+                "methods": ["MIDI Note Remapper","MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer"],
                 "params": {
+                    "MIDI Note Remapper": ("Blues", "C", 5, 0),
+                    "MIDI Phrase Reconstructor": (8, "Inversione"),
                     "MIDI Time Scrambler": (4.0, 10, 0),
                     "MIDI Density Transformer": (10, 40, "Droni"),
                 }
             },
             "🥁 Minimalismo Ritmico": {
-                "desc": "Solo base ritmica + rimozione note alta. Percussivo e scarno.",
-                "methods": ["MIDI Density Transformer","MIDI Rhythmic Base"],
+                "desc": "Scala Blues + rimozione massiccia + base ritmica adattiva. Solo lo scheletro ritmico sopravvive.",
+                "methods": ["MIDI Note Remapper","MIDI Density Transformer","MIDI Rhythmic Base"],
                 "params": {
-                    "MIDI Density Transformer": (0, 50, "Nessuna"),
+                    "MIDI Note Remapper": ("Blues", "C", 5, 0),
+                    "MIDI Density Transformer": (0, 55, "Nessuna"),
                     "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Adattivo"),
                 }
             },
