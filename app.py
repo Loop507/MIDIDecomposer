@@ -50,7 +50,7 @@ def get_scale_notes(scale_name):
     }
     return scales.get(scale_name, scales["Cromatica"])
 
-def extract_notes(track):
+def extract_notes(track, ticks_per_beat=384):
     """Helper per estrarre note e il loro tempo assoluto da una traccia."""
     notes = []
     active_notes = {}
@@ -64,8 +64,11 @@ def extract_notes(track):
             if key in active_notes:
                 start_data = active_notes.pop(key)
                 notes.append({'start': start_data['start'], 'end': current_abs_time, 'pitch': msg.note, 'velocity': start_data['velocity'], 'channel': key[1]})
+    # Note rimaste aperte senza note_off — chiuse con durata stimata di 1 beat
+    # invece di usare current_abs_time che creerebbe note lunghissime
     for key, start_data in active_notes.items():
-        notes.append({'start': start_data['start'], 'end': current_abs_time, 'pitch': key[0], 'velocity': start_data['velocity'], 'channel': key[1]})
+        estimated_end = start_data['start'] + ticks_per_beat  # 1 beat di default
+        notes.append({'start': start_data['start'], 'end': estimated_end, 'pitch': key[0], 'velocity': start_data['velocity'], 'channel': key[1]})
     return notes
 
 def reconstruct_track(notes, ticks_per_beat):
@@ -281,7 +284,7 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
 
     for original_track in original_midi.tracks:
         _dens_name = original_track.name if hasattr(original_track, 'name') else ''
-        notes = extract_notes(original_track)
+        notes = extract_notes(original_track, original_midi.ticks_per_beat)
 
         # Se la traccia non ha note (metadati, controller, ecc.) — passa intatta
         if not notes:
