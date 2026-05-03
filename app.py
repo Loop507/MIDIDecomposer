@@ -204,11 +204,32 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
             new_track.name = _track_name
         flat_events_for_reconstruction = []
         absolute_time_in_reorganized_seq = 0
-        
+
         for phrase_block in reorganized_phrases:
+            # Traccia note aperte in questa frase — chiudi quelle senza note_off
+            open_notes = {}  # (pitch, channel) -> abs_time di apertura
+            phrase_abs = absolute_time_in_reorganized_seq
+
             for msg_in_phrase in phrase_block:
-                absolute_time_in_reorganized_seq += msg_in_phrase.time
-                flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': absolute_time_in_reorganized_seq})
+                phrase_abs += msg_in_phrase.time
+                if msg_in_phrase.type == 'note_on' and msg_in_phrase.velocity > 0:
+                    open_notes[(msg_in_phrase.note, msg_in_phrase.channel)] = phrase_abs
+                elif msg_in_phrase.type == 'note_off' or (msg_in_phrase.type == 'note_on' and msg_in_phrase.velocity == 0):
+                    open_notes.pop((msg_in_phrase.note, msg_in_phrase.channel), None)
+                flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': phrase_abs})
+
+            # Chiudi note rimaste aperte alla fine della frase
+            phrase_end = phrase_abs
+            for (pitch, ch) in list(open_notes.keys()):
+                flat_events_for_reconstruction.append({
+                    'msg': mido.Message('note_off', note=pitch, velocity=0, channel=ch, time=0),
+                    'abs_time': phrase_end
+                })
+
+            absolute_time_in_reorganized_seq = phrase_end
+
+        # Ordina: note_off prima di note_on allo stesso tick
+        flat_events_for_reconstruction.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
 
         last_abs_time = 0
         for event_data in flat_events_for_reconstruction:
@@ -218,7 +239,7 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
             new_msg = msg.copy(time=delta_time)
             new_track.append(new_msg)
             last_abs_time = abs_time
-            
+
         new_midi.tracks.append(new_track)
     return new_midi
 
