@@ -633,6 +633,12 @@ def midi_recomposer(original_midi, style):
             "vel_factor":     0.8,
             "pitch_step":     5,
         },
+        "sperimentale": {
+            "note_dur_range": (tpb // 8, tpb * 3),
+            "gap_range":      (0, tpb * 2),
+            "vel_factor":     1.0,
+            "pitch_step":     0,
+        },
     }
 
     cfg = style_configs.get(style, style_configs["minimal"])
@@ -850,23 +856,19 @@ if uploaded_midi_file is not None:
             "MIDI Recomposer": "🔁 Ricomposizione (nuovo brano dal materiale originale)"
         }
 
-        # --- PRESET DEFINIZIONI ---
+        # --- STILI RICOMPOSIZIONE (usati dal pulsante Ricomponi) ---
+        RECOMPOSE_STYLES = {
+            "🔇 Minimal":             ("minimal",             "Ritmo scarno, pause ampie. Brano sparso e meditativo."),
+            "🌊 Ambient":             ("ambient",             "Note lunghe e rarefatte. Paesaggio sonoro lento."),
+            "🎼 Armonico":            ("armonico",            "Melodia per gradi stretti, fluida e cantabile."),
+            "🤖 Elettronico":         ("elettronico",         "Griglia rigida, pattern meccanici e ripetitivi."),
+            "🔔 Drone":               ("drone",               "Note lunghissime, statico e ipnotico."),
+            "🥁 Minimalismo Ritmico": ("minimalismo_ritmico", "Sincopato, poche note sparse, ritmo nuovo."),
+            "🎲 Sperimentale":        ("sperimentale",        "Pitch random + durate caotiche. Brano irriconoscibile."),
+        }
+
+        # --- PRESET DECOMPOSIZIONE (usati dal pulsante Decomponi in modalità Avanzato) ---
         PRESETS = {
-            "🎲 Sperimentale": {
-                "desc": "Tutti i metodi combinati con valori aggressivi. Massimo caos controllato.",
-                "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer","MIDI Random Pitch Transformer"],
-                "params": {
-                    "MIDI Phrase Reconstructor": (4, "Casuale"),
-                    "MIDI Time Scrambler": (1.2, 60, 40),
-                    "MIDI Density Transformer": (30, 10, "Riempi Accordo (Triadi)"),
-                    "MIDI Random Pitch Transformer": (60,),
-                }
-            },
-            "🔇 Minimal": {
-                "desc": "Ricompone un brano minimalista usando le note originali con ritmo completamente nuovo e pause ampie.",
-                "methods": ["MIDI Recomposer"],
-                "params": {"MIDI Recomposer": ("minimal",)}
-            },
             "🎸 Elettroacustico": {
                 "desc": "Ritmo deformato, frasi rimescolate, groove organico con base ritmica adattiva.",
                 "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Rhythmic Base"],
@@ -875,11 +877,6 @@ if uploaded_midi_file is not None:
                     "MIDI Time Scrambler": (1.0, 30, 55),
                     "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Adattivo"),
                 }
-            },
-            "🌊 Ambient": {
-                "desc": "Ricompone un brano lento e rarefatto usando le note originali con note lunghe e pause ampie.",
-                "methods": ["MIDI Recomposer"],
-                "params": {"MIDI Recomposer": ("ambient",)}
             },
             "⚡ Glitch": {
                 "desc": "Random Pitch aggressivo + frasi rimescolate + timing spezzato.",
@@ -890,11 +887,6 @@ if uploaded_midi_file is not None:
                     "MIDI Random Pitch Transformer": (80,),
                 }
             },
-            "🎼 Armonico": {
-                "desc": "Ricompone un brano a 3 voci (melodia + quinta + ottava) usando le note originali come vocabolario armonico.",
-                "methods": ["MIDI Recomposer"],
-                "params": {"MIDI Recomposer": ("armonico",)}
-            },
             "🎬 Cinematico": {
                 "desc": "Frasi riorganizzate + stretch lento + Triadi. Epico e atmosferico.",
                 "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer"],
@@ -904,16 +896,8 @@ if uploaded_midi_file is not None:
                     "MIDI Density Transformer": (15, 0, "Riempi Accordo (Triadi)"),
                 }
             },
-            "🤖 Elettronico": {
-                "desc": "Ricompone un brano elettronico su griglia rigida usando le note originali in pattern meccanici e ripetitivi.",
-                "methods": ["MIDI Recomposer","MIDI Rhythmic Base"],
-                "params": {
-                    "MIDI Recomposer": ("elettronico",),
-                    "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Fisso (Pop/Rock)"),
-                }
-            },
             "🎷 Jazz Decostruito": {
-                "desc": "Swing alto + contro-melodia + frasi rimescolate. Liberta' ritmica.",
+                "desc": "Swing alto + contro-melodia + frasi rimescolate. Libertà ritmica.",
                 "methods": ["MIDI Phrase Reconstructor","MIDI Time Scrambler","MIDI Density Transformer"],
                 "params": {
                     "MIDI Phrase Reconstructor": (4, "Casuale"),
@@ -922,25 +906,12 @@ if uploaded_midi_file is not None:
                 }
             },
             "📢 Noise": {
-                "desc": "Frasi invertite + Triadi dense + Random Pitch estremo. Il brano diventa un muro di suono irriconoscibile.",
+                "desc": "Frasi invertite + Triadi dense + Random Pitch estremo. Muro di suono.",
                 "methods": ["MIDI Phrase Reconstructor","MIDI Density Transformer","MIDI Random Pitch Transformer"],
                 "params": {
                     "MIDI Phrase Reconstructor": (2, "Inversione"),
                     "MIDI Density Transformer": (50, 0, "Riempi Accordo (Triadi)"),
                     "MIDI Random Pitch Transformer": (95,),
-                }
-            },
-            "🔔 Drone": {
-                "desc": "Ricompone un paesaggio sonoro statico con note lunghissime e basso pedale sulla nota tonica originale.",
-                "methods": ["MIDI Recomposer"],
-                "params": {"MIDI Recomposer": ("drone",)}
-            },
-            "🥁 Minimalismo Ritmico": {
-                "desc": "Ricompone un brano sincopato con poche note sparse e ritmo completamente nuovo + base ritmica adattiva.",
-                "methods": ["MIDI Recomposer","MIDI Rhythmic Base"],
-                "params": {
-                    "MIDI Recomposer": ("minimalismo_ritmico",),
-                    "MIDI Rhythmic Base": (True, True, True, "4/4", "Pattern Adattivo"),
                 }
             },
         }
@@ -953,29 +924,22 @@ if uploaded_midi_file is not None:
         selected_methods_keys = []
 
         if modalita == "🎨 Stile":
-            # Stile Ricomposizione — pulsante dedicato
             st.markdown("#### 🔁 Ricomponi l'intero MIDI")
             st.markdown(
-                "Ricostruisce **ogni traccia** dal suo pool di note originali: "
-                "stessi canali, stessi nomi, struttura e ritmo completamente nuovi."
+                "Ogni traccia viene ricostruita dal suo pool di note originali: "
+                "**stesso numero di tracce, stessi canali, stessi nomi** — ritmo e struttura completamente nuovi."
             )
-            recompose_style_ui = st.selectbox(
-                "Stile di ricomposizione:",
-                ["minimal", "ambient", "armonico", "elettronico", "drone", "minimalismo_ritmico"],
-                format_func=lambda s: {
-                    "minimal":             "🔇 Minimal — ritmo scarno, pause ampie",
-                    "ambient":             "🌊 Ambient — note lunghe, rarefatto",
-                    "armonico":            "🎼 Armonico — melodia per gradi stretti",
-                    "elettronico":         "🤖 Elettronico — griglia rigida, meccanico",
-                    "drone":               "🔔 Drone — note lunghissime, statico",
-                    "minimalismo_ritmico": "🥁 Minimalismo Ritmico — sincopato, sparse",
-                }[s],
-                key="recompose_style_ui"
+            style_label = st.selectbox(
+                "Scegli uno stile:",
+                list(RECOMPOSE_STYLES.keys()),
+                key="recompose_style_label"
             )
+            style_key, style_desc = RECOMPOSE_STYLES[style_label]
+            st.info(style_desc)
+
             if st.button("🔁 Ricomponi", type="primary", use_container_width=True, key="btn_recomponi"):
                 with st.spinner("Ricomponendo traccia per traccia..."):
-                    recomposed = midi_recomposer(midi_data, recompose_style_ui)
-
+                    recomposed = midi_recomposer(midi_data, style_key)
                     midi_out_bytes = io.BytesIO()
                     recomposed.save(file=midi_out_bytes)
                     midi_out_bytes.seek(0)
@@ -983,8 +947,8 @@ if uploaded_midi_file is not None:
                     st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Recomposed.mid"
                     st.session_state.midi_report   = build_report(
                         uploaded_midi_file.name, midi_data, recomposed,
-                        ["MIDI Recomposer"], {"MIDI Recomposer": (recompose_style_ui,)},
-                        midi_methods, stile=f"Ricomponi — {recompose_style_ui}"
+                        ["MIDI Recomposer"], {"MIDI Recomposer": (style_key,)},
+                        midi_methods, stile=style_label
                     )
                     st.session_state.midi_ready = True
                     st.success(
@@ -992,14 +956,6 @@ if uploaded_midi_file is not None:
                         f"{len(midi_data.tracks)} tracce originali → "
                         f"{len(recomposed.tracks)} tracce ricomposte."
                     )
-            st.markdown("---")
-            # Preset styling ancora disponibile come secondo pannello
-            preset_name = st.selectbox("Oppure scegli un preset di decomposizione:", list(PRESETS.keys()))
-            preset = PRESETS[preset_name]
-            st.info(preset["desc"])
-            selected_methods_keys = preset["methods"]
-            parameters = preset["params"]
-            st.caption("Metodi applicati: " + " → ".join([midi_methods[m] for m in selected_methods_keys]))
 
         else:
             st.markdown("#### Metodi di Decomposizione")
