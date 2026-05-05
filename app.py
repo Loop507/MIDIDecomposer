@@ -573,23 +573,47 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
 
 
 
+# Mappatura General MIDI: numero programma → nome famiglia strumentale
+_GM_FAMILY = [
+    "Piano","Chromatic Perc","Organ","Guitar",
+    "Bass","Strings","Ensemble","Brass",
+    "Reed","Pipe","Synth Lead","Synth Pad",
+    "Synth FX","Ethnic","Percussive","Sound FX",
+]
+
+def _gm_track_name(program, channel):
+    """Restituisce il nome GM della famiglia strumentale dato il programma e il canale."""
+    if channel == 9:
+        return "Drums"
+    family = _GM_FAMILY[min(program // 8, 15)]
+    return family
+
+
 def _split_type0_to_tracks(midi):
     """
     Converte un MIDI tipo 0 (1 traccia, N canali) in un MIDI tipo 1
-    con una traccia per canale. Preserva i messaggi meta nella traccia 0.
+    con una traccia per canale attivo (canali senza note vengono ignorati).
+    Nomina ogni traccia con il nome GM reale (Bass, Drums, Guitar, ecc.)
+    preservando il canale originale.
     """
     from collections import defaultdict
     tpb = midi.ticks_per_beat
     src_track = midi.tracks[0]
 
-    # Calcola tempo assoluto per ogni messaggio
+    # Tempo assoluto per ogni messaggio
     events = []
     abs_time = 0
     for msg in src_track:
         abs_time += msg.time
         events.append((abs_time, msg))
 
-    # Separa meta dalla traccia 0, note per canale
+    # Leggi program_change per canale (primo trovato vince)
+    ch_program = {}
+    for _, msg in events:
+        if msg.type == 'program_change' and msg.channel not in ch_program:
+            ch_program[msg.channel] = msg.program
+
+    # Separa meta e messaggi per canale
     meta_events = []
     ch_events = defaultdict(list)
     for abs_t, msg in events:
@@ -600,9 +624,15 @@ def _split_type0_to_tracks(midi):
         else:
             meta_events.append((abs_t, msg))
 
+    # Tieni solo canali che hanno almeno una nota
+    active_channels = {
+        ch for ch, evs in ch_events.items()
+        if any(m.type == 'note_on' and m.velocity > 0 for _, m in evs)
+    }
+
     new_midi = mido.MidiFile(ticks_per_beat=tpb, type=1)
 
-    # Traccia 0: solo meta (tempo, time signature, ecc.)
+    # Traccia 0: solo meta
     meta_track = mido.MidiTrack()
     meta_track.name = "Meta"
     last_t = 0
@@ -612,10 +642,30 @@ def _split_type0_to_tracks(midi):
         last_t = abs_t
     new_midi.tracks.append(meta_track)
 
-    # Una traccia per canale
-    for ch in sorted(ch_events.keys()):
+    # Conta quante volte compare ogni nome GM (per disambiguare duplicati)
+    name_count = defaultdict(int)
+    ch_names = {}
+    for ch in sorted(active_channels):
+        prog = ch_program.get(ch, 0)
+        base_name = _gm_track_name(prog, ch)
+        name_count[base_name] += 1
+        ch_names[ch] = (base_name, prog)
+
+    # Se un nome compare più volte, aggiungi suffisso numerico
+    seen = defaultdict(int)
+    final_names = {}
+    for ch in sorted(active_channels):
+        base_name, prog = ch_names[ch]
+        if name_count[base_name] > 1:
+            seen[base_name] += 1
+            final_names[ch] = f"{base_name} {seen[base_name]}"
+        else:
+            final_names[ch] = base_name
+
+    # Una traccia per canale attivo
+    for ch in sorted(active_channels):
         ch_track = mido.MidiTrack()
-        ch_track.name = f"Ch{ch+1}"
+        ch_track.name = final_names[ch]
         last_t = 0
         evs = sorted(ch_events[ch], key=lambda x: x[0])
         for abs_t, msg in evs:
