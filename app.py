@@ -573,17 +573,77 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
 
 
 
+def _split_type0_to_tracks(midi):
+    """
+    Converte un MIDI tipo 0 (1 traccia, N canali) in un MIDI tipo 1
+    con una traccia per canale. Preserva i messaggi meta nella traccia 0.
+    """
+    from collections import defaultdict
+    tpb = midi.ticks_per_beat
+    src_track = midi.tracks[0]
+
+    # Calcola tempo assoluto per ogni messaggio
+    events = []
+    abs_time = 0
+    for msg in src_track:
+        abs_time += msg.time
+        events.append((abs_time, msg))
+
+    # Separa meta dalla traccia 0, note per canale
+    meta_events = []
+    ch_events = defaultdict(list)
+    for abs_t, msg in events:
+        if msg.is_meta:
+            meta_events.append((abs_t, msg))
+        elif hasattr(msg, 'channel'):
+            ch_events[msg.channel].append((abs_t, msg))
+        else:
+            meta_events.append((abs_t, msg))
+
+    new_midi = mido.MidiFile(ticks_per_beat=tpb, type=1)
+
+    # Traccia 0: solo meta (tempo, time signature, ecc.)
+    meta_track = mido.MidiTrack()
+    meta_track.name = "Meta"
+    last_t = 0
+    for abs_t, msg in sorted(meta_events, key=lambda x: x[0]):
+        delta = abs_t - last_t
+        meta_track.append(msg.copy(time=delta))
+        last_t = abs_t
+    new_midi.tracks.append(meta_track)
+
+    # Una traccia per canale
+    for ch in sorted(ch_events.keys()):
+        ch_track = mido.MidiTrack()
+        ch_track.name = f"Ch{ch+1}"
+        last_t = 0
+        evs = sorted(ch_events[ch], key=lambda x: x[0])
+        for abs_t, msg in evs:
+            delta = abs_t - last_t
+            ch_track.append(msg.copy(time=delta))
+            last_t = abs_t
+        new_midi.tracks.append(ch_track)
+
+    return new_midi
+
+
 def midi_recomposer(original_midi, style):
     """
     Ricompone TRACCIA PER TRACCIA il MIDI originale.
+    Se il file è tipo 0 (1 traccia, N canali) lo esplode prima in N tracce.
     Per ogni traccia:
       1. Estrae il pool di pitch (con frequenza proporzionale)
       2. Rileva il canale dominante della traccia
       3. Costruisce una nuova melodia con ritmo e struttura completamente nuovi
          usando solo le note di quella traccia come vocabolario
-    Output: stesso numero di tracce, stessi canali, stessi nomi — brano irriconoscibile.
+    Output: stesso numero di tracce/canali dell'originale — brano irriconoscibile.
     """
     from collections import Counter
+
+    # File tipo 0: esplodi canali in tracce separate prima di ricomporre
+    if original_midi.type == 0 or (len(original_midi.tracks) == 1 and
+            len({m.channel for t in original_midi.tracks for m in t if hasattr(m,'channel')}) > 1):
+        original_midi = _split_type0_to_tracks(original_midi)
 
     tpb = original_midi.ticks_per_beat
 
@@ -741,8 +801,12 @@ def midi_recomposer(original_midi, style):
         for pitch, count in pitch_counts.items():
             weighted_pool.extend([pitch] * max(1, count))
 
-        vel_min = max(30, min(velocities))
-        vel_max = min(120, max(velocities))
+        vel_min = min(velocities)
+        vel_max = max(velocities)
+        if vel_min > vel_max: vel_min, vel_max = vel_max, vel_min
+        vel_min = max(1, vel_min)
+        vel_max = min(127, vel_max)
+        if vel_min == vel_max: vel_min = max(1, vel_max - 10)
 
         # --- Costruisci nuova traccia ---
         new_track = build_track_from_pool(
