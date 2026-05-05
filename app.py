@@ -957,141 +957,146 @@ if uploaded_midi_file is not None:
                         f"{len(recomposed.tracks)} tracce ricomposte."
                     )
 
-        else:
+        else:  # 🔧 Avanzato
             st.markdown("#### Metodi di Decomposizione")
             selected_methods_keys = st.multiselect("Seleziona uno o piu' metodi:", list(midi_methods.keys()), format_func=lambda x: midi_methods[x])
             st.markdown("#### Parametri per i Metodi Selezionati:")
 
-        for selected_method in selected_methods_keys:
-            st.markdown(f"**Parametri per: {midi_methods[selected_method]}**")
+            for selected_method in selected_methods_keys:
+                st.markdown(f"**Parametri per: {midi_methods[selected_method]}**")
 
-            if selected_method == "MIDI Note Remapper":
-                col1_remap, col2_remap = st.columns(2)
-                with col1_remap:
-                    target_scale = st.selectbox("Scala Target:", ["Cromatica", "Maggiore", "Minore Naturale", "Pentatonica Maggiore", "Blues"], key=f"remap_scale_{selected_method}")
-                with col2_remap:
-                    target_key = st.selectbox("Tonalità Target:", ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B','Cm', 'C#m', 'Dm', 'D#m', 'Em', 'Fm', 'F#m', 'Gm', 'G#m', 'Am', 'A#m', 'Bm'], index=0, key=f"remap_key_{selected_method}")
-                pitch_shift_range = st.slider("Range Pitch Shift Randomico (semitoni):", 0, 12, 0, key=f"remap_pitch_shift_{selected_method}")
-                velocity_randomization = st.slider("Percentuale Randomizzazione Velocity:", 0, 100, 0, key=f"remap_velocity_{selected_method}")
-                parameters[selected_method] = (target_scale, target_key, int(pitch_shift_range), int(velocity_randomization))
+                if selected_method == "MIDI Note Remapper":
+                    col1_remap, col2_remap = st.columns(2)
+                    with col1_remap:
+                        target_scale = st.selectbox("Scala Target:", ["Cromatica", "Maggiore", "Minore Naturale", "Pentatonica Maggiore", "Blues"], key=f"remap_scale_{selected_method}")
+                    with col2_remap:
+                        target_key = st.selectbox("Tonalità Target:", ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B','Cm', 'C#m', 'Dm', 'D#m', 'Em', 'Fm', 'F#m', 'Gm', 'G#m', 'Am', 'A#m', 'Bm'], index=0, key=f"remap_key_{selected_method}")
+                    pitch_shift_range = st.slider("Range Pitch Shift Randomico (semitoni):", 0, 12, 0, key=f"remap_pitch_shift_{selected_method}")
+                    velocity_randomization = st.slider("Percentuale Randomizzazione Velocity:", 0, 100, 0, key=f"remap_velocity_{selected_method}")
+                    parameters[selected_method] = (target_scale, target_key, int(pitch_shift_range), int(velocity_randomization))
 
-            elif selected_method == "MIDI Phrase Reconstructor":
-                phrase_length_beats = st.slider("Lunghezza Frase (battute):", 1, 16, 4, key=f"phrase_length_{selected_method}")
-                reassembly_style = st.selectbox("Stile Riorganizzazione Frasi:", ["Casuale", "Inversione", "Ciclico A-B-A", "Dal Più Corto al Più Lungo"], index=0, key=f"phrase_style_{selected_method}")
-                parameters[selected_method] = (phrase_length_beats, reassembly_style)
+                elif selected_method == "MIDI Phrase Reconstructor":
+                    phrase_length_beats = st.slider("Lunghezza Frase (battute):", 1, 16, 4, key=f"phrase_length_{selected_method}")
+                    reassembly_style = st.selectbox("Stile Riorganizzazione Frasi:", ["Casuale", "Inversione", "Ciclico A-B-A", "Dal Più Corto al Più Lungo"], index=0, key=f"phrase_style_{selected_method}")
+                    parameters[selected_method] = (phrase_length_beats, reassembly_style)
 
-            elif selected_method == "MIDI Time Scrambler":
-                keep_original_duration = st.checkbox("Mantieni Durata Originale", key=f"time_keep_duration_{selected_method}")
-                execution_speed_preset = st.selectbox("Velocità di Esecuzione:", ["Medio (Originale)", "Lento (Metà velocità)", "Molto Lento (Un quarto velocità)", "Veloce (Doppia velocità)", "Molto Veloce (Quattro volte velocità)"], index=0, key=f"time_speed_preset_{selected_method}")
-                default_stretch_factor = 1.0
-                if execution_speed_preset == "Lento (Metà velocità)": default_stretch_factor = 2.0
-                elif execution_speed_preset == "Molto Lento (Un quarto velocità)": default_stretch_factor = 4.0
-                elif execution_speed_preset == "Veloce (Doppia velocità)": default_stretch_factor = 0.5
-                elif execution_speed_preset == "Molto Veloce (Quattro volte velocità)": default_stretch_factor = 0.25
-                stretch_factor = st.slider("Fattore di Stiramento/Compressione (Time Warp):", 0.1, 5.0, default_stretch_factor, 0.1, key=f"time_stretch_factor_{selected_method}")
-                quantization_strength = st.slider("Forza Quantizzazione (0=libero, 100=rigido):", 0, 100, 50, key=f"time_quant_strength_{selected_method}")
-                swing_amount = st.slider("Quantità di Swing (%):", 0, 100, 0, key=f"time_swing_amount_{selected_method}")
-                if keep_original_duration: stretch_factor = 1.0
-                parameters[selected_method] = (stretch_factor, quantization_strength, swing_amount)
+                elif selected_method == "MIDI Time Scrambler":
+                    keep_original_duration = st.checkbox("Mantieni Durata Originale", key=f"time_keep_duration_{selected_method}")
+                    execution_speed_preset = st.selectbox("Velocità di Esecuzione:", ["Medio (Originale)", "Lento (Metà velocità)", "Molto Lento (Un quarto velocità)", "Veloce (Doppia velocità)", "Molto Veloce (Quattro volte velocità)"], index=0, key=f"time_speed_preset_{selected_method}")
+                    default_stretch_factor = 1.0
+                    if execution_speed_preset == "Lento (Metà velocità)": default_stretch_factor = 2.0
+                    elif execution_speed_preset == "Molto Lento (Un quarto velocità)": default_stretch_factor = 4.0
+                    elif execution_speed_preset == "Veloce (Doppia velocità)": default_stretch_factor = 0.5
+                    elif execution_speed_preset == "Molto Veloce (Quattro volte velocità)": default_stretch_factor = 0.25
+                    stretch_factor = st.slider("Fattore di Stiramento/Compressione (Time Warp):", 0.1, 5.0, default_stretch_factor, 0.1, key=f"time_stretch_factor_{selected_method}")
+                    quantization_strength = st.slider("Forza Quantizzazione (0=libero, 100=rigido):", 0, 100, 50, key=f"time_quant_strength_{selected_method}")
+                    swing_amount = st.slider("Quantità di Swing (%):", 0, 100, 0, key=f"time_swing_amount_{selected_method}")
+                    if keep_original_duration: stretch_factor = 1.0
+                    parameters[selected_method] = (stretch_factor, quantization_strength, swing_amount)
 
-            elif selected_method == "MIDI Density Transformer":
-                add_note_probability = st.slider("Probabilità di Aggiungere Note (%):", 0, 50, 0, key=f"density_add_prob_{selected_method}")
-                remove_note_probability = st.slider("Probabilità di Rimuovere Note (%):", 0, 50, 0, key=f"density_remove_prob_{selected_method}")
-                polyphony_mode = st.selectbox("Modalità Polifonia Aggiuntiva:", ["Nessuna", "Riempi Accordo (Triadi)", "Aggiungi Contro-Melodia", "Droni"], key=f"density_poly_mode_{selected_method}")
-                parameters[selected_method] = (add_note_probability, remove_note_probability, polyphony_mode)
-            
-            elif selected_method == "MIDI Random Pitch Transformer":
-                random_pitch_strength = st.slider("Forza Randomizzazione Pitch (%):", 0, 100, 100, key=f"random_pitch_strength_{selected_method}")
-                parameters[selected_method] = (random_pitch_strength,)
+                elif selected_method == "MIDI Density Transformer":
+                    add_note_probability = st.slider("Probabilità di Aggiungere Note (%):", 0, 50, 0, key=f"density_add_prob_{selected_method}")
+                    remove_note_probability = st.slider("Probabilità di Rimuovere Note (%):", 0, 50, 0, key=f"density_remove_prob_{selected_method}")
+                    polyphony_mode = st.selectbox("Modalità Polifonia Aggiuntiva:", ["Nessuna", "Riempi Accordo (Triadi)", "Aggiungi Contro-Melodia", "Droni"], key=f"density_poly_mode_{selected_method}")
+                    parameters[selected_method] = (add_note_probability, remove_note_probability, polyphony_mode)
 
-            elif selected_method == "MIDI Rhythmic Base":
-                st.markdown("Seleziona gli elementi ritmici per costruire il tuo pattern:")
-                col_rhythm1, col_rhythm2 = st.columns(2)
-                with col_rhythm1:
-                    kick_enabled = st.checkbox("Cassa", value=True, key="rhythm_kick")
-                    snare_enabled = st.checkbox("Rullante", value=True, key="rhythm_snare")
-                    hihat_enabled = st.checkbox("Hi-hat", value=True, key="rhythm_hihat")
-                with col_rhythm2:
-                    time_signature = st.text_input("Metrica (es. '4/4', '3/4', '5/8'):", value="4/4", key=f"rhythm_time_sig_{selected_method}")
-                    rhythmic_pattern_style = st.selectbox("Stile Pattern Ritmico:", ["Pattern Adattivo", "Pattern Fisso (Pop/Rock)", "Pattern Casuale"], key=f"rhythm_pattern_style_{selected_method}")
-                parameters[selected_method] = (kick_enabled, snare_enabled, hihat_enabled, time_signature, rhythmic_pattern_style)
+                elif selected_method == "MIDI Random Pitch Transformer":
+                    random_pitch_strength = st.slider("Forza Randomizzazione Pitch (%):", 0, 100, 100, key=f"random_pitch_strength_{selected_method}")
+                    parameters[selected_method] = (random_pitch_strength,)
 
-        if st.button("🎶 DECOMPONI MIDI", type="primary", use_container_width=True):
-            with st.spinner("Applicando le decomposizioni..."):
-                current_midi = midi_data
-                for method_key in selected_methods_keys:
-                    method_params = parameters.get(method_key, [])
-                    if method_key == "MIDI Note Remapper":
-                        current_midi = midi_note_remapper(current_midi, *method_params)
-                    elif method_key == "MIDI Phrase Reconstructor":
-                        current_midi = midi_phrase_reconstructor(current_midi, *method_params)
-                    elif method_key == "MIDI Time Scrambler":
-                        current_midi = midi_time_scrambler(current_midi, *method_params)
-                    elif method_key == "MIDI Density Transformer":
-                        current_midi = midi_density_transformer(current_midi, *method_params)
-                    elif method_key == "MIDI Random Pitch Transformer":
-                        current_midi = midi_random_pitch_transformer(current_midi, *method_params)
-                    elif method_key == "MIDI Rhythmic Base":
-                        current_midi = midi_add_rhythmic_base(current_midi, *method_params)
-                    elif method_key == "MIDI Recomposer":
-                        recompose_style = method_params[0] if method_params else "minimal"
-                        current_midi = midi_recomposer(current_midi, recompose_style)
-                decomposed_midi_file = current_midi
+                elif selected_method == "MIDI Rhythmic Base":
+                    st.markdown("Seleziona gli elementi ritmici per costruire il tuo pattern:")
+                    col_rhythm1, col_rhythm2 = st.columns(2)
+                    with col_rhythm1:
+                        kick_enabled = st.checkbox("Cassa", value=True, key="rhythm_kick")
+                        snare_enabled = st.checkbox("Rullante", value=True, key="rhythm_snare")
+                        hihat_enabled = st.checkbox("Hi-hat", value=True, key="rhythm_hihat")
+                    with col_rhythm2:
+                        time_signature = st.text_input("Metrica (es. '4/4', '3/4', '5/8'):", value="4/4", key=f"rhythm_time_sig_{selected_method}")
+                        rhythmic_pattern_style = st.selectbox("Stile Pattern Ritmico:", ["Pattern Adattivo", "Pattern Fisso (Pop/Rock)", "Pattern Casuale"], key=f"rhythm_pattern_style_{selected_method}")
+                    parameters[selected_method] = (kick_enabled, snare_enabled, hihat_enabled, time_signature, rhythmic_pattern_style)
 
-                if decomposed_midi_file:
-                    st.success("Decomposizione MIDI completata!")
-
-                    # Salva in session_state
-                    midi_out_bytes = io.BytesIO()
-                    decomposed_midi_file.save(file=midi_out_bytes)
-                    midi_out_bytes.seek(0)
-                    st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                    st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Decomposed.mid"
-                    st.session_state.midi_report   = build_report(
-                        uploaded_midi_file.name, midi_data, decomposed_midi_file,
-                        selected_methods_keys, parameters, midi_methods,
-                        stile=preset_name if modalita == '🎨 Stile' else None
+                elif selected_method == "MIDI Recomposer":
+                    recomposer_style_adv = st.selectbox(
+                        "Stile Recomposer:",
+                        ["minimal","ambient","armonico","elettronico","drone","minimalismo_ritmico","sperimentale"],
+                        key="recomposer_style_adv"
                     )
-                    st.session_state.midi_ready = True
-                    
-                    def get_track_display_name(track, index):
-                        track_name = next((msg.name for msg in track if msg.type == 'track_name'), None)
-                        if not track_name and hasattr(track, 'name') and 'Ritmica:' in track.name:
-                             return track.name
-                        return f"Traccia {index}: {track_name if track_name else '(Senza Nome)'}"
+                    parameters[selected_method] = (recomposer_style_adv,)
 
-                    if len(decomposed_midi_file.tracks) > 0:
-                        st.markdown("---")
-                        st.subheader("Scarica Singole Tracce del MIDI Decomposto")
-                        track_options = [get_track_display_name(track, i) for i, track in enumerate(decomposed_midi_file.tracks)]
-                        selected_tracks_indices = st.multiselect(
-                            "Seleziona una o più tracce da scaricare singolarmente:",
-                            options=list(range(len(decomposed_midi_file.tracks))),
-                            format_func=lambda x: track_options[x],
-                            default=None,
-                            help="Seleziona le tracce che vuoi scaricare come file MIDI separati."
+            if st.button("🎶 DECOMPONI MIDI", type="primary", use_container_width=True):
+                with st.spinner("Applicando le decomposizioni..."):
+                    current_midi = midi_data
+                    for method_key in selected_methods_keys:
+                        method_params = parameters.get(method_key, [])
+                        if method_key == "MIDI Note Remapper":
+                            current_midi = midi_note_remapper(current_midi, *method_params)
+                        elif method_key == "MIDI Phrase Reconstructor":
+                            current_midi = midi_phrase_reconstructor(current_midi, *method_params)
+                        elif method_key == "MIDI Time Scrambler":
+                            current_midi = midi_time_scrambler(current_midi, *method_params)
+                        elif method_key == "MIDI Density Transformer":
+                            current_midi = midi_density_transformer(current_midi, *method_params)
+                        elif method_key == "MIDI Random Pitch Transformer":
+                            current_midi = midi_random_pitch_transformer(current_midi, *method_params)
+                        elif method_key == "MIDI Rhythmic Base":
+                            current_midi = midi_add_rhythmic_base(current_midi, *method_params)
+                        elif method_key == "MIDI Recomposer":
+                            recompose_style = method_params[0] if method_params else "minimal"
+                            current_midi = midi_recomposer(current_midi, recompose_style)
+                    decomposed_midi_file = current_midi
+
+                    if decomposed_midi_file:
+                        st.success("Decomposizione MIDI completata!")
+                        midi_out_bytes = io.BytesIO()
+                        decomposed_midi_file.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Decomposed.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, decomposed_midi_file,
+                            selected_methods_keys, parameters, midi_methods, stile=None
                         )
-                        if selected_tracks_indices:
-                            for track_index in selected_tracks_indices:
-                                single_track_midi = mido.MidiFile()
-                                single_track_midi.tracks.append(decomposed_midi_file.tracks[track_index])
-                                single_track_midi.ticks_per_beat = decomposed_midi_file.ticks_per_beat
-                                single_track_bytes = io.BytesIO()
-                                single_track_midi.save(file=single_track_bytes)
-                                single_track_bytes.seek(0)
-                                original_file_base_name = uploaded_midi_file.name.split('.')[0]
-                                track_name_for_file = get_track_display_name(decomposed_midi_file.tracks[track_index], track_index).replace(' ', '_').replace(':', '')
-                                st.download_button(
-                                    label=f"💾 Scarica {track_options[track_index]}",
-                                    data=single_track_bytes,
-                                    file_name=f"{original_file_base_name}_{track_name_for_file}.mid",
-                                    mime="audio/midi",
-                                    key=f"download_track_{track_index}"
-                                )
+                        st.session_state.midi_ready = True
+
+                        def get_track_display_name(track, index):
+                            track_name = next((msg.name for msg in track if msg.type == 'track_name'), None)
+                            if not track_name and hasattr(track, 'name') and 'Ritmica:' in track.name:
+                                return track.name
+                            return f"Traccia {index}: {track_name if track_name else '(Senza Nome)'}"
+
+                        if len(decomposed_midi_file.tracks) > 0:
+                            st.markdown("---")
+                            st.subheader("Scarica Singole Tracce del MIDI Decomposto")
+                            track_options = [get_track_display_name(track, i) for i, track in enumerate(decomposed_midi_file.tracks)]
+                            selected_tracks_indices = st.multiselect(
+                                "Seleziona una o più tracce da scaricare singolarmente:",
+                                options=list(range(len(decomposed_midi_file.tracks))),
+                                format_func=lambda x: track_options[x],
+                                default=None,
+                                help="Seleziona le tracce che vuoi scaricare come file MIDI separati."
+                            )
+                            if selected_tracks_indices:
+                                for track_index in selected_tracks_indices:
+                                    single_track_midi = mido.MidiFile()
+                                    single_track_midi.tracks.append(decomposed_midi_file.tracks[track_index])
+                                    single_track_midi.ticks_per_beat = decomposed_midi_file.ticks_per_beat
+                                    single_track_bytes = io.BytesIO()
+                                    single_track_midi.save(file=single_track_bytes)
+                                    single_track_bytes.seek(0)
+                                    original_file_base_name = uploaded_midi_file.name.split('.')[0]
+                                    track_name_for_file = get_track_display_name(decomposed_midi_file.tracks[track_index], track_index).replace(' ', '_').replace(':', '')
+                                    st.download_button(
+                                        label=f"💾 Scarica {track_options[track_index]}",
+                                        data=single_track_bytes,
+                                        file_name=f"{original_file_base_name}_{track_name_for_file}.mid",
+                                        mime="audio/midi",
+                                        key=f"download_track_{track_index}"
+                                    )
+                        else:
+                            st.info("Il MIDI decomposto non contiene tracce valide da scaricare singolarmente.")
                     else:
-                        st.info("Il MIDI decomposto non contiene tracce valide da scaricare singolarmente.")
-                else:
-                    st.error("Impossibile generare il MIDI decomposto. Controlla i messaggi di avviso.")
+                        st.error("Impossibile generare il MIDI decomposto. Controlla i messaggi di avviso.")
 
     except Exception as e:
         st.error(f"❌ Errore durante la lettura o l'elaborazione del file MIDI: {str(e)}")
