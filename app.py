@@ -312,6 +312,160 @@ def midi_costas_generator(original_midi, min_order, base_pitch, pitch_range_semi
     return new_midi, (n, p, g)
 
 
+# --- Compositori: Karlheinz Stockhausen / Boulez — Serialismo Integrale (Punktuelle Musik) ---
+# Rif: Stockhausen "Kreuzspiel" (1951), Boulez "Structures Ia" (1952), radicati nel
+# "Mode de valeurs et d'intensites" di Messiaen (1949) — il primo a serializzare
+# non solo l'altezza ma anche durata, dinamica e attacco. Ogni nota diventa un
+# "punto" sonoro isolato le cui 4 dimensioni (pitch/durata/dinamica/timbro) sono
+# governate da 4 forme indipendenti della stessa fila a 12 elementi.
+
+def _row_prime(row):
+    return list(row)
+
+def _row_retrograde(row):
+    return list(reversed(row))
+
+def _row_inversion(row):
+    return [(12 - x) % 12 for x in row]
+
+def _row_retrograde_inversion(row):
+    return list(reversed(_row_inversion(row)))
+
+def derive_twelve_tone_row(original_midi):
+    """
+    Deriva la fila dodecafonica direttamente dal materiale del brano: le prime
+    12 classi di altezza distinte incontrate, nell'ordine di apparizione
+    (prassi seriale classica: la fila nasce dal materiale stesso).
+    Se il brano non contiene 12 classi distinte, completa con la permutazione
+    di Costas di ordine 12 (stessa costruzione di Welch del Costas Sequencer),
+    cosi' la fila resta comunque priva di ripetizioni banali.
+    """
+    seen = []
+    for track in original_midi.tracks:
+        for msg in track:
+            if msg.type == 'note_on' and msg.velocity > 0:
+                pc = msg.note % 12
+                if pc not in seen:
+                    seen.append(pc)
+                if len(seen) == 12:
+                    break
+        if len(seen) == 12:
+            break
+    if len(seen) < 12:
+        costas_perm, _n, _p, _g = generate_costas_array(12)
+        for pc in costas_perm:
+            if pc not in seen:
+                seen.append(pc)
+            if len(seen) == 12:
+                break
+    return seen[:12]
+
+
+def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serialize_dynamics=True,
+                                 serialize_timbre=True, isolamento_punti=True):
+    """
+    Serialismo integrale multiparametrico (stile Stockhausen/Boulez).
+    Estrae una fila a 12 elementi dal brano, poi applica 4 forme indipendenti
+    della fila a 4 parametri scorrelati di ogni singola nota, trattata come un
+    punto sonoro isolato:
+      - Altezza  -> forma Prima (P)         (classe di pitch rimappata)
+      - Durata   -> forma Retrograda (R)    (12 classi di durata fisse)
+      - Dinamica -> forma Inversione (I)    (12 classi di velocity fisse)
+      - Timbro   -> forma Retrograda-Inversa (RI) (rotazione tra i canali presenti)
+    Le note vengono processate in ordine cronologico assoluto attraverso tutte
+    le tracce (non per traccia separata), perche' nella musica puntillistica
+    ogni punto e' indipendente dal contesto melodico/timbrico originale.
+    Se isolamento_punti=True, ogni nota viene accorciata e seguita da un
+    micro-silenzio, per accentuare la natura di "punti" isolati nello spazio
+    sonoro invece che di frasi legate.
+    """
+    row = derive_twelve_tone_row(original_midi)
+    row_P = _row_prime(row)
+    row_R = _row_retrograde(row)
+    row_I = _row_inversion(row)
+    row_RI = _row_retrograde_inversion(row)
+
+    ticks_per_beat = original_midi.ticks_per_beat
+    base_unit = max(1, ticks_per_beat // 8)
+    DURATION_CLASSES = [base_unit * (k + 1) for k in range(12)]  # 12 durate crescenti, in ottavi di beat
+    DYNAMICS_CLASSES = [int(v) for v in np.linspace(24, 127, 12)]  # ppp -> fff su 12 gradini
+
+    channels_present = sorted(set(
+        msg.channel for track in original_midi.tracks for msg in track
+        if hasattr(msg, 'channel')
+    )) or [0]
+
+    # Raccogli tutte le note come punti indipendenti, in ordine cronologico assoluto
+    all_points = []
+    for track_idx, track in enumerate(original_midi.tracks):
+        notes = extract_notes(track, ticks_per_beat)
+        for nd in notes:
+            all_points.append({
+                'start': nd['start'],
+                'orig_pitch': nd['pitch'],
+                'orig_channel': nd['channel'],
+                'orig_velocity': nd['velocity'],
+                'track_idx': track_idx,
+            })
+
+    if not all_points:
+        st.warning("Nessuna nota trovata nel brano. La tecnica Punktuelle non verra' applicata.")
+        return original_midi, row
+
+    all_points.sort(key=lambda x: x['start'])
+
+    # Un'unica traccia d'uscita: la musica puntillistica di Stockhausen non
+    # distingue "voci" — ogni punto e' un evento autonomo nello spazio sonoro.
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    punkt_track = mido.MidiTrack()
+    row_str = "-".join(str(x) for x in row_P)
+    punkt_track.name = f"Punktuelle (fila: {row_str})"
+
+    events = []
+    for i, point in enumerate(all_points):
+        pitch_class = point['orig_pitch'] % 12
+        octave = point['orig_pitch'] // 12
+        new_pitch_class = row_P[pitch_class]
+        new_pitch = max(0, min(127, octave * 12 + new_pitch_class))
+
+        if serialize_duration:
+            dur_idx = row_R[i % 12]
+            duration = DURATION_CLASSES[dur_idx]
+        else:
+            duration = base_unit * 2
+
+        if serialize_dynamics:
+            dyn_idx = row_I[i % 12]
+            velocity = DYNAMICS_CLASSES[dyn_idx]
+        else:
+            velocity = point['orig_velocity']
+
+        if serialize_timbre:
+            timbre_idx = row_RI[i % 12] % len(channels_present)
+            channel = channels_present[timbre_idx]
+        else:
+            channel = point['orig_channel']
+
+        note_start = point['start']
+        if isolamento_punti:
+            note_len = max(1, int(duration * 0.55))  # nota staccata: meno della meta' dello slot
+        else:
+            note_len = max(1, duration)
+
+        events.append({'msg': mido.Message('note_on', note=new_pitch, velocity=velocity, channel=channel, time=0), 'abs_time': note_start})
+        events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=channel, time=0), 'abs_time': note_start + note_len})
+
+    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+    last_abs_time = 0
+    for event_data in events:
+        delta = max(0, event_data['abs_time'] - last_abs_time)
+        punkt_track.append(event_data['msg'].copy(time=delta))
+        last_abs_time = event_data['abs_time']
+
+    new_midi.tracks.append(punkt_track)
+    return new_midi, row
+
+
 # --- Funzioni di Decomposizione ---
 
 def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
@@ -1147,6 +1301,17 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
             else:
                 method_lines.append(f"   * Pitch base: {params[2]} | Estensione: {params[3]} semitoni | Passo: {params[4]} beat")
 
+        elif method_key == "MIDI Stockhausen Punktuelle":
+            dur_on, dyn_on, timbre_on, iso_on, row_used = params
+            method_lines.append(f"   * Fila dodecafonica: {row_used}")
+            flags = []
+            if dur_on: flags.append("Durata")
+            if dyn_on: flags.append("Dinamica")
+            if timbre_on: flags.append("Timbro")
+            method_lines.append(f"   * Parametri serializzati: Altezza (P), {', '.join(flags) if flags else 'solo Altezza'}")
+            method_lines.append(f"   * Isolamento punti (staccato): {'Sì' if iso_on else 'No'}")
+            method_lines.append("   * Serialismo integrale (Stockhausen/Boulez, rad. Messiaen 'Mode de valeurs')")
+
     report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
     report += ":: MOTORE: midi_decomposer [v1.0]\n"
     report += f":: FILE: {original_file}\n"
@@ -1232,8 +1397,20 @@ if uploaded_midi_file is not None:
             "MIDI Density Transformer": "🎲 Controllo Densità (Armonia/Contrappunto)",
             "MIDI Random Pitch Transformer": "❓ Randomizzazione Totale Pitch (Caos)",
             "MIDI Rhythmic Base": "🥁 Aggiungi Base Ritmica",
-            "MIDI Costas Sequencer": "🧮 Costas Sequencer (permutazioni prive di autocorrelazione)",
-            "MIDI Recomposer": "🔁 Ricomposizione (nuovo brano dal materiale originale)"
+            "MIDI Recomposer": "🔁 Ricomposizione (nuovo brano dal materiale originale)",
+            # --- Compositori (vedi modalita' dedicata "🎼 Compositori") ---
+            "MIDI Costas Sequencer": "🧮 Scott Rickard — Costas Sequencer",
+            "MIDI Stockhausen Punktuelle": "🎯 Karlheinz Stockhausen — Punktuelle Musik",
+        }
+        # Metodi disponibili nella modalita' "🔧 Avanzato" (i Compositori hanno la loro modalita' dedicata)
+        ADVANCED_METHODS_KEYS = [
+            "MIDI Note Remapper", "MIDI Phrase Reconstructor", "MIDI Time Scrambler",
+            "MIDI Density Transformer", "MIDI Random Pitch Transformer",
+            "MIDI Rhythmic Base", "MIDI Recomposer",
+        ]
+        COMPOSITORI = {
+            "🎯 Karlheinz Stockhausen — Punktuelle Musik": "MIDI Stockhausen Punktuelle",
+            "🧮 Scott Rickard — Costas Sequencer": "MIDI Costas Sequencer",
         }
 
         # --- STILI RICOMPOSIZIONE (usati dal pulsante Ricomponi) ---
@@ -1297,7 +1474,7 @@ if uploaded_midi_file is not None:
         }
 
         # Modalita' Preset / Avanzato
-        modalita = st.radio("Modalita':", ["🎨 Stile", "🔧 Avanzato"], horizontal=True)
+        modalita = st.radio("Modalita':", ["🎨 Stile", "🎼 Compositori", "🔧 Avanzato"], horizontal=True)
 
         decomposed_midi_file = midi_data
         parameters = {}
@@ -1337,9 +1514,112 @@ if uploaded_midi_file is not None:
                         f"{len(recomposed.tracks)} tracce ricomposte."
                     )
 
+        elif modalita == "🎼 Compositori":
+            st.markdown("#### 🎼 Tecniche Compositive Algoritmiche")
+            st.markdown(
+                "Ricomposizioni che replicano le tecniche di compositori/matematici storici "
+                "che hanno usato schemi combinatori — nessuna rete neurale, solo algoritmo puro."
+            )
+            compositore_label = st.selectbox("Scegli compositore/tecnica:", list(COMPOSITORI.keys()), key="compositore_select")
+            compositore_key = COMPOSITORI[compositore_label]
+
+            if compositore_key == "MIDI Stockhausen Punktuelle":
+                st.info(
+                    "**Serialismo integrale (Kreuzspiel, 1951 / Structures Ia, 1952)** — radicato nel "
+                    "\"Mode de valeurs et d'intensités\" di Messiaen. Una fila a 12 elementi, derivata "
+                    "dal brano stesso, viene applicata in 4 forme indipendenti (Prima, Retrograda, "
+                    "Inversione, Retrograda-Inversa) a 4 parametri scorrelati: altezza, durata, "
+                    "dinamica e timbro. Ogni nota diventa un punto sonoro isolato."
+                )
+                col_st1, col_st2 = st.columns(2)
+                with col_st1:
+                    serialize_duration = st.checkbox("Serializza Durata", value=True, key="stock_dur")
+                    serialize_dynamics = st.checkbox("Serializza Dinamica", value=True, key="stock_dyn")
+                with col_st2:
+                    serialize_timbre = st.checkbox("Serializza Timbro (canale)", value=True, key="stock_timbre")
+                    isolamento_punti = st.checkbox("Isolamento punti (note staccate)", value=True, key="stock_iso")
+
+                if st.button("🎯 Applica Punktuelle Musik", type="primary", use_container_width=True, key="btn_stockhausen"):
+                    with st.spinner("Serializzando i 4 parametri (Stockhausen/Boulez)..."):
+                        result_midi, row_used = midi_stockhausen_punktuelle(
+                            midi_data, serialize_duration, serialize_dynamics, serialize_timbre, isolamento_punti
+                        )
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Stockhausen.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Stockhausen Punktuelle"],
+                            {"MIDI Stockhausen Punktuelle": (serialize_duration, serialize_dynamics, serialize_timbre, isolamento_punti, row_used)},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        st.success(f"✅ Punktuelle Musik applicata! Fila dodecafonica usata: {row_used}")
+
+            else:  # Costas Sequencer
+                st.caption(
+                    "Basato sulla costruzione di Welch (Scott Rickard / J.P. Costas): "
+                    "una permutazione algoritmica in cui nessun vettore-differenza tra "
+                    "coppie si ripete. Nessuna rete neurale, nessun random puro — pura DSP/combinatoria."
+                )
+                costas_mode = st.selectbox(
+                    "Modalità Costas:",
+                    ["Permutazione Pitch (Cromatica)", "Griglia Ritmica Costas", "Generatore Costas (Nuova Melodia)"],
+                    key="costas_mode_compositori"
+                )
+
+                if costas_mode == "Permutazione Pitch (Cromatica)":
+                    st.info("Usa una matrice di Costas di ordine 12 (p=13) come cifrario di sostituzione fisso per le 12 classi di altezza. Ritmo invariato.")
+                    transpose_octave = st.slider("Trasposizione (ottave):", -2, 2, 0, key="costas_transpose_compositori")
+                    costas_params = (costas_mode, 12, transpose_octave, 0, 1.0)
+
+                elif costas_mode == "Griglia Ritmica Costas":
+                    costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 8, key="costas_order_grid_compositori")
+                    _p_preview = _costas_find_prime(costas_order_req)
+                    st.caption(f"Ordine effettivo: n = {_p_preview - 1} (primo p = {_p_preview})")
+                    costas_params = (costas_mode, costas_order_req, 0, 0, 1.0)
+
+                else:  # Generatore Costas (Nuova Melodia)
+                    costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 12, key="costas_order_gen_compositori")
+                    _p_preview = _costas_find_prime(costas_order_req)
+                    st.caption(f"Ordine effettivo: n = {_p_preview - 1} (primo p = {_p_preview})")
+                    col_c1, col_c2 = st.columns(2)
+                    with col_c1:
+                        base_pitch = st.slider("Pitch base (MIDI):", 24, 96, 60, key="costas_base_pitch_compositori")
+                    with col_c2:
+                        pitch_range_semitones = st.slider("Estensione (semitoni):", 6, 48, 24, key="costas_pitch_range_compositori")
+                    step_beats = st.slider("Durata di ogni passo (in battute/beat):", 0.125, 2.0, 0.25, 0.125, key="costas_step_beats_compositori")
+                    costas_params = (costas_mode, costas_order_req, base_pitch, pitch_range_semitones, step_beats)
+
+                if st.button("🧮 Applica Costas Sequencer", type="primary", use_container_width=True, key="btn_costas"):
+                    with st.spinner("Generando la matrice di Costas (costruzione di Welch)..."):
+                        cmode, corder, cp1, cp2, cp3 = costas_params
+                        if cmode == "Permutazione Pitch (Cromatica)":
+                            result_midi, costas_info = midi_costas_pitch_permutation(midi_data, transpose_octave=cp1)
+                        elif cmode == "Griglia Ritmica Costas":
+                            result_midi, costas_info = midi_costas_rhythmic_grid(midi_data, corder)
+                        else:
+                            result_midi, costas_info = midi_costas_generator(midi_data, corder, cp1, cp2, cp3)
+
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Costas.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Costas Sequencer"], {"MIDI Costas Sequencer": costas_params},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        n_costas, p_costas, g_costas = costas_info
+                        st.success(f"✅ Costas Sequencer applicato! Ordine effettivo n={n_costas} (p={p_costas}, g={g_costas})")
+
         else:  # 🔧 Avanzato
             st.markdown("#### Metodi di Decomposizione")
-            selected_methods_keys = st.multiselect("Seleziona uno o piu' metodi:", list(midi_methods.keys()), format_func=lambda x: midi_methods[x])
+            selected_methods_keys = st.multiselect("Seleziona uno o piu' metodi:", ADVANCED_METHODS_KEYS, format_func=lambda x: midi_methods[x])
             st.markdown("#### Parametri per i Metodi Selezionati:")
 
             for selected_method in selected_methods_keys:
@@ -1396,41 +1676,6 @@ if uploaded_midi_file is not None:
                         rhythmic_pattern_style = st.selectbox("Stile Pattern Ritmico:", ["Pattern Adattivo", "Pattern Fisso (Pop/Rock)", "Pattern Casuale"], key=f"rhythm_pattern_style_{selected_method}")
                     parameters[selected_method] = (kick_enabled, snare_enabled, hihat_enabled, time_signature, rhythmic_pattern_style)
 
-                elif selected_method == "MIDI Costas Sequencer":
-                    st.caption(
-                        "Basato sulla costruzione di Welch (Scott Rickard / J.P. Costas): "
-                        "una permutazione algoritmica in cui nessun vettore-differenza tra "
-                        "coppie si ripete. Nessuna rete neurale, nessun random puro — pura DSP/combinatoria."
-                    )
-                    costas_mode = st.selectbox(
-                        "Modalità Costas:",
-                        ["Permutazione Pitch (Cromatica)", "Griglia Ritmica Costas", "Generatore Costas (Nuova Melodia)"],
-                        key=f"costas_mode_{selected_method}"
-                    )
-
-                    if costas_mode == "Permutazione Pitch (Cromatica)":
-                        st.info("Usa una matrice di Costas di ordine 12 (p=13) come cifrario di sostituzione fisso per le 12 classi di altezza. Ritmo invariato.")
-                        transpose_octave = st.slider("Trasposizione (ottave):", -2, 2, 0, key=f"costas_transpose_{selected_method}")
-                        parameters[selected_method] = (costas_mode, 12, transpose_octave, 0, 1.0)
-
-                    elif costas_mode == "Griglia Ritmica Costas":
-                        costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 8, key=f"costas_order_grid_{selected_method}")
-                        _p_preview = _costas_find_prime(costas_order_req)
-                        st.caption(f"Ordine effettivo: n = {_p_preview - 1} (primo p = {_p_preview})")
-                        parameters[selected_method] = (costas_mode, costas_order_req, 0, 0, 1.0)
-
-                    else:  # Generatore Costas (Nuova Melodia)
-                        costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 12, key=f"costas_order_gen_{selected_method}")
-                        _p_preview = _costas_find_prime(costas_order_req)
-                        st.caption(f"Ordine effettivo: n = {_p_preview - 1} (primo p = {_p_preview})")
-                        col_c1, col_c2 = st.columns(2)
-                        with col_c1:
-                            base_pitch = st.slider("Pitch base (MIDI):", 24, 96, 60, key=f"costas_base_pitch_{selected_method}")
-                        with col_c2:
-                            pitch_range_semitones = st.slider("Estensione (semitoni):", 6, 48, 24, key=f"costas_pitch_range_{selected_method}")
-                        step_beats = st.slider("Durata di ogni passo (in battute/beat):", 0.125, 2.0, 0.25, 0.125, key=f"costas_step_beats_{selected_method}")
-                        parameters[selected_method] = (costas_mode, costas_order_req, base_pitch, pitch_range_semitones, step_beats)
-
                 elif selected_method == "MIDI Recomposer":
                     recomposer_style_adv = st.selectbox(
                         "Stile Recomposer:",
@@ -1456,15 +1701,6 @@ if uploaded_midi_file is not None:
                             current_midi = midi_random_pitch_transformer(current_midi, *method_params)
                         elif method_key == "MIDI Rhythmic Base":
                             current_midi = midi_add_rhythmic_base(current_midi, *method_params)
-                        elif method_key == "MIDI Costas Sequencer":
-                            costas_mode, costas_order, cp1, cp2, cp3 = method_params
-                            if costas_mode == "Permutazione Pitch (Cromatica)":
-                                current_midi, costas_info = midi_costas_pitch_permutation(current_midi, transpose_octave=cp1)
-                            elif costas_mode == "Griglia Ritmica Costas":
-                                current_midi, costas_info = midi_costas_rhythmic_grid(current_midi, costas_order)
-                            else:
-                                current_midi, costas_info = midi_costas_generator(current_midi, costas_order, cp1, cp2, cp3)
-                            st.session_state["_last_costas_info"] = costas_info
                         elif method_key == "MIDI Recomposer":
                             recompose_style = method_params[0] if method_params else "minimal"
                             current_midi = midi_recomposer(current_midi, recompose_style)
