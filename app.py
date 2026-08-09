@@ -1,10 +1,12 @@
 # midi_decomposer_app.py - VERSIONE RIVISTA E CORRETTA
 
 import streamlit as st
+import streamlit.components.v1 as components
 import mido
 import random
 import numpy as np
 import io
+import base64
 from collections import defaultdict
 
 # --- Configurazione della Pagina ---
@@ -1167,6 +1169,35 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
     report += "#structuraldecomposition #algorithmicmusic #experimentalmusic"
     return report
 
+# --- Player MIDI in-browser (web component html-midi-player, no dipendenze server) ---
+def render_midi_player(midi_bytes, label, key_suffix=""):
+    """
+    Incorpora un lettore/visualizzatore MIDI direttamente nel browser dell'utente,
+    usando la libreria 'html-midi-player' (Tone.js + soundfont via CDN).
+    Nessuna sintesi lato server: funziona anche su Streamlit Cloud.
+    """
+    b64_midi = base64.b64encode(midi_bytes).decode("utf-8")
+    data_uri = f"data:audio/midi;base64,{b64_midi}"
+    html_code = f"""
+    <script src="https://cdn.jsdelivr.net/combine/npm/tone@14.7.58,npm/@magenta/music@1.23.1/es6/core.js,npm/focus-visible@5,npm/html-midi-player@1.5.0"></script>
+    <div style="background:#111;border-radius:8px;padding:12px;font-family:sans-serif;">
+        <p style="color:#ddd;margin:0 0 8px 0;font-size:14px;">🎧 {label}</p>
+        <midi-player
+            src="{data_uri}"
+            sound-font
+            visualizer="#midi-visualizer-{key_suffix}"
+            style="width:100%;">
+        </midi-player>
+        <midi-visualizer
+            id="midi-visualizer-{key_suffix}"
+            src="{data_uri}"
+            type="piano-roll"
+            style="width:100%;display:block;margin-top:8px;">
+        </midi-visualizer>
+    </div>
+    """
+    components.html(html_code, height=260, scrolling=False)
+
 # --- Sezione Upload File MIDI ---
 st.subheader("🎵 Carica il tuo file MIDI (.mid o .midi)")
 uploaded_midi_file = st.file_uploader(
@@ -1185,6 +1216,12 @@ if uploaded_midi_file is not None:
         st.write(f"Nome file: **{uploaded_midi_file.name}**")
         st.write(f"Numero di tracce: **{len(midi_data.tracks)}**")
         st.write(f"Durata (stimata): **{midi_data.length:.2f} secondi**")
+
+        with st.expander("🎧 Ascolta il MIDI originale"):
+            _orig_bytes_io = io.BytesIO()
+            midi_data.save(file=_orig_bytes_io)
+            render_midi_player(_orig_bytes_io.getvalue(), "MIDI originale", key_suffix="original")
+
         st.markdown("---")
         st.subheader("⚙️ Modalita' di Decomposizione")
 
@@ -1512,6 +1549,9 @@ else:
 # RISULTATI PERSISTENTI
 if st.session_state.midi_ready and st.session_state.midi_bytes:
     st.markdown("---")
+    st.subheader("🎧 Ascolta il risultato prima di scaricare")
+    render_midi_player(st.session_state.midi_bytes, "MIDI decomposto/ricomposto", key_suffix="result")
+
     st.subheader("Scarica il tuo MIDI Decomposto")
     c_d1, c_d2 = st.columns(2)
     with c_d1:
