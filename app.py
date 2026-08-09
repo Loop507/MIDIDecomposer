@@ -92,6 +92,224 @@ def reconstruct_track(notes, ticks_per_beat):
         last_abs_time = event['abs_time']
     return new_track
 
+# --- Costas Array Utilities (costruzione di Welch, GF(p)) ---
+# Rif: J.P. Costas (1965); L. Welch construction via radice primitiva mod p.
+# Scott Rickard ha usato la stessa costruzione per generare melodie prive di
+# autocorrelazione ("la canzone piu' irritante mai composta").
+
+def _costas_is_prime(n):
+    if n < 2:
+        return False
+    if n in (2, 3):
+        return True
+    if n % 2 == 0:
+        return False
+    i = 3
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i += 2
+    return True
+
+def _costas_prime_factors(n):
+    factors = set()
+    d = 2
+    while d * d <= n:
+        while n % d == 0:
+            factors.add(d)
+            n //= d
+        d += 1
+    if n > 1:
+        factors.add(n)
+    return factors
+
+def _costas_find_prime(min_order):
+    """Trova il piu' piccolo primo p tale che p-1 >= min_order."""
+    p = max(3, min_order + 1)
+    while not _costas_is_prime(p):
+        p += 1
+    return p
+
+def _costas_primitive_root(p):
+    """Trova una radice primitiva di p (esiste sempre per p primo)."""
+    if p == 2:
+        return 1
+    phi = p - 1
+    factors = _costas_prime_factors(phi)
+    for g in range(2, p):
+        if all(pow(g, phi // f, p) != 1 for f in factors):
+            return g
+    return 2  # fallback teorico, non dovrebbe mai accadere per p primo
+
+def generate_costas_array(min_order):
+    """
+    Genera una matrice/sequenza di Costas tramite la costruzione di Welch:
+    per un primo p con radice primitiva g, la permutazione
+        perm[i] = (g^(i+1) mod p) - 1   per i = 0..p-2
+    e' una permutazione di {0,...,p-2} = {0,...,n-1} con la proprieta' di Costas
+    (tutti i vettori differenza tra coppie di punti sono distinti).
+
+    Ritorna: (perm, n, p, g)
+      perm: lista di lunghezza n, permutazione di 0..n-1 (perm[riga] = colonna)
+      n:    ordine effettivo della matrice (n = p-1, >= min_order richiesto)
+      p:    primo usato
+      g:    radice primitiva usata
+    """
+    min_order = max(1, int(min_order))
+    p = _costas_find_prime(min_order)
+    g = _costas_primitive_root(p)
+    n = p - 1
+    perm = [(pow(g, i + 1, p) - 1) for i in range(n)]
+    return perm, n, p, g
+
+
+def midi_costas_pitch_permutation(original_midi, transpose_octave=0):
+    """
+    Modalita' 1: Permutazione Pitch (cromatica).
+    Usa una matrice di Costas di ordine 12 (p=13, primo) come cifrario di
+    sostituzione deterministico e privo di autocorrelazione per le classi di
+    altezza: ogni classe di pitch (0-11) viene rimappata secondo perm[pitch_class],
+    mantenendo l'ottava originale (+ eventuale trasposizione).
+    A differenza del Random Pitch Transformer, la mappatura e' fissa e
+    biunivoca: stesso pitch in ingresso -> sempre stesso pitch in uscita.
+    """
+    perm, n, p, g = generate_costas_array(12)  # p=13 -> n=12, mappa cromatica esatta
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+
+    for original_track in original_midi.tracks:
+        new_track = mido.MidiTrack()
+        if hasattr(original_track, 'name') and original_track.name:
+            new_track.name = original_track.name
+
+        for msg in original_track:
+            if msg.type in ('note_on', 'note_off') and hasattr(msg, 'note'):
+                pitch_class = msg.note % 12
+                octave = msg.note // 12
+                new_pitch_class = perm[pitch_class % n]
+                new_pitch = (octave * 12) + new_pitch_class + (transpose_octave * 12)
+                new_pitch = max(0, min(127, new_pitch))
+                new_track.append(msg.copy(note=new_pitch))
+            else:
+                new_track.append(msg)
+
+        new_midi.tracks.append(new_track)
+    return new_midi, (n, p, g)
+
+
+def midi_costas_rhythmic_grid(original_midi, min_order, block_notes=None):
+    """
+    Modalita' 2: Griglia Ritmica Costas.
+    Raggruppa le note (per traccia, in ordine di apertura) in blocchi di n note
+    (n = ordine effettivo della matrice) e ridistribuisce gli onset all'interno
+    di ciascun blocco secondo la permutazione di Costas su una griglia di n slot
+    che copre l'estensione temporale originale del blocco. Pitch e durate
+    restano quelli originali: cambia solo *dove* cade ogni nota — uno shuffle
+    algoritmico non ripetitivo, non casuale.
+    """
+    perm, n, p, g = generate_costas_array(min_order)
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+
+    for original_track in original_midi.tracks:
+        _name = original_track.name if hasattr(original_track, 'name') else ''
+        notes = extract_notes(original_track, original_midi.ticks_per_beat)
+
+        if not notes:
+            new_midi.tracks.append(original_track)
+            continue
+
+        notes_sorted = sorted(notes, key=lambda x: x['start_tick'])
+        final_events = []
+
+        for block_start in range(0, len(notes_sorted), n):
+            block = notes_sorted[block_start: block_start + n]
+            if not block:
+                continue
+            block_begin_tick = block[0]['start_tick']
+            block_end_tick = max(nd['start_tick'] + nd['duration_ticks'] for nd in block)
+            block_span = max(1, block_end_tick - block_begin_tick)
+            slot_size = block_span / n
+
+            for idx, note_data in enumerate(block):
+                slot = perm[idx % n]
+                new_start = block_begin_tick + int(round(slot * slot_size))
+                duration = max(1, note_data['duration_ticks'])
+                new_end = new_start + duration
+
+                final_events.append({'msg': mido.Message('note_on', note=note_data['pitch'], velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': new_start})
+                final_events.append({'msg': mido.Message('note_off', note=note_data['pitch'], velocity=0, channel=note_data['channel'], time=0), 'abs_time': new_end})
+
+        final_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+
+        new_track = mido.MidiTrack()
+        if _name:
+            new_track.name = _name
+        last_abs_time = 0
+        for event_data in final_events:
+            delta = max(0, event_data['abs_time'] - last_abs_time)
+            new_track.append(event_data['msg'].copy(time=delta))
+            last_abs_time = event_data['abs_time']
+
+        new_midi.tracks.append(new_track)
+    return new_midi, (n, p, g)
+
+
+def midi_costas_generator(original_midi, min_order, base_pitch, pitch_range_semitones, step_beats, channel=0):
+    """
+    Modalita' 3: Generatore Costas (nuova melodia) — nello spirito della
+    "canzone piu' irritante" di Scott Rickard. Genera una traccia MIDI
+    autonoma che copre l'intera durata del brano originale, in cui ogni passo
+    i (su una griglia ciclica di n passi) suona il pitch:
+        base_pitch + round(perm[i] * pitch_range / (n-1))
+    Nessuna ripetizione di intervallo tra le coppie di note e' presente
+    all'interno di ciascun ciclo (proprieta' di Costas), quindi la melodia
+    non presenta alcun pattern memorizzabile.
+    Le tracce originali vengono mantenute; questa si aggiunge come nuova traccia.
+    """
+    perm, n, p, g = generate_costas_array(min_order)
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    for track in original_midi.tracks:
+        new_midi.tracks.append(track)
+
+    total_ticks = 0
+    for track in original_midi.tracks:
+        current_time = 0
+        for msg in track:
+            current_time += msg.time
+        total_ticks = max(total_ticks, current_time)
+
+    if total_ticks == 0:
+        st.warning("Il brano originale non contiene eventi validi. Il generatore Costas non verra' aggiunto.")
+        return new_midi, (n, p, g)
+
+    step_ticks = max(1, int(round(step_beats * original_midi.ticks_per_beat)))
+    costas_track = mido.MidiTrack()
+    costas_track.name = f"Costas Generator (n={n}, p={p}, g={g})"
+
+    events = []
+    t = 0
+    i = 0
+    while t < total_ticks:
+        slot = perm[i % n]
+        denom = max(1, n - 1)
+        pitch = base_pitch + int(round(slot * pitch_range_semitones / denom))
+        pitch = max(0, min(127, pitch))
+        note_len = max(1, int(step_ticks * 0.9))
+        events.append({'msg': mido.Message('note_on', note=pitch, velocity=95, channel=channel, time=0), 'abs_time': t})
+        events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=channel, time=0), 'abs_time': t + note_len})
+        t += step_ticks
+        i += 1
+
+    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+    last_abs_time = 0
+    for event_data in events:
+        delta = max(0, event_data['abs_time'] - last_abs_time)
+        costas_track.append(event_data['msg'].copy(time=delta))
+        last_abs_time = event_data['abs_time']
+
+    new_midi.tracks.append(costas_track)
+    return new_midi, (n, p, g)
+
+
 # --- Funzioni di Decomposizione ---
 
 def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
@@ -917,6 +1135,16 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
             method_lines.append(f"   * Elementi: {', '.join(drums) if drums else 'Nessuno'}")
             method_lines.append(f"   * Metrica: {params[3]} | Pattern: {params[4]}")
 
+        elif method_key == "MIDI Costas Sequencer":
+            costas_mode = params[0]
+            method_lines.append(f"   * Modalità: {costas_mode} | Ordine richiesto: {params[1]}")
+            if costas_mode == "Permutazione Pitch (Cromatica)":
+                method_lines.append(f"   * Trasposizione: {params[2]} ottave | Costruzione di Welch, n=12, p=13")
+            elif costas_mode == "Griglia Ritmica Costas":
+                method_lines.append("   * Costruzione di Welch (Scott Rickard / J.P. Costas)")
+            else:
+                method_lines.append(f"   * Pitch base: {params[2]} | Estensione: {params[3]} semitoni | Passo: {params[4]} beat")
+
     report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
     report += ":: MOTORE: midi_decomposer [v1.0]\n"
     report += f":: FILE: {original_file}\n"
@@ -967,6 +1195,7 @@ if uploaded_midi_file is not None:
             "MIDI Density Transformer": "🎲 Controllo Densità (Armonia/Contrappunto)",
             "MIDI Random Pitch Transformer": "❓ Randomizzazione Totale Pitch (Caos)",
             "MIDI Rhythmic Base": "🥁 Aggiungi Base Ritmica",
+            "MIDI Costas Sequencer": "🧮 Costas Sequencer (permutazioni prive di autocorrelazione)",
             "MIDI Recomposer": "🔁 Ricomposizione (nuovo brano dal materiale originale)"
         }
 
@@ -1130,6 +1359,41 @@ if uploaded_midi_file is not None:
                         rhythmic_pattern_style = st.selectbox("Stile Pattern Ritmico:", ["Pattern Adattivo", "Pattern Fisso (Pop/Rock)", "Pattern Casuale"], key=f"rhythm_pattern_style_{selected_method}")
                     parameters[selected_method] = (kick_enabled, snare_enabled, hihat_enabled, time_signature, rhythmic_pattern_style)
 
+                elif selected_method == "MIDI Costas Sequencer":
+                    st.caption(
+                        "Basato sulla costruzione di Welch (Scott Rickard / J.P. Costas): "
+                        "una permutazione algoritmica in cui nessun vettore-differenza tra "
+                        "coppie si ripete. Nessuna rete neurale, nessun random puro — pura DSP/combinatoria."
+                    )
+                    costas_mode = st.selectbox(
+                        "Modalità Costas:",
+                        ["Permutazione Pitch (Cromatica)", "Griglia Ritmica Costas", "Generatore Costas (Nuova Melodia)"],
+                        key=f"costas_mode_{selected_method}"
+                    )
+
+                    if costas_mode == "Permutazione Pitch (Cromatica)":
+                        st.info("Usa una matrice di Costas di ordine 12 (p=13) come cifrario di sostituzione fisso per le 12 classi di altezza. Ritmo invariato.")
+                        transpose_octave = st.slider("Trasposizione (ottave):", -2, 2, 0, key=f"costas_transpose_{selected_method}")
+                        parameters[selected_method] = (costas_mode, 12, transpose_octave, 0, 1.0)
+
+                    elif costas_mode == "Griglia Ritmica Costas":
+                        costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 8, key=f"costas_order_grid_{selected_method}")
+                        _p_preview = _costas_find_prime(costas_order_req)
+                        st.caption(f"Ordine effettivo: n = {_p_preview - 1} (primo p = {_p_preview})")
+                        parameters[selected_method] = (costas_mode, costas_order_req, 0, 0, 1.0)
+
+                    else:  # Generatore Costas (Nuova Melodia)
+                        costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 12, key=f"costas_order_gen_{selected_method}")
+                        _p_preview = _costas_find_prime(costas_order_req)
+                        st.caption(f"Ordine effettivo: n = {_p_preview - 1} (primo p = {_p_preview})")
+                        col_c1, col_c2 = st.columns(2)
+                        with col_c1:
+                            base_pitch = st.slider("Pitch base (MIDI):", 24, 96, 60, key=f"costas_base_pitch_{selected_method}")
+                        with col_c2:
+                            pitch_range_semitones = st.slider("Estensione (semitoni):", 6, 48, 24, key=f"costas_pitch_range_{selected_method}")
+                        step_beats = st.slider("Durata di ogni passo (in battute/beat):", 0.125, 2.0, 0.25, 0.125, key=f"costas_step_beats_{selected_method}")
+                        parameters[selected_method] = (costas_mode, costas_order_req, base_pitch, pitch_range_semitones, step_beats)
+
                 elif selected_method == "MIDI Recomposer":
                     recomposer_style_adv = st.selectbox(
                         "Stile Recomposer:",
@@ -1155,6 +1419,15 @@ if uploaded_midi_file is not None:
                             current_midi = midi_random_pitch_transformer(current_midi, *method_params)
                         elif method_key == "MIDI Rhythmic Base":
                             current_midi = midi_add_rhythmic_base(current_midi, *method_params)
+                        elif method_key == "MIDI Costas Sequencer":
+                            costas_mode, costas_order, cp1, cp2, cp3 = method_params
+                            if costas_mode == "Permutazione Pitch (Cromatica)":
+                                current_midi, costas_info = midi_costas_pitch_permutation(current_midi, transpose_octave=cp1)
+                            elif costas_mode == "Griglia Ritmica Costas":
+                                current_midi, costas_info = midi_costas_rhythmic_grid(current_midi, costas_order)
+                            else:
+                                current_midi, costas_info = midi_costas_generator(current_midi, costas_order, cp1, cp2, cp3)
+                            st.session_state["_last_costas_info"] = costas_info
                         elif method_key == "MIDI Recomposer":
                             recompose_style = method_params[0] if method_params else "minimal"
                             current_midi = midi_recomposer(current_midi, recompose_style)
