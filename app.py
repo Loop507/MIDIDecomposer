@@ -466,6 +466,108 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
     return new_midi, row
 
 
+# --- Compositori: Pierre Boulez — Moltiplicazione d'Accordi (Blocs Sonores) ---
+# Rif: Le Marteau sans maitre (1955), Structures II, Eclat. Tecnica di "pitch-class
+# set multiplication" (Heinemann 1993; Koblyakov 1990): dato un insieme A e un
+# insieme B di classi di altezza, si trasla A per ciascun intervallo generato da B
+# rispetto a un pivot; l'unione delle trasposizioni forma un nuovo aggregato
+# armonico. A differenza del pointillisme di Stockhausen (un punto = una nota),
+# qui ogni evento del brano diventa un accordo/massa sonora verticale.
+
+def boulez_multiply_sets(set_a, set_b, pivot=None):
+    """
+    Moltiplicazione semplice di due pitch-class set (Boulez/Heinemann):
+    per ciascuna classe b in set_b, calcola l'intervallo rispetto al pivot e
+    trasla set_a di quell'intervallo; l'unione (senza doppioni) e' il risultato.
+    Es.: {0,4,7} x {0,2} con pivot=0 -> {0,4,7} unito a {2,6,9} = {0,2,4,6,7,9}.
+    """
+    if not set_a or not set_b:
+        return []
+    if pivot is None:
+        pivot = set_b[0]
+    result = set()
+    for b in set_b:
+        interval = (b - pivot) % 12
+        for a in set_a:
+            result.add((a + interval) % 12)
+    return sorted(result)
+
+
+def derive_boulez_sets(original_midi, set_size=4):
+    """
+    Deriva due pitch-class set dal brano stesso, nello spirito seriale in cui
+    il materiale genera i propri operandi: insieme A = prime `set_size` classi
+    distinte incontrate; insieme B = le `set_size` successive. La fila completa
+    a 12 elementi (con fallback Costas) garantisce che A e B non si sovrappongano
+    e siano sempre disponibili anche su brani poveri di materiale.
+    """
+    row = derive_twelve_tone_row(original_midi)
+    set_a = row[:set_size]
+    set_b = row[set_size:set_size * 2]
+    return set_a, set_b
+
+
+def midi_boulez_multiplication(original_midi, set_size=4, chord_density=0, register_spread=1):
+    """
+    Ogni nota del brano originale viene sostituita da un accordo costruito
+    sull'aggregato risultante dalla moltiplicazione d'accordi di Boulez,
+    trasformando la linea melodica in una sequenza di blocs sonores (masse
+    armoniche verticali) invece che di punti isolati.
+    chord_density=0 -> usa l'intero insieme moltiplicato; altrimenti limita
+    l'accordo a `chord_density` classi scelte equidistanti nell'insieme.
+    register_spread>1 -> distribuisce le voci dell'accordo su piu' ottave
+    vicine invece di ammassarle tutte nella stessa ottava (evita cluster).
+    """
+    set_a, set_b = derive_boulez_sets(original_midi, set_size)
+    pivot = set_b[0] if set_b else 0
+    multiplied = boulez_multiply_sets(set_a, set_b, pivot)
+
+    if not multiplied:
+        st.warning("Materiale insufficiente per la moltiplicazione d'accordi. Restituito il MIDI originale.")
+        return original_midi, (set_a, set_b, multiplied)
+
+    if chord_density and 0 < chord_density < len(multiplied):
+        step = len(multiplied) / chord_density
+        chosen_idx = sorted(set(int(round(i * step)) % len(multiplied) for i in range(chord_density)))
+        chord_pcs = [multiplied[i] for i in chosen_idx]
+    else:
+        chord_pcs = multiplied
+
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    for original_track in original_midi.tracks:
+        _name = original_track.name if hasattr(original_track, 'name') else ''
+        notes = extract_notes(original_track, original_midi.ticks_per_beat)
+
+        if not notes:
+            new_midi.tracks.append(original_track)
+            continue
+
+        final_events = []
+        for nd in notes:
+            base_octave = nd['pitch'] // 12
+            for offset_idx, pc in enumerate(chord_pcs):
+                octave_shift = 0
+                if register_spread > 1:
+                    octave_shift = (offset_idx % register_spread) - (register_spread // 2)
+                new_pitch = max(0, min(127, (base_octave + octave_shift) * 12 + pc))
+                final_events.append({'msg': mido.Message('note_on', note=new_pitch, velocity=nd['velocity'], channel=nd['channel'], time=0), 'abs_time': nd['start']})
+                final_events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=nd['channel'], time=0), 'abs_time': nd['end']})
+
+        final_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+        new_track = mido.MidiTrack()
+        if _name:
+            new_track.name = _name
+        last_abs_time = 0
+        for event_data in final_events:
+            delta = max(0, event_data['abs_time'] - last_abs_time)
+            new_track.append(event_data['msg'].copy(time=delta))
+            last_abs_time = event_data['abs_time']
+
+        new_midi.tracks.append(new_track)
+
+    return new_midi, (set_a, set_b, multiplied)
+
+
 # --- Funzioni di Decomposizione ---
 
 def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
@@ -1312,6 +1414,12 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
             method_lines.append(f"   * Isolamento punti (staccato): {'Sì' if iso_on else 'No'}")
             method_lines.append("   * Serialismo integrale (Stockhausen/Boulez, rad. Messiaen 'Mode de valeurs')")
 
+        elif method_key == "MIDI Boulez Multiplication":
+            set_size, chord_density, register_spread, set_a, set_b = params
+            method_lines.append(f"   * Dimensione insiemi A/B: {set_size} | Densità accordo: {'completa' if not chord_density else chord_density} | Ottave: {register_spread}")
+            method_lines.append(f"   * Insieme A: {set_a} | Insieme B: {set_b}")
+            method_lines.append("   * Moltiplicazione d'accordi (Boulez, 'Le Marteau sans maître' / Structures II)")
+
     report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
     report += ":: MOTORE: midi_decomposer [v1.0]\n"
     report += f":: FILE: {original_file}\n"
@@ -1401,6 +1509,7 @@ if uploaded_midi_file is not None:
             # --- Compositori (vedi modalita' dedicata "🎼 Compositori") ---
             "MIDI Costas Sequencer": "🧮 Scott Rickard — Costas Sequencer",
             "MIDI Stockhausen Punktuelle": "🎯 Karlheinz Stockhausen — Punktuelle Musik",
+            "MIDI Boulez Multiplication": "🔷 Pierre Boulez — Moltiplicazione d'Accordi",
         }
         # Metodi disponibili nella modalita' "🔧 Avanzato" (i Compositori hanno la loro modalita' dedicata)
         ADVANCED_METHODS_KEYS = [
@@ -1410,6 +1519,7 @@ if uploaded_midi_file is not None:
         ]
         COMPOSITORI = {
             "🎯 Karlheinz Stockhausen — Punktuelle Musik": "MIDI Stockhausen Punktuelle",
+            "🔷 Pierre Boulez — Moltiplicazione d'Accordi": "MIDI Boulez Multiplication",
             "🧮 Scott Rickard — Costas Sequencer": "MIDI Costas Sequencer",
         }
 
@@ -1557,6 +1667,46 @@ if uploaded_midi_file is not None:
                         )
                         st.session_state.midi_ready = True
                         st.success(f"✅ Punktuelle Musik applicata! Fila dodecafonica usata: {row_used}")
+
+            elif compositore_key == "MIDI Boulez Multiplication":
+                st.info(
+                    "**Moltiplicazione d'accordi** (*Le Marteau sans maître*, 1955 / *Structures II*) — "
+                    "due insiemi di classi di altezza A e B vengono derivati dal brano; A viene traslato "
+                    "per ciascun intervallo generato da B, e l'unione delle trasposizioni forma un nuovo "
+                    "aggregato armonico. Ogni nota del brano diventa un accordo costruito su questo "
+                    "aggregato: la linea melodica si trasforma in *blocs sonores*, masse armoniche "
+                    "verticali invece di punti isolati (l'opposto testurale della Punktuelle Musik)."
+                )
+                col_b1, col_b2 = st.columns(2)
+                with col_b1:
+                    set_size = st.slider("Dimensione insiemi A e B:", 2, 6, 4, key="boulez_set_size")
+                    register_spread = st.slider("Spargimento su ottave:", 1, 3, 1, key="boulez_register_spread")
+                with col_b2:
+                    limita_densita = st.checkbox("Limita densità accordo", value=False, key="boulez_limit_density")
+                    chord_density = st.slider("Note per accordo:", 2, 12, 6, key="boulez_chord_density") if limita_densita else 0
+
+                _preview_a, _preview_b = derive_boulez_sets(midi_data, set_size)
+                _preview_pivot = _preview_b[0] if _preview_b else 0
+                _preview_mult = boulez_multiply_sets(_preview_a, _preview_b, _preview_pivot)
+                st.caption(f"Anteprima — Insieme A: {_preview_a} | Insieme B: {_preview_b} | Aggregato risultante: {_preview_mult} ({len(_preview_mult)} classi)")
+
+                if st.button("🔷 Applica Moltiplicazione d'Accordi", type="primary", use_container_width=True, key="btn_boulez"):
+                    with st.spinner("Moltiplicando gli insiemi di classi di altezza..."):
+                        result_midi, sets_info = midi_boulez_multiplication(midi_data, set_size, chord_density, register_spread)
+                        set_a, set_b, multiplied = sets_info
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Boulez.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Boulez Multiplication"],
+                            {"MIDI Boulez Multiplication": (set_size, chord_density, register_spread, set_a, set_b)},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        st.success(f"✅ Moltiplicazione applicata! Aggregato: {multiplied} ({len(multiplied)} classi di altezza)")
 
             else:  # Costas Sequencer
                 st.caption(
