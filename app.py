@@ -219,22 +219,22 @@ def midi_costas_rhythmic_grid(original_midi, min_order, block_notes=None):
             new_midi.tracks.append(original_track)
             continue
 
-        notes_sorted = sorted(notes, key=lambda x: x['start_tick'])
+        notes_sorted = sorted(notes, key=lambda x: x['start'])
         final_events = []
 
         for block_start in range(0, len(notes_sorted), n):
             block = notes_sorted[block_start: block_start + n]
             if not block:
                 continue
-            block_begin_tick = block[0]['start_tick']
-            block_end_tick = max(nd['start_tick'] + nd['duration_ticks'] for nd in block)
+            block_begin_tick = block[0]['start']
+            block_end_tick = max(nd['end'] for nd in block)
             block_span = max(1, block_end_tick - block_begin_tick)
             slot_size = block_span / n
 
             for idx, note_data in enumerate(block):
                 slot = perm[idx % n]
                 new_start = block_begin_tick + int(round(slot * slot_size))
-                duration = max(1, note_data['duration_ticks'])
+                duration = max(1, note_data['end'] - note_data['start'])
                 new_end = new_start + duration
 
                 final_events.append({'msg': mido.Message('note_on', note=note_data['pitch'], velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': new_start})
