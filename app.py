@@ -857,6 +857,110 @@ def midi_cage_chance_operations(original_midi, silence_probability=0.15, duratio
     return new_midi, hexagram_log
 
 
+# --- Compositori: Brian Eno — Musica Generativa (Cicli Asincroni) ---
+# Rif: "Discreet Music" (1975), "Music for Airports" (1978) — sistemi
+# costruiti da loop di nastro indipendenti, ciascuno contenente una singola
+# nota, che ripetono al proprio periodo. Le lunghezze dei loop sono scelte
+# "incommensurabili" tra loro (nell'album reale: ~23.5s, ~25.9s, ~29.2s...),
+# cosi' che l'insieme impieghi un tempo lunghissimo (il MCM delle lunghezze)
+# prima di ripetersi esattamente, pur restando gli elementi di base sempre
+# gli stessi. "Non compongo la musica, compongo i sistemi che la generano"
+# (Eno). Qui le lunghezze derivano da numeri primi distinti per garantire
+# la stessa incommensurabilita' in modo deterministico e verificabile.
+
+def _eno_prime_sequence(count, start_from=11):
+    """Genera i primi `count` numeri primi a partire da start_from, per ottenere
+    lunghezze di ciclo il piu' possibile incommensurabili tra loro."""
+    primes = []
+    candidate = start_from if start_from % 2 != 0 else start_from + 1
+    while len(primes) < count:
+        if _costas_is_prime(candidate):
+            primes.append(candidate)
+        candidate += 2
+    return primes
+
+
+def midi_eno_generative(original_midi, num_loops=6, min_loop_beats=8, max_loop_beats=32,
+                         note_length_ratio=0.35, duration_multiplier=4, velocity_base=55,
+                         seed=None):
+    """
+    Genera un sistema di loop asincroni in stile Music for Airports/Discreet
+    Music: ogni loop ripete una singola nota (derivata dal materiale del
+    brano originale) al proprio periodo indipendente. Le lunghezze dei loop
+    sono multipli di numeri primi distinti, cosi' che l'intero sistema
+    impieghi un tempo lunghissimo prima di ripetersi esattamente — la stessa
+    logica dei nastri fisici di lunghezza diversa che Eno faceva girare in
+    loop, sfasandosi continuamente l'uno rispetto all'altro.
+    Le tracce originali restano intatte; il sistema generativo si aggiunge
+    come nuove tracce indipendenti (una per loop), per poter regolare in DAW
+    volume/timbro di ciascun loop separatamente.
+    """
+    rng = np.random.default_rng(seed)
+    ticks_per_beat = original_midi.ticks_per_beat
+
+    pitches_found = []
+    for track in original_midi.tracks:
+        for msg in track:
+            if msg.type == 'note_on' and msg.velocity > 0 and msg.note not in pitches_found:
+                pitches_found.append(msg.note)
+    if not pitches_found:
+        st.warning("Nessuna nota trovata nel brano. Il sistema generativo non verra' aggiunto.")
+        return original_midi, []
+    pitches_found.sort()
+
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    for track in original_midi.tracks:
+        new_midi.tracks.append(track)
+
+    total_ticks = 0
+    for track in original_midi.tracks:
+        current_time = 0
+        for msg in track:
+            current_time += msg.time
+        total_ticks = max(total_ticks, current_time)
+    if total_ticks == 0:
+        total_ticks = ticks_per_beat * 4 * 8
+    total_ticks = int(total_ticks * max(1, duration_multiplier))
+
+    primes = _eno_prime_sequence(num_loops, start_from=11)
+    min_ticks = int(min_loop_beats * ticks_per_beat)
+    max_ticks = max(min_ticks + ticks_per_beat, int(max_loop_beats * ticks_per_beat))
+
+    loops_info = []
+    for i in range(num_loops):
+        p = primes[i]
+        scale = min_ticks + (p % max(1, (max_ticks - min_ticks)))
+        loop_len_ticks = max(ticks_per_beat, scale)
+
+        pitch = pitches_found[i % len(pitches_found)]
+        note_len = max(1, int(loop_len_ticks * note_length_ratio))
+        phase_offset = int(rng.uniform(0, loop_len_ticks))  # entrata sfalsata del loop
+
+        loop_track = mido.MidiTrack()
+        loop_track.name = f"Eno Loop {i + 1} (pitch={pitch}, ciclo={loop_len_ticks}t, primo={p})"
+        loop_track.append(mido.Message('program_change', program=0, channel=0, time=0))
+
+        events = []
+        t = phase_offset
+        while t < total_ticks:
+            vel = int(np.clip(velocity_base + rng.normal(0, 6), 15, 90))
+            events.append({'msg': mido.Message('note_on', note=pitch, velocity=vel, channel=0, time=0), 'abs_time': t})
+            events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=0, time=0), 'abs_time': t + note_len})
+            t += loop_len_ticks
+
+        events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+        last_abs_time = 0
+        for event_data in events:
+            delta = max(0, event_data['abs_time'] - last_abs_time)
+            loop_track.append(event_data['msg'].copy(time=delta))
+            last_abs_time = event_data['abs_time']
+
+        new_midi.tracks.append(loop_track)
+        loops_info.append((pitch, loop_len_ticks, p))
+
+    return new_midi, loops_info
+
+
 # --- Funzioni di Decomposizione ---
 
 def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
@@ -1740,6 +1844,12 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
             method_lines.append(f"   * Probabilità di silenzio per evento: {silence_p:.0%} | Varietà durata: {'Sì' if dur_var else 'No'}")
             method_lines.append("   * Operazioni di caso via I Ching, metodo delle tre monete (Cage, 'Music of Changes', 1951)")
 
+        elif method_key == "MIDI Eno Generative":
+            num_loops_r, min_lb, max_lb, nlr, dm, vb = params
+            method_lines.append(f"   * Numero loop: {num_loops_r} | Lunghezza: {min_lb}-{max_lb} beat | Estensione durata: ×{dm}")
+            method_lines.append(f"   * Rapporto durata nota/loop: {nlr} | Velocity base: {vb}")
+            method_lines.append("   * Loop asincroni a lunghezze incommensurabili (Eno, 'Music for Airports'/'Discreet Music')")
+
     report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
     report += ":: MOTORE: midi_decomposer [v1.0]\n"
     report += f":: FILE: {original_file}\n"
@@ -1832,6 +1942,7 @@ if uploaded_midi_file is not None:
             "MIDI Boulez Multiplication": "🔷 Pierre Boulez — Moltiplicazione d'Accordi",
             "MIDI Xenakis Stochastic": "☁️ Iannis Xenakis — Musica Stocastica (Nuvole)",
             "MIDI Cage Chance": "☯️ John Cage — Operazioni di Caso (I Ching)",
+            "MIDI Eno Generative": "🌫️ Brian Eno — Musica Generativa (Cicli Asincroni)",
         }
         # Metodi disponibili nella modalita' "🔧 Avanzato" (i Compositori hanno la loro modalita' dedicata)
         ADVANCED_METHODS_KEYS = [
@@ -1844,6 +1955,7 @@ if uploaded_midi_file is not None:
             "🔷 Pierre Boulez — Moltiplicazione d'Accordi": "MIDI Boulez Multiplication",
             "☁️ Iannis Xenakis — Musica Stocastica": "MIDI Xenakis Stochastic",
             "☯️ John Cage — Operazioni di Caso (I Ching)": "MIDI Cage Chance",
+            "🌫️ Brian Eno — Musica Generativa": "MIDI Eno Generative",
             "🧮 Scott Rickard — Costas Sequencer": "MIDI Costas Sequencer",
         }
 
@@ -2118,6 +2230,48 @@ if uploaded_midi_file is not None:
                         n_eventi_originali = len(hexagram_log)
                         n_silenzi = sum(1 for h in hexagram_log if (h[3] / 64.0) < silence_probability)
                         st.success(f"✅ Operazioni di caso applicate! {n_eventi_originali - n_silenzi} suoni, {n_silenzi} silenzi su {n_eventi_originali} esagrammi lanciati")
+
+            elif compositore_key == "MIDI Eno Generative":
+                st.info(
+                    "**Musica generativa a cicli asincroni** (*Music for Airports*, 1978 / *Discreet Music*, "
+                    "1975) — ogni loop ripete una singola nota (derivata dal brano) al proprio periodo "
+                    "indipendente. Le lunghezze dei loop sono scelte 'incommensurabili' tra loro (via numeri "
+                    "primi distinti), cosi' che l'intero sistema impieghi un tempo lunghissimo prima di "
+                    "ripetersi esattamente, pur restando gli elementi di base sempre gli stessi. "
+                    "*\"Non compongo la musica, compongo i sistemi che la generano\"* (Eno)."
+                )
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    num_loops = st.slider("Numero di loop:", 2, 12, 6, key="eno_num_loops")
+                    min_loop_beats = st.slider("Lunghezza minima loop (beat):", 2, 32, 8, key="eno_min_loop")
+                    max_loop_beats = st.slider("Lunghezza massima loop (beat):", 8, 128, 32, key="eno_max_loop")
+                with col_e2:
+                    note_length_ratio = st.slider("Durata nota (frazione del loop):", 0.05, 0.9, 0.35, 0.05, key="eno_note_ratio")
+                    duration_multiplier = st.slider("Estensione durata brano (×):", 1, 12, 4, key="eno_dur_mult")
+                    velocity_base = st.slider("Velocity base:", 15, 90, 55, key="eno_vel_base")
+                eno_seed_input = st.text_input("Seed (opzionale, per riproducibilità):", value="", key="eno_seed")
+                eno_seed = int(eno_seed_input) if eno_seed_input.strip().isdigit() else None
+
+                if st.button("🌫️ Applica Musica Generativa", type="primary", use_container_width=True, key="btn_eno"):
+                    with st.spinner("Costruendo i cicli asincroni (lunghezze basate su numeri primi)..."):
+                        result_midi, loops_info = midi_eno_generative(
+                            midi_data, num_loops, min_loop_beats, max_loop_beats,
+                            note_length_ratio, duration_multiplier, velocity_base, seed=eno_seed
+                        )
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Eno.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Eno Generative"],
+                            {"MIDI Eno Generative": (num_loops, min_loop_beats, max_loop_beats, note_length_ratio, duration_multiplier, velocity_base)},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        loop_desc = ", ".join(f"{p}t" for _, p, _ in loops_info[:6])
+                        st.success(f"✅ Sistema generativo creato! {len(loops_info)} loop asincroni, cicli: {loop_desc}{'...' if len(loops_info) > 6 else ''}")
 
             else:  # Costas Sequencer
                 st.caption(
