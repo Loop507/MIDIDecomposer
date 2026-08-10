@@ -961,6 +961,414 @@ def midi_eno_generative(original_midi, num_loops=6, min_loop_beats=8, max_loop_b
     return new_midi, loops_info
 
 
+# --- Compositori: Arvo Pärt — Tintinnabuli ---
+# Rif: tecnica inventata nel 1976. Voce M (melodica): si muove per gradi
+# congiunti in una scala diatonica. Voce T (tintinnabuli): vincolata alle
+# sole note della triade centrale, scelta secondo una posizione e direzione
+# fisse rispetto a ciascuna nota della voce M (es. "la prima nota della
+# triade sopra la voce M").
+
+def _part_snap_to_scale(pitch, scale_pcs):
+    """Arrotonda un pitch alla nota di scala piu' vicina (spostamento minimo)."""
+    pc = pitch % 12
+    if pc in scale_pcs:
+        return pitch
+    diff_up = min(((s - pc) % 12) for s in scale_pcs)
+    diff_down = min(((pc - s) % 12) for s in scale_pcs)
+    return pitch + diff_up if diff_up <= diff_down else pitch - diff_down
+
+
+def _part_nearest_triad_tone(pitch, triad_pcs, direction, position):
+    """Trova l'N-esima nota della triade sopra/sotto un dato pitch (posizione 1,2,3)."""
+    candidates = []
+    for octv in range(-3, 4):
+        for pc in triad_pcs:
+            candidates.append(octv * 12 + pc)
+    if direction == "sopra":
+        options = sorted(c for c in candidates if c > pitch)
+    else:
+        options = sorted((c for c in candidates if c < pitch), reverse=True)
+    if not options:
+        return pitch
+    idx = min(position - 1, len(options) - 1)
+    return options[idx]
+
+
+def midi_part_tintinnabuli(original_midi, root_note_name="A", mode="Minore Naturale",
+                            direction="sotto", position=1, t_voice_program=14):
+    """
+    Applica la tecnica tintinnabuli di Arvo Part. Per ciascuna traccia con
+    note: la voce M e' la melodia originale quantizzata sulla scala scelta
+    (movimento per gradi congiunti); una nuova voce T viene aggiunta come
+    traccia parallela, restretta alle sole note della triade tonale, scelta
+    secondo la posizione/direzione indicate rispetto a ciascuna nota M.
+    Le tracce originali (M-voice) vengono quantizzate sul posto; le nuove
+    T-voice si aggiungono come tracce indipendenti (patch di default:
+    Tubular Bells, GM program 14 — coerente con l'origine del nome
+    "tintinnabuli", dal latino per le campanelle).
+    """
+    root_pc = get_key_offset(root_note_name)
+    scale_intervals = get_scale_notes(mode)
+    scale_pcs_ordered = [(root_pc + iv) % 12 for iv in scale_intervals]  # ordine dei gradi dalla tonica
+    scale_pcs = sorted(set(scale_pcs_ordered))  # per la quantizzazione (l'ordine non conta)
+    triad_pcs = [scale_pcs_ordered[0], scale_pcs_ordered[2 % len(scale_pcs_ordered)], scale_pcs_ordered[4 % len(scale_pcs_ordered)]]
+
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    t_voice_tracks = []
+
+    for original_track in original_midi.tracks:
+        notes = extract_notes(original_track, original_midi.ticks_per_beat)
+        if not notes:
+            new_midi.tracks.append(original_track)
+            continue
+
+        _header = _extract_instrument_header(original_track)
+        _name = original_track.name if hasattr(original_track, 'name') else ''
+
+        # --- Voce M: melodia originale quantizzata sulla scala ---
+        m_track = mido.MidiTrack()
+        if _name:
+            m_track.name = f"{_name} (M-voice)"
+        for _h in _header:
+            m_track.append(_h)
+        m_events = []
+        for nd in notes:
+            new_pitch = max(0, min(127, _part_snap_to_scale(nd['pitch'], scale_pcs)))
+            m_events.append({'msg': mido.Message('note_on', note=new_pitch, velocity=nd['velocity'], channel=nd['channel'], time=0), 'abs_time': nd['start']})
+            m_events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=nd['channel'], time=0), 'abs_time': nd['end']})
+        m_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+        last_abs_time = 0
+        for ev in m_events:
+            delta = max(0, ev['abs_time'] - last_abs_time)
+            m_track.append(ev['msg'].copy(time=delta))
+            last_abs_time = ev['abs_time']
+        new_midi.tracks.append(m_track)
+
+        # --- Voce T: triade tonale, stessa ritmica della voce M ---
+        t_track = mido.MidiTrack()
+        t_track.name = f"{_name} (T-voice)" if _name else "T-voice"
+        t_track.append(mido.Message('program_change', program=t_voice_program, channel=1, time=0))
+        t_events = []
+        for nd in notes:
+            m_pitch = max(0, min(127, _part_snap_to_scale(nd['pitch'], scale_pcs)))
+            t_pitch = max(0, min(127, _part_nearest_triad_tone(m_pitch, triad_pcs, direction, position)))
+            t_events.append({'msg': mido.Message('note_on', note=t_pitch, velocity=max(30, nd['velocity'] - 15), channel=1, time=0), 'abs_time': nd['start']})
+            t_events.append({'msg': mido.Message('note_off', note=t_pitch, velocity=0, channel=1, time=0), 'abs_time': nd['end']})
+        t_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+        last_abs_time = 0
+        for ev in t_events:
+            delta = max(0, ev['abs_time'] - last_abs_time)
+            t_track.append(ev['msg'].copy(time=delta))
+            last_abs_time = ev['abs_time']
+        t_voice_tracks.append(t_track)
+
+    for t in t_voice_tracks:
+        new_midi.tracks.append(t)
+
+    return new_midi, (root_note_name, mode, triad_pcs)
+
+
+# --- Compositori: Olivier Messiaen — Modi a Trasposizione Limitata + Ritmi Non Retrogradabili ---
+# Rif: "Technique de mon langage musical" (1944). I 7 modi di Messiaen sono
+# scale simmetriche che, dopo un numero limitato di trasposizioni, tornano a
+# contenere le stesse note (es. Modo 2 = scala ottatonica, 3 trasposizioni).
+# I ritmi non retrogradabili sono sequenze di durate palindrome: lette in
+# avanti o all'indietro, l'ordine resta identico.
+
+MESSIAEN_MODES = {
+    "Modo 1 (esatonale)": [0, 2, 4, 6, 8, 10],
+    "Modo 2 (ottatonico)": [0, 1, 3, 4, 6, 7, 9, 10],
+    "Modo 3": [0, 2, 3, 4, 6, 7, 8, 10, 11],
+    "Modo 4": [0, 1, 2, 5, 6, 7, 8, 11],
+    "Modo 5": [0, 1, 5, 6, 7, 11],
+    "Modo 6": [0, 2, 4, 5, 6, 8, 10, 11],
+    "Modo 7": [0, 1, 2, 3, 5, 6, 7, 8, 9, 11],
+}
+
+
+def _messiaen_snap_to_mode(pitch, mode_pcs):
+    pc = pitch % 12
+    if pc in mode_pcs:
+        return pitch
+    diff_up = min(((m - pc) % 12) for m in mode_pcs)
+    diff_down = min(((pc - m) % 12) for m in mode_pcs)
+    return pitch + diff_up if diff_up <= diff_down else pitch - diff_down
+
+
+def _messiaen_make_palindrome(durations):
+    """Costruisce una sequenza di durate palindroma (ritmo non retrogradabile)
+    a partire da una lista di durate: [d1,d2,...] -> [d1,d2,...,d2,d1]
+    (con valore centrale unico se la lunghezza e' dispari)."""
+    if not durations:
+        return durations
+    half = list(durations)
+    return half + half[-2::-1] if len(half) > 1 else half + half
+
+
+def midi_messiaen_modal(original_midi, mode_name="Modo 2 (ottatonico)", root_note_name="C",
+                         palindrome_block_size=4):
+    """
+    Applica il linguaggio modale di Messiaen: ogni nota viene quantizzata sul
+    modo a trasposizione limitata scelto (invece che su una scala diatonica
+    convenzionale); le durate delle note vengono raggruppate in blocchi e
+    trasformate in sequenze palindrome (ritmi non retrogradabili) — lo stesso
+    ritmo letto in avanti o indietro resta identico.
+    """
+    root_pc = get_key_offset(root_note_name)
+    mode_intervals = MESSIAEN_MODES.get(mode_name, MESSIAEN_MODES["Modo 2 (ottatonico)"])
+    mode_pcs = sorted(set((root_pc + iv) % 12 for iv in mode_intervals))
+
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    for original_track in original_midi.tracks:
+        notes = extract_notes(original_track, original_midi.ticks_per_beat)
+        if not notes:
+            new_midi.tracks.append(original_track)
+            continue
+
+        _header = _extract_instrument_header(original_track)
+        _name = original_track.name if hasattr(original_track, 'name') else ''
+        notes_sorted = sorted(notes, key=lambda x: x['start'])
+
+        # Durate palindrome, applicate a blocchi
+        original_durations = [max(1, nd['end'] - nd['start']) for nd in notes_sorted]
+        new_durations = []
+        for block_start in range(0, len(original_durations), palindrome_block_size):
+            block = original_durations[block_start: block_start + palindrome_block_size]
+            new_durations.extend(_messiaen_make_palindrome(block)[:len(block)])
+
+        new_track = mido.MidiTrack()
+        if _name:
+            new_track.name = _name
+        for _h in _header:
+            new_track.append(_h)
+
+        events = []
+        for i, nd in enumerate(notes_sorted):
+            new_pitch = max(0, min(127, _messiaen_snap_to_mode(nd['pitch'], mode_pcs)))
+            duration = new_durations[i] if i < len(new_durations) else max(1, nd['end'] - nd['start'])
+            events.append({'msg': mido.Message('note_on', note=new_pitch, velocity=nd['velocity'], channel=nd['channel'], time=0), 'abs_time': nd['start']})
+            events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=nd['channel'], time=0), 'abs_time': nd['start'] + duration})
+
+        events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+        last_abs_time = 0
+        for ev in events:
+            delta = max(0, ev['abs_time'] - last_abs_time)
+            new_track.append(ev['msg'].copy(time=delta))
+            last_abs_time = ev['abs_time']
+
+        new_midi.tracks.append(new_track)
+
+    return new_midi, mode_pcs
+
+
+# --- Compositori: Steve Reich — Phasing ---
+# Rif: "Piano Phase" (1967), "Clapping Music" (1972). Una cellula ritmico-
+# melodica breve viene suonata simultaneamente da due voci identiche; la
+# seconda voce accumula uno scarto di fase crescente e discreto rispetto
+# alla prima, ciclo dopo ciclo, finche' non ha percorso un'intera rotazione
+# e torna in unisono — passando per tutte le relazioni di fase intermedie.
+
+def midi_reich_phasing(original_midi, pattern_length=8, num_cycles=None, shift_fraction=1.0):
+    """
+    Deriva una cellula di `pattern_length` note dalla prima traccia con note
+    del brano, poi genera due voci che la ripetono simultaneamente: la Voce A
+    resta fissa, la Voce B accumula ad ogni ciclo uno scarto di fase pari a
+    shift_fraction * (durata di un passo della cellula), fino a completare
+    una rotazione intera dopo `num_cycles` ripetizioni (default = pattern_length,
+    cosi' che l'ultimo ciclo coincida di nuovo con la Voce A).
+    """
+    ticks_per_beat = original_midi.ticks_per_beat
+    seed_notes = None
+    for track in original_midi.tracks:
+        notes = extract_notes(track, ticks_per_beat)
+        if notes:
+            seed_notes = sorted(notes, key=lambda x: x['start'])[:pattern_length]
+            break
+
+    if not seed_notes:
+        st.warning("Nessuna nota trovata nel brano. Il phasing non verra' applicato.")
+        return original_midi, 0
+
+    step_ticks = max(1, ticks_per_beat // 4)
+    cell = [(nd['pitch'], nd['velocity'], nd['channel']) for nd in seed_notes]
+    n = len(cell)
+    if num_cycles is None:
+        num_cycles = n
+
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    for track in original_midi.tracks:
+        new_midi.tracks.append(track)
+
+    def build_voice(name, phase_offset_ticks_fn):
+        voice_track = mido.MidiTrack()
+        voice_track.name = name
+        voice_track.append(mido.Message('program_change', program=0, channel=0, time=0))
+        events = []
+        for cycle in range(num_cycles):
+            offset = phase_offset_ticks_fn(cycle)
+            for idx, (pitch, vel, ch) in enumerate(cell):
+                t_start = cycle * n * step_ticks + idx * step_ticks + offset
+                events.append({'msg': mido.Message('note_on', note=pitch, velocity=vel, channel=0, time=0), 'abs_time': t_start})
+                events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=0, time=0), 'abs_time': t_start + step_ticks})
+        events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+        last_abs_time = 0
+        for ev in events:
+            delta = max(0, ev['abs_time'] - last_abs_time)
+            voice_track.append(ev['msg'].copy(time=delta))
+            last_abs_time = ev['abs_time']
+        return voice_track
+
+    voice_a = build_voice("Reich Phasing — Voce A (fissa)", lambda c: 0)
+    shift_step = max(1, int(step_ticks * shift_fraction))
+    voice_b = build_voice("Reich Phasing — Voce B (sfasata)", lambda c: c * shift_step)
+
+    new_midi.tracks.append(voice_a)
+    new_midi.tracks.append(voice_b)
+
+    return new_midi, num_cycles
+
+
+# --- Compositori: Philip Glass — Processo Additivo ---
+# Rif: "Two Pages" (1968), "Music in Contrary Motion" (1969). Una breve
+# cellula viene sottoposta a un processo additivo: si parte da 1 sola nota,
+# ripetuta; poi si aggiunge una nota alla volta fino a raggiungere l'intera
+# cellula, ripetendo ogni stadio intermedio piu' volte prima di procedere.
+
+def midi_glass_additive(original_midi, cell_length=6, repeats_per_stage=3, contract_after=True):
+    """
+    Deriva una cellula di `cell_length` note dalla prima traccia con note del
+    brano, poi costruisce una nuova traccia che la espone tramite processo
+    additivo: stadio 1 = prima nota ripetuta `repeats_per_stage` volte,
+    stadio 2 = prime 2 note ripetute, ..., fino alla cellula completa.
+    Se contract_after=True, il processo si inverte simmetricamente
+    (contrazione) dopo aver raggiunto la lunghezza massima.
+    """
+    ticks_per_beat = original_midi.ticks_per_beat
+    seed_notes = None
+    for track in original_midi.tracks:
+        notes = extract_notes(track, ticks_per_beat)
+        if notes:
+            seed_notes = sorted(notes, key=lambda x: x['start'])[:cell_length]
+            break
+
+    if not seed_notes:
+        st.warning("Nessuna nota trovata nel brano. Il processo additivo non verra' applicato.")
+        return original_midi, 0
+
+    step_ticks = max(1, ticks_per_beat // 4)
+    cell = [(nd['pitch'], nd['velocity'], nd['channel']) for nd in seed_notes]
+    n = len(cell)
+
+    stage_lengths = list(range(1, n + 1))
+    if contract_after:
+        stage_lengths += list(range(n - 1, 0, -1))
+
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    for track in original_midi.tracks:
+        new_midi.tracks.append(track)
+
+    glass_track = mido.MidiTrack()
+    glass_track.name = f"Glass Additive Process (cella={n} note)"
+    glass_track.append(mido.Message('program_change', program=0, channel=0, time=0))
+
+    events = []
+    t = 0
+    for stage_len in stage_lengths:
+        for _rep in range(repeats_per_stage):
+            for idx in range(stage_len):
+                pitch, vel, ch = cell[idx]
+                events.append({'msg': mido.Message('note_on', note=pitch, velocity=vel, channel=0, time=0), 'abs_time': t})
+                events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=0, time=0), 'abs_time': t + step_ticks})
+                t += step_ticks
+
+    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+    last_abs_time = 0
+    for ev in events:
+        delta = max(0, ev['abs_time'] - last_abs_time)
+        glass_track.append(ev['msg'].copy(time=delta))
+        last_abs_time = ev['abs_time']
+
+    new_midi.tracks.append(glass_track)
+    return new_midi, len(stage_lengths)
+
+
+# --- Compositori: Johann Sebastian Bach — Canone Rigoroso ---
+# Rif: tecnica contrappuntistica sistematizzata nell'Offerta Musicale e
+# nell'Arte della Fuga. Un "comes" (voce che segue) viene derivato dal "dux"
+# (voce guida, la melodia originale) secondo una regola fissa: retrogrado
+# (canone cancrizans, "a specchio nel tempo"), inversione (specchio negli
+# intervalli attorno a un asse), o trasposizione a un dato intervallo con
+# ritardo (canone imitativo).
+
+def midi_bach_canon(original_midi, canon_type="Cancrizans (Retrogrado)", interval_semitones=7,
+                     delay_beats=2, axis_pitch=None):
+    """
+    Deriva un "comes" dalla prima traccia con note del brano (il "dux") e lo
+    aggiunge come voce canonica indipendente, secondo la regola scelta:
+      - Cancrizans: il comes e' l'esatto retrogrado del dux (stesse note,
+        ordine invertito), eseguito simultaneamente — il "canone del granchio".
+      - Per Inversione: il comes e' lo specchio del dux attorno a un pitch-asse
+        (ogni intervallo dall'asse viene invertito).
+      - All'Intervallo (imitativo): il comes e' il dux trasposto di
+        interval_semitones ed eseguito con un ritardo di delay_beats.
+    """
+    ticks_per_beat = original_midi.ticks_per_beat
+    dux_notes = None
+    for track in original_midi.tracks:
+        notes = extract_notes(track, ticks_per_beat)
+        if notes:
+            dux_notes = sorted(notes, key=lambda x: x['start'])
+            break
+
+    if not dux_notes:
+        st.warning("Nessuna nota trovata nel brano. Il canone non verra' applicato.")
+        return original_midi, canon_type
+
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    for track in original_midi.tracks:
+        new_midi.tracks.append(track)
+
+    comes_track = mido.MidiTrack()
+    comes_track.name = f"Bach Canon — Comes ({canon_type})"
+    comes_track.append(mido.Message('program_change', program=0, channel=1, time=0))
+
+    events = []
+    total_span = max(nd['end'] for nd in dux_notes) - dux_notes[0]['start']
+
+    if canon_type == "Cancrizans (Retrogrado)":
+        for nd in dux_notes:
+            rel_start = nd['start'] - dux_notes[0]['start']
+            rel_end = nd['end'] - dux_notes[0]['start']
+            new_start = total_span - rel_end
+            new_end = total_span - rel_start
+            events.append({'msg': mido.Message('note_on', note=nd['pitch'], velocity=nd['velocity'], channel=1, time=0), 'abs_time': dux_notes[0]['start'] + new_start})
+            events.append({'msg': mido.Message('note_off', note=nd['pitch'], velocity=0, channel=1, time=0), 'abs_time': dux_notes[0]['start'] + new_end})
+
+    elif canon_type == "Per Inversione":
+        axis = axis_pitch if axis_pitch is not None else dux_notes[0]['pitch']
+        for nd in dux_notes:
+            new_pitch = max(0, min(127, 2 * axis - nd['pitch']))
+            events.append({'msg': mido.Message('note_on', note=new_pitch, velocity=nd['velocity'], channel=1, time=0), 'abs_time': nd['start']})
+            events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=1, time=0), 'abs_time': nd['end']})
+
+    else:  # "All'Intervallo (imitativo)"
+        delay_ticks = int(delay_beats * ticks_per_beat)
+        for nd in dux_notes:
+            new_pitch = max(0, min(127, nd['pitch'] + interval_semitones))
+            events.append({'msg': mido.Message('note_on', note=new_pitch, velocity=nd['velocity'], channel=1, time=0), 'abs_time': nd['start'] + delay_ticks})
+            events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=1, time=0), 'abs_time': nd['end'] + delay_ticks})
+
+    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+    last_abs_time = 0
+    for ev in events:
+        delta = max(0, ev['abs_time'] - last_abs_time)
+        comes_track.append(ev['msg'].copy(time=delta))
+        last_abs_time = ev['abs_time']
+
+    new_midi.tracks.append(comes_track)
+    return new_midi, canon_type
+
+
 # --- Funzioni di Decomposizione ---
 
 def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
@@ -1850,6 +2258,31 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
             method_lines.append(f"   * Rapporto durata nota/loop: {nlr} | Velocity base: {vb}")
             method_lines.append("   * Loop asincroni a lunghezze incommensurabili (Eno, 'Music for Airports'/'Discreet Music')")
 
+        elif method_key == "MIDI Part Tintinnabuli":
+            root_n, mode_n, triad = params
+            method_lines.append(f"   * Tonalità: {root_n} {mode_n} | Triade tintinnabuli: {triad}")
+            method_lines.append("   * Tecnica tintinnabuli — voce M (melodica) + voce T (triade) (Pärt, 1976)")
+
+        elif method_key == "MIDI Messiaen Modal":
+            mode_name_r, root_n2, block_sz = params
+            method_lines.append(f"   * Modo: {mode_name_r} | Tonica: {root_n2} | Blocco palindromo: {block_sz} note")
+            method_lines.append("   * Modi a trasposizione limitata + ritmi non retrogradabili (Messiaen, 1944)")
+
+        elif method_key == "MIDI Reich Phasing":
+            pat_len, n_cyc, shift_f = params
+            method_lines.append(f"   * Lunghezza cellula: {pat_len} note | Cicli: {n_cyc} | Scarto di fase: {shift_f}")
+            method_lines.append("   * Phasing — due voci identiche che si sfasano gradualmente (Reich, 'Piano Phase', 1967)")
+
+        elif method_key == "MIDI Glass Additive":
+            cell_len, reps, contr = params
+            method_lines.append(f"   * Lunghezza cellula: {cell_len} note | Ripetizioni per stadio: {reps} | Contrazione: {'Sì' if contr else 'No'}")
+            method_lines.append("   * Processo additivo (Glass, 'Two Pages', 1968)")
+
+        elif method_key == "MIDI Bach Canon":
+            canon_t, interval_s, delay_b = params
+            method_lines.append(f"   * Tipo di canone: {canon_t} | Intervallo: {interval_s} semitoni | Ritardo: {delay_b} beat")
+            method_lines.append("   * Canone rigoroso — dux/comes (Bach, Offerta Musicale/Arte della Fuga)")
+
     report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
     report += ":: MOTORE: midi_decomposer [v1.0]\n"
     report += f":: FILE: {original_file}\n"
@@ -1943,6 +2376,11 @@ if uploaded_midi_file is not None:
             "MIDI Xenakis Stochastic": "☁️ Iannis Xenakis — Musica Stocastica (Nuvole)",
             "MIDI Cage Chance": "☯️ John Cage — Operazioni di Caso (I Ching)",
             "MIDI Eno Generative": "🌫️ Brian Eno — Musica Generativa (Cicli Asincroni)",
+            "MIDI Part Tintinnabuli": "🔔 Arvo Pärt — Tintinnabuli",
+            "MIDI Messiaen Modal": "🕊️ Olivier Messiaen — Modi e Ritmi Non Retrogradabili",
+            "MIDI Reich Phasing": "🌀 Steve Reich — Phasing",
+            "MIDI Glass Additive": "➕ Philip Glass — Processo Additivo",
+            "MIDI Bach Canon": "🎼 Johann Sebastian Bach — Canone Rigoroso",
         }
         # Metodi disponibili nella modalita' "🔧 Avanzato" (i Compositori hanno la loro modalita' dedicata)
         ADVANCED_METHODS_KEYS = [
@@ -1950,13 +2388,19 @@ if uploaded_midi_file is not None:
             "MIDI Density Transformer", "MIDI Random Pitch Transformer",
             "MIDI Rhythmic Base", "MIDI Recomposer",
         ]
+        # Ordine alfabetico per cognome del compositore
         COMPOSITORI = {
-            "🎯 Karlheinz Stockhausen — Punktuelle Musik": "MIDI Stockhausen Punktuelle",
+            "🎼 Johann Sebastian Bach — Canone Rigoroso": "MIDI Bach Canon",
             "🔷 Pierre Boulez — Moltiplicazione d'Accordi": "MIDI Boulez Multiplication",
-            "☁️ Iannis Xenakis — Musica Stocastica": "MIDI Xenakis Stochastic",
             "☯️ John Cage — Operazioni di Caso (I Ching)": "MIDI Cage Chance",
             "🌫️ Brian Eno — Musica Generativa": "MIDI Eno Generative",
+            "➕ Philip Glass — Processo Additivo": "MIDI Glass Additive",
+            "🕊️ Olivier Messiaen — Modi e Ritmi Non Retrogradabili": "MIDI Messiaen Modal",
+            "🔔 Arvo Pärt — Tintinnabuli": "MIDI Part Tintinnabuli",
+            "🌀 Steve Reich — Phasing": "MIDI Reich Phasing",
             "🧮 Scott Rickard — Costas Sequencer": "MIDI Costas Sequencer",
+            "🎯 Karlheinz Stockhausen — Punktuelle Musik": "MIDI Stockhausen Punktuelle",
+            "☁️ Iannis Xenakis — Musica Stocastica": "MIDI Xenakis Stochastic",
         }
 
         # --- STILI RICOMPOSIZIONE (usati dal pulsante Ricomponi) ---
@@ -2272,6 +2716,170 @@ if uploaded_midi_file is not None:
                         st.session_state.midi_ready = True
                         loop_desc = ", ".join(f"{p}t" for _, p, _ in loops_info[:6])
                         st.success(f"✅ Sistema generativo creato! {len(loops_info)} loop asincroni, cicli: {loop_desc}{'...' if len(loops_info) > 6 else ''}")
+
+            elif compositore_key == "MIDI Part Tintinnabuli":
+                st.info(
+                    "**Tintinnabuli** (1976) — la voce M (melodica) è la linea originale quantizzata su una "
+                    "scala diatonica; una nuova voce T (campanellina, dal latino *tintinnabulum*) viene "
+                    "aggiunta in parallelo, vincolata alle sole note della triade tonale, scelta secondo "
+                    "posizione e direzione rispetto a ciascuna nota M."
+                )
+                col_p1, col_p2 = st.columns(2)
+                with col_p1:
+                    part_root = st.selectbox("Tonica:", ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"], index=9, key="part_root")
+                    part_mode = st.selectbox("Modo:", ["Minore Naturale", "Maggiore"], key="part_mode")
+                with col_p2:
+                    part_direction = st.selectbox("Direzione voce T:", ["sotto", "sopra"], key="part_direction")
+                    part_position = st.slider("Posizione nella triade:", 1, 3, 1, key="part_position")
+
+                if st.button("🔔 Applica Tintinnabuli", type="primary", use_container_width=True, key="btn_part"):
+                    with st.spinner("Costruendo voce M e voce T..."):
+                        result_midi, part_info = midi_part_tintinnabuli(
+                            midi_data, part_root, part_mode, part_direction, part_position
+                        )
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Part.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Part Tintinnabuli"],
+                            {"MIDI Part Tintinnabuli": (part_root, part_mode, part_info[2])},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        st.success(f"✅ Tintinnabuli applicato! Triade tonale: {part_info[2]}")
+
+            elif compositore_key == "MIDI Messiaen Modal":
+                st.info(
+                    "**Linguaggio modale di Messiaen** (1944) — ogni nota viene quantizzata su uno dei 7 "
+                    "modi a trasposizione limitata (scale simmetriche che tornano su se stesse dopo poche "
+                    "trasposizioni); le durate vengono raggruppate a blocchi e trasformate in sequenze "
+                    "palindrome (**ritmi non retrogradabili**: lette avanti o indietro, restano identiche)."
+                )
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    messiaen_mode = st.selectbox("Modo:", list(MESSIAEN_MODES.keys()), index=1, key="messiaen_mode")
+                    messiaen_root = st.selectbox("Tonica:", ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"], index=0, key="messiaen_root")
+                with col_m2:
+                    messiaen_block = st.slider("Blocco palindromo (note):", 2, 12, 4, key="messiaen_block")
+
+                if st.button("🕊️ Applica Linguaggio Modale", type="primary", use_container_width=True, key="btn_messiaen"):
+                    with st.spinner("Quantizzando sul modo e costruendo ritmi palindromi..."):
+                        result_midi, mode_pcs_used = midi_messiaen_modal(midi_data, messiaen_mode, messiaen_root, messiaen_block)
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Messiaen.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Messiaen Modal"],
+                            {"MIDI Messiaen Modal": (messiaen_mode, messiaen_root, messiaen_block)},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        st.success(f"✅ Linguaggio modale applicato! Classi di altezza del modo: {mode_pcs_used}")
+
+            elif compositore_key == "MIDI Reich Phasing":
+                st.info(
+                    "**Phasing** (*Piano Phase*, 1967) — una cellula breve viene derivata dal brano e "
+                    "suonata simultaneamente da due voci identiche: la Voce A resta fissa, la Voce B "
+                    "accumula ad ogni ciclo uno scarto di fase crescente, finché non completa una "
+                    "rotazione intera e torna in unisono con la Voce A."
+                )
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    reich_pattern_length = st.slider("Lunghezza cellula (note):", 3, 16, 8, key="reich_pattern_len")
+                    reich_shift = st.slider("Scarto di fase per ciclo (frazione di passo):", 0.25, 2.0, 1.0, 0.25, key="reich_shift")
+                with col_r2:
+                    reich_num_cycles = st.slider("Numero di cicli:", 2, 32, 8, key="reich_num_cycles")
+
+                if st.button("🌀 Applica Phasing", type="primary", use_container_width=True, key="btn_reich"):
+                    with st.spinner("Costruendo le due voci sfasate..."):
+                        result_midi, cycles_used = midi_reich_phasing(midi_data, reich_pattern_length, reich_num_cycles, reich_shift)
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Reich.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Reich Phasing"],
+                            {"MIDI Reich Phasing": (reich_pattern_length, cycles_used, reich_shift)},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        st.success(f"✅ Phasing applicato! {cycles_used} cicli, Voce A e Voce B aggiunte.")
+
+            elif compositore_key == "MIDI Glass Additive":
+                st.info(
+                    "**Processo additivo** (*Two Pages*, 1968) — una breve cellula derivata dal brano viene "
+                    "esposta gradualmente: prima 1 nota ripetuta, poi 2, poi 3... fino alla cellula completa, "
+                    "eventualmente seguita da una contrazione simmetrica."
+                )
+                col_g1, col_g2 = st.columns(2)
+                with col_g1:
+                    glass_cell_length = st.slider("Lunghezza cellula (note):", 2, 16, 6, key="glass_cell_len")
+                    glass_repeats = st.slider("Ripetizioni per stadio:", 1, 8, 3, key="glass_repeats")
+                with col_g2:
+                    glass_contract = st.checkbox("Contrazione dopo l'apice", value=True, key="glass_contract")
+
+                if st.button("➕ Applica Processo Additivo", type="primary", use_container_width=True, key="btn_glass"):
+                    with st.spinner("Costruendo gli stadi del processo additivo..."):
+                        result_midi, n_stages = midi_glass_additive(midi_data, glass_cell_length, glass_repeats, glass_contract)
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Glass.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Glass Additive"],
+                            {"MIDI Glass Additive": (glass_cell_length, glass_repeats, glass_contract)},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        st.success(f"✅ Processo additivo applicato! {n_stages} stadi generati.")
+
+            elif compositore_key == "MIDI Bach Canon":
+                st.info(
+                    "**Canone rigoroso** (Offerta Musicale / Arte della Fuga) — un \"comes\" (voce che segue) "
+                    "viene derivato dal \"dux\" (la melodia originale, il \"leader\") secondo una regola fissa: "
+                    "retrogrado (canone cancrizans, il celebre \"canone del granchio\"), inversione (specchio "
+                    "attorno a un asse), o trasposizione a un intervallo con ritardo (canone imitativo)."
+                )
+                bach_canon_type = st.selectbox(
+                    "Tipo di canone:",
+                    ["Cancrizans (Retrogrado)", "Per Inversione", "All'Intervallo (imitativo)"],
+                    key="bach_canon_type"
+                )
+                if bach_canon_type == "All'Intervallo (imitativo)":
+                    col_b1, col_b2 = st.columns(2)
+                    with col_b1:
+                        bach_interval = st.slider("Intervallo di trasposizione (semitoni):", -12, 12, 7, key="bach_interval")
+                    with col_b2:
+                        bach_delay = st.slider("Ritardo di ingresso (beat):", 0.5, 8.0, 2.0, 0.5, key="bach_delay")
+                else:
+                    bach_interval, bach_delay = 0, 0
+
+                if st.button("🎼 Applica Canone", type="primary", use_container_width=True, key="btn_bach"):
+                    with st.spinner("Derivando il comes dal dux..."):
+                        result_midi, canon_used = midi_bach_canon(midi_data, bach_canon_type, bach_interval, bach_delay)
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Bach.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Bach Canon"],
+                            {"MIDI Bach Canon": (bach_canon_type, bach_interval, bach_delay)},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        st.success(f"✅ Canone applicato! Tipo: {canon_used}")
 
             else:  # Costas Sequencer
                 st.caption(
