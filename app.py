@@ -568,6 +568,226 @@ def midi_boulez_multiplication(original_midi, set_size=4, chord_density=0, regis
     return new_midi, (set_a, set_b, multiplied)
 
 
+# --- Compositori: Iannis Xenakis — Musica Stocastica (Nuvole di Suoni) ---
+# Rif: Pithoprakta (1955-56, distribuzione Gaussiana per i glissandi),
+# Achorripsis (1956-57, processo di Poisson per la densita' degli eventi nel
+# tempo, distribuzione esponenziale per gli intertempi), teoria dei crivelli
+# (cribles: insiemi costruiti per unione di classi di resto modulari).
+# A differenza di Stockhausen/Boulez (deterministici), qui i parametri sono
+# governati da distribuzioni di probabilita' controllate — "il minimo di
+# vincoli logici necessario" (Xenakis) — non dal random uniforme grezzo.
+
+def generate_sieve(moduli_residues, universe=(0, 128)):
+    """
+    Crivello di Xenakis (crible): unione di classi di resto x = r (mod m).
+    moduli_residues: lista di coppie (m, r). Es. [(3,0),(4,1)] = tutti gli
+    interi congrui a 0 mod 3 UNITI a tutti quelli congrui a 1 mod 4.
+    """
+    lo, hi = universe
+    sieve_set = set()
+    for m, r in moduli_residues:
+        if m <= 0:
+            continue
+        r = r % m
+        for x in range(lo, hi):
+            if (x - r) % m == 0:
+                sieve_set.add(x)
+    return sorted(sieve_set)
+
+
+def parse_sieve_string(s):
+    """Parsa una stringa tipo '3:0, 4:1, 7:3' in una lista di coppie (m, r)."""
+    pairs = []
+    for chunk in s.split(','):
+        chunk = chunk.strip()
+        if not chunk or ':' not in chunk:
+            continue
+        m_str, r_str = chunk.split(':', 1)
+        try:
+            m = int(m_str.strip())
+            r = int(r_str.strip())
+            if m > 0:
+                pairs.append((m, r % m))
+        except ValueError:
+            continue
+    return pairs
+
+
+def _xenakis_snap_to_sieve(value, sieve):
+    if not sieve:
+        return value
+    return min(sieve, key=lambda s: abs(s - value))
+
+
+def midi_xenakis_stochastic(original_midi, sieve_moduli, mean_events_per_beat, pitch_center,
+                             pitch_spread_semitones, duration_mean_beats, velocity_mean,
+                             velocity_spread, seed=None):
+    """
+    Genera una "nuvola di suoni" stocastica (Pithoprakta/Achorripsis):
+      - Tempi di attacco: processo di Poisson (intertempi con distribuzione
+        esponenziale), tasso medio mean_events_per_beat eventi/beat.
+      - Altezza: distribuzione Gaussiana attorno a pitch_center, quantizzata
+        sul crivello (sieve) definito da sieve_moduli.
+      - Durata: distribuzione esponenziale attorno a duration_mean_beats.
+      - Dinamica: distribuzione Gaussiana attorno a velocity_mean.
+    Copre l'intera durata del brano originale; le tracce originali restano
+    intatte, la nuvola si aggiunge come nuova traccia.
+    """
+    rng = np.random.default_rng(seed)
+    sieve = generate_sieve(sieve_moduli, universe=(0, 128))
+    if not sieve:
+        sieve = list(range(128))
+
+    ticks_per_beat = original_midi.ticks_per_beat
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    for track in original_midi.tracks:
+        new_midi.tracks.append(track)
+
+    total_ticks = 0
+    for track in original_midi.tracks:
+        current_time = 0
+        for msg in track:
+            current_time += msg.time
+        total_ticks = max(total_ticks, current_time)
+
+    if total_ticks == 0:
+        st.warning("Il brano originale non contiene eventi validi. La nuvola stocastica non verra' aggiunta.")
+        return new_midi, sieve
+
+    xenakis_track = mido.MidiTrack()
+    xenakis_track.name = f"Xenakis Stochastic Cloud (sieve n={len(sieve)})"
+
+    total_beats = total_ticks / ticks_per_beat
+    lam = max(0.05, mean_events_per_beat)
+
+    events = []
+    t = 0.0
+    while t < total_beats:
+        inter_arrival = rng.exponential(1.0 / lam)  # processo di Poisson
+        t += inter_arrival
+        if t >= total_beats:
+            break
+
+        raw_pitch = rng.normal(pitch_center, pitch_spread_semitones)
+        pitch = int(round(_xenakis_snap_to_sieve(raw_pitch, sieve)))
+        pitch = max(0, min(127, pitch))
+
+        dur_beats = max(0.05, rng.exponential(duration_mean_beats))
+        velocity = int(round(np.clip(rng.normal(velocity_mean, velocity_spread), 1, 127)))
+
+        start_tick = int(round(t * ticks_per_beat))
+        end_tick = int(round((t + dur_beats) * ticks_per_beat))
+
+        events.append({'msg': mido.Message('note_on', note=pitch, velocity=velocity, channel=0, time=0), 'abs_time': start_tick})
+        events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=0, time=0), 'abs_time': end_tick})
+
+    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+    last_abs_time = 0
+    for event_data in events:
+        delta = max(0, event_data['abs_time'] - last_abs_time)
+        xenakis_track.append(event_data['msg'].copy(time=delta))
+        last_abs_time = event_data['abs_time']
+
+    new_midi.tracks.append(xenakis_track)
+    return new_midi, sieve
+
+
+# --- Compositori: John Cage — Operazioni di Caso (I Ching / Music of Changes) ---
+# Rif: Music of Changes (1951) — Cage costrui' delle "charts" (tabelle a 64
+# caselle, una per esagramma) per altezza, durata e dinamica, e uso' il
+# metodo classico delle tre monete dell'I Ching per scegliere, ad ogni
+# passo, quale casella consultare. A differenza della statistica continua
+# di Xenakis, qui il caso e' un'operazione discreta e procedurale — e il
+# silenzio e' materiale musicale legittimo quanto il suono (stesso principio
+# alla base di 4'33").
+
+def _cage_toss_line(rng):
+    """Simula il lancio di 3 monete (metodo classico dell'I Ching): testa=3, croce=2."""
+    coins_total = sum(3 if rng.integers(0, 2) == 1 else 2 for _ in range(3))  # somma in {6,7,8,9}
+    return 1 if coins_total in (7, 9) else 0  # linea intera (yang) = 1, spezzata (yin) = 0
+
+
+def _cage_toss_hexagram(rng):
+    """6 lanci di linea -> indice di esagramma 0..63 (metodo delle tre monete)."""
+    idx = 0
+    for _ in range(6):
+        idx = (idx << 1) | _cage_toss_line(rng)
+    return idx
+
+
+def midi_cage_chance_operations(original_midi, silence_probability=0.15, duration_variety=True, seed=None):
+    """
+    Operazioni di caso in stile "Music of Changes": ogni nota del brano
+    originale diventa un evento le cui proprieta' (altezza, durata,
+    dinamica, presenza/assenza di suono) sono determinate da esagrammi
+    indipendenti, generati con il metodo classico delle tre monete
+    dell'I Ching — non pseudocasuale grezzo, ma la stessa procedura
+    combinatoria (64 esiti equiprobabili) usata da Cage per costruire
+    le proprie tabelle. Il silenzio ha silence_probability di sostituire
+    ciascun evento: e' trattato come materiale, non come nota mancante.
+    """
+    rng = np.random.default_rng(seed)
+    ticks_per_beat = original_midi.ticks_per_beat
+    base_unit = max(1, ticks_per_beat // 4)
+
+    all_points = []
+    for track in original_midi.tracks:
+        notes = extract_notes(track, ticks_per_beat)
+        for nd in notes:
+            all_points.append(nd)
+
+    if not all_points:
+        st.warning("Nessuna nota trovata. Le operazioni di caso non verranno applicate.")
+        return original_midi, []
+
+    all_points.sort(key=lambda x: x['start'])
+
+    pitches = [p['pitch'] for p in all_points]
+    pitch_lo, pitch_hi = min(pitches), max(pitches)
+    if pitch_hi <= pitch_lo:
+        pitch_hi = pitch_lo + 12
+
+    # Tabelle a 64 caselle (una per ciascun esagramma), come nelle charts di Cage
+    PITCH_CHART = [pitch_lo + (i % (pitch_hi - pitch_lo + 1)) for i in range(64)]
+    DURATION_CHART = [base_unit * (1 + (i % 8)) for i in range(64)]
+    DYNAMICS_CHART = [int(v) for v in np.linspace(20, 120, 64)]
+
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    cage_track = mido.MidiTrack()
+    cage_track.name = "Music of Changes (I Ching chance operations)"
+
+    events = []
+    hexagram_log = []
+    for point in all_points:
+        hex_pitch = _cage_toss_hexagram(rng)
+        hex_dur = _cage_toss_hexagram(rng) if duration_variety else hex_pitch
+        hex_dyn = _cage_toss_hexagram(rng)
+        hex_silence = _cage_toss_hexagram(rng)
+        hexagram_log.append((hex_pitch, hex_dur, hex_dyn, hex_silence))
+
+        is_silence = (hex_silence / 64.0) < silence_probability
+        if is_silence:
+            continue  # il silenzio e' l'esito legittimo: nessun evento sonoro
+
+        pitch = max(0, min(127, PITCH_CHART[hex_pitch]))
+        duration = DURATION_CHART[hex_dur]
+        velocity = DYNAMICS_CHART[hex_dyn]
+
+        note_start = point['start']
+        events.append({'msg': mido.Message('note_on', note=pitch, velocity=velocity, channel=point['channel'], time=0), 'abs_time': note_start})
+        events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=point['channel'], time=0), 'abs_time': note_start + max(1, duration)})
+
+    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+    last_abs_time = 0
+    for event_data in events:
+        delta = max(0, event_data['abs_time'] - last_abs_time)
+        cage_track.append(event_data['msg'].copy(time=delta))
+        last_abs_time = event_data['abs_time']
+
+    new_midi.tracks.append(cage_track)
+    return new_midi, hexagram_log
+
+
 # --- Funzioni di Decomposizione ---
 
 def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
@@ -1420,6 +1640,17 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
             method_lines.append(f"   * Insieme A: {set_a} | Insieme B: {set_b}")
             method_lines.append("   * Moltiplicazione d'accordi (Boulez, 'Le Marteau sans maître' / Structures II)")
 
+        elif method_key == "MIDI Xenakis Stochastic":
+            sieve_str, mean_ev, pc, ps, dm, vm, vs = params
+            method_lines.append(f"   * Crivello (sieve): {sieve_str} | Tasso eventi: {mean_ev}/beat (processo di Poisson)")
+            method_lines.append(f"   * Altezza: Gauss(μ={pc}, σ={ps}) | Durata: Exp(μ={dm} beat) | Dinamica: Gauss(μ={vm}, σ={vs})")
+            method_lines.append("   * Musica stocastica (Xenakis, Pithoprakta/Achorripsis, 1955-57)")
+
+        elif method_key == "MIDI Cage Chance":
+            silence_p, dur_var = params
+            method_lines.append(f"   * Probabilità di silenzio per evento: {silence_p:.0%} | Varietà durata: {'Sì' if dur_var else 'No'}")
+            method_lines.append("   * Operazioni di caso via I Ching, metodo delle tre monete (Cage, 'Music of Changes', 1951)")
+
     report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
     report += ":: MOTORE: midi_decomposer [v1.0]\n"
     report += f":: FILE: {original_file}\n"
@@ -1510,6 +1741,8 @@ if uploaded_midi_file is not None:
             "MIDI Costas Sequencer": "🧮 Scott Rickard — Costas Sequencer",
             "MIDI Stockhausen Punktuelle": "🎯 Karlheinz Stockhausen — Punktuelle Musik",
             "MIDI Boulez Multiplication": "🔷 Pierre Boulez — Moltiplicazione d'Accordi",
+            "MIDI Xenakis Stochastic": "☁️ Iannis Xenakis — Musica Stocastica (Nuvole)",
+            "MIDI Cage Chance": "☯️ John Cage — Operazioni di Caso (I Ching)",
         }
         # Metodi disponibili nella modalita' "🔧 Avanzato" (i Compositori hanno la loro modalita' dedicata)
         ADVANCED_METHODS_KEYS = [
@@ -1520,6 +1753,8 @@ if uploaded_midi_file is not None:
         COMPOSITORI = {
             "🎯 Karlheinz Stockhausen — Punktuelle Musik": "MIDI Stockhausen Punktuelle",
             "🔷 Pierre Boulez — Moltiplicazione d'Accordi": "MIDI Boulez Multiplication",
+            "☁️ Iannis Xenakis — Musica Stocastica": "MIDI Xenakis Stochastic",
+            "☯️ John Cage — Operazioni di Caso (I Ching)": "MIDI Cage Chance",
             "🧮 Scott Rickard — Costas Sequencer": "MIDI Costas Sequencer",
         }
 
@@ -1707,6 +1942,93 @@ if uploaded_midi_file is not None:
                         )
                         st.session_state.midi_ready = True
                         st.success(f"✅ Moltiplicazione applicata! Aggregato: {multiplied} ({len(multiplied)} classi di altezza)")
+
+            elif compositore_key == "MIDI Xenakis Stochastic":
+                st.info(
+                    "**Musica stocastica** (*Pithoprakta*, 1955-56 / *Achorripsis*, 1956-57) — i parametri "
+                    "sonori sono governati da distribuzioni di probabilità anziché da regole fisse: i tempi "
+                    "di attacco seguono un **processo di Poisson** (come la densità delle 'nuvole di suoni' "
+                    "di Xenakis), l'altezza segue una **Gaussiana** quantizzata su un **crivello** (sieve, "
+                    "teoria dei cribles) definito da classi di resto modulari."
+                )
+                sieve_input = st.text_input(
+                    "Crivello (formula m:r, unione, es. '3:0, 4:1'):",
+                    value="3:0, 4:1",
+                    key="xenakis_sieve_input",
+                    help="Ogni coppia m:r seleziona tutti i numeri congrui a r modulo m. Le coppie si uniscono."
+                )
+                sieve_pairs = parse_sieve_string(sieve_input)
+                _sieve_preview = generate_sieve(sieve_pairs, universe=(0, 24)) if sieve_pairs else []
+                st.caption(f"Anteprima crivello (0-24): {_sieve_preview if _sieve_preview else 'nessuna coppia valida — verrà usato il range cromatico completo'}")
+
+                col_x1, col_x2 = st.columns(2)
+                with col_x1:
+                    mean_events_per_beat = st.slider("Densità eventi (per beat, Poisson):", 0.25, 8.0, 2.0, 0.25, key="xenakis_density")
+                    pitch_center = st.slider("Centro altezza (MIDI):", 24, 96, 60, key="xenakis_pitch_center")
+                    pitch_spread = st.slider("Dispersione altezza (σ, semitoni):", 1, 36, 12, key="xenakis_pitch_spread")
+                with col_x2:
+                    duration_mean = st.slider("Durata media evento (beat, esponenziale):", 0.1, 4.0, 0.5, 0.1, key="xenakis_dur_mean")
+                    velocity_mean = st.slider("Dinamica media (velocity):", 20, 120, 75, key="xenakis_vel_mean")
+                    velocity_spread = st.slider("Dispersione dinamica (σ):", 1, 40, 15, key="xenakis_vel_spread")
+                xenakis_seed_input = st.text_input("Seed (opzionale, per riproducibilità):", value="", key="xenakis_seed")
+                xenakis_seed = int(xenakis_seed_input) if xenakis_seed_input.strip().isdigit() else None
+
+                if st.button("☁️ Applica Musica Stocastica", type="primary", use_container_width=True, key="btn_xenakis"):
+                    with st.spinner("Generando la nuvola stocastica (Poisson + Gauss + crivello)..."):
+                        result_midi, sieve_used = midi_xenakis_stochastic(
+                            midi_data, sieve_pairs, mean_events_per_beat, pitch_center, pitch_spread,
+                            duration_mean, velocity_mean, velocity_spread, seed=xenakis_seed
+                        )
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Xenakis.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Xenakis Stochastic"],
+                            {"MIDI Xenakis Stochastic": (sieve_input, mean_events_per_beat, pitch_center, pitch_spread, duration_mean, velocity_mean, velocity_spread)},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        st.success(f"✅ Nuvola stocastica generata! Crivello effettivo: {len(sieve_used)} classi disponibili su 128")
+
+            elif compositore_key == "MIDI Cage Chance":
+                st.info(
+                    "**Operazioni di caso** (*Music of Changes*, 1951) — ogni nota diventa un evento le cui "
+                    "proprietà (altezza, durata, dinamica, presenza/assenza di suono) sono determinate da "
+                    "**esagrammi indipendenti**, generati con il metodo classico delle tre monete dell'I "
+                    "Ching (64 esiti equiprobabili). Il **silenzio** è materiale musicale legittimo quanto "
+                    "il suono — stesso principio alla base di *4'33\"*."
+                )
+                col_cg1, col_cg2 = st.columns(2)
+                with col_cg1:
+                    silence_probability = st.slider("Probabilità di silenzio per evento:", 0.0, 0.8, 0.15, 0.05, key="cage_silence_prob")
+                with col_cg2:
+                    duration_variety = st.checkbox("Varietà indipendente della durata", value=True, key="cage_dur_variety")
+                cage_seed_input = st.text_input("Seed (opzionale, per riproducibilità):", value="", key="cage_seed")
+                cage_seed = int(cage_seed_input) if cage_seed_input.strip().isdigit() else None
+
+                if st.button("☯️ Applica Operazioni di Caso", type="primary", use_container_width=True, key="btn_cage"):
+                    with st.spinner("Lanciando le monete dell'I Ching (64 esagrammi per parametro)..."):
+                        result_midi, hexagram_log = midi_cage_chance_operations(
+                            midi_data, silence_probability, duration_variety, seed=cage_seed
+                        )
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Cage.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Cage Chance"],
+                            {"MIDI Cage Chance": (silence_probability, duration_variety)},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        n_eventi_originali = len(hexagram_log)
+                        n_silenzi = sum(1 for h in hexagram_log if (h[3] / 64.0) < silence_probability)
+                        st.success(f"✅ Operazioni di caso applicate! {n_eventi_originali - n_silenzi} suoni, {n_silenzi} silenzi su {n_eventi_originali} esagrammi lanciati")
 
             else:  # Costas Sequencer
                 st.caption(
