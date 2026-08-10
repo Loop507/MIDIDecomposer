@@ -73,6 +73,36 @@ def extract_notes(track, ticks_per_beat=384):
         notes.append({'start': start_data['start'], 'end': estimated_end, 'pitch': key[0], 'velocity': start_data['velocity'], 'channel': key[1]})
     return notes
 
+
+def _extract_instrument_header(track):
+    """
+    Estrae i messaggi che definiscono lo strumento di una traccia originale
+    (program_change ed eventuali control_change di bank select 0/32), letti
+    prima del primo evento nota. Le funzioni che ricostruiscono una traccia
+    da zero a partire dalle sole note (extract_notes) devono ri-applicare
+    questi messaggi in testa alla nuova traccia — altrimenti la DAW (es.
+    Logic Pro) assegna il proprio strumento di default (tipicamente
+    "Steinway Grand Piano") a tutte le tracce, perdendo l'orchestrazione
+    originale anche quando il numero e i nomi delle tracce sono corretti.
+    """
+    header = []
+    for msg in track:
+        if msg.type in ('note_on', 'note_off'):
+            break
+        if msg.type == 'program_change':
+            header.append(msg.copy(time=0))
+        elif msg.type == 'control_change' and msg.control in (0, 32):
+            header.append(msg.copy(time=0))
+    return header
+
+
+def _get_track_default_channel(track):
+    """Ritorna il canale MIDI dominante di una traccia (il primo trovato), o 0 se assente."""
+    for msg in track:
+        if hasattr(msg, 'channel'):
+            return msg.channel
+    return 0
+
 def reconstruct_track(notes, ticks_per_beat):
     """Helper per ricostruire una traccia da una lista di note."""
     new_track = mido.MidiTrack()
@@ -213,6 +243,7 @@ def midi_costas_rhythmic_grid(original_midi, min_order, block_notes=None):
 
     for original_track in original_midi.tracks:
         _name = original_track.name if hasattr(original_track, 'name') else ''
+        _header = _extract_instrument_header(original_track)
         notes = extract_notes(original_track, original_midi.ticks_per_beat)
 
         if not notes:
@@ -245,6 +276,8 @@ def midi_costas_rhythmic_grid(original_midi, min_order, block_notes=None):
         new_track = mido.MidiTrack()
         if _name:
             new_track.name = _name
+        for _h in _header:
+            new_track.append(_h)
         last_abs_time = 0
         for event_data in final_events:
             delta = max(0, event_data['abs_time'] - last_abs_time)
@@ -286,6 +319,7 @@ def midi_costas_generator(original_midi, min_order, base_pitch, pitch_range_semi
     step_ticks = max(1, int(round(step_beats * original_midi.ticks_per_beat)))
     costas_track = mido.MidiTrack()
     costas_track.name = f"Costas Generator (n={n}, p={p}, g={g})"
+    costas_track.append(mido.Message('program_change', program=0, channel=channel, time=0))  # Acoustic Grand Piano di default
 
     events = []
     t = 0
@@ -371,10 +405,17 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
       - Altezza  -> forma Prima (P)         (classe di pitch rimappata)
       - Durata   -> forma Retrograda (R)    (12 classi di durata fisse)
       - Dinamica -> forma Inversione (I)    (12 classi di velocity fisse)
-      - Timbro   -> forma Retrograda-Inversa (RI) (rotazione tra i canali presenti)
+      - Timbro   -> forma Retrograda-Inversa (RI) (la nota "salta" su un'altra
+        traccia/strumento del brano, nello spirito di Kreuzspiel dove
+        Stockhausen disperde una linea tra strumenti diversi)
     Le note vengono processate in ordine cronologico assoluto attraverso tutte
     le tracce (non per traccia separata), perche' nella musica puntillistica
-    ogni punto e' indipendente dal contesto melodico/timbrico originale.
+    ogni punto e' indipendente dal contesto melodico originale. La struttura
+    a piu' tracce/strumenti del brano di partenza viene pero' SEMPRE
+    preservata (stesso numero di tracce, stessi nomi, stesso program_change):
+    solo la destinazione di ciascuna nota puo' cambiare, non l'esistenza
+    delle tracce — altrimenti DAW come Logic Pro perdono l'assegnazione
+    degli strumenti e riproducono tutto con un patch di default.
     Se isolamento_punti=True, ogni nota viene accorciata e seguita da un
     micro-silenzio, per accentuare la natura di "punti" isolati nello spazio
     sonoro invece che di frasi legate.
@@ -390,10 +431,13 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
     DURATION_CLASSES = [base_unit * (k + 1) for k in range(12)]  # 12 durate crescenti, in ottavi di beat
     DYNAMICS_CLASSES = [int(v) for v in np.linspace(24, 127, 12)]  # ppp -> fff su 12 gradini
 
-    channels_present = sorted(set(
-        msg.channel for track in original_midi.tracks for msg in track
-        if hasattr(msg, 'channel')
-    )) or [0]
+    num_tracks = len(original_midi.tracks)
+    track_headers = [_extract_instrument_header(t) for t in original_midi.tracks]
+    track_names = [
+        (t.name if hasattr(t, 'name') and t.name else f"Traccia {i + 1}")
+        for i, t in enumerate(original_midi.tracks)
+    ]
+    track_channels = [_get_track_default_channel(t) for t in original_midi.tracks]
 
     # Raccogli tutte le note come punti indipendenti, in ordine cronologico assoluto
     all_points = []
@@ -403,7 +447,6 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
             all_points.append({
                 'start': nd['start'],
                 'orig_pitch': nd['pitch'],
-                'orig_channel': nd['channel'],
                 'orig_velocity': nd['velocity'],
                 'track_idx': track_idx,
             })
@@ -414,14 +457,8 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
 
     all_points.sort(key=lambda x: x['start'])
 
-    # Un'unica traccia d'uscita: la musica puntillistica di Stockhausen non
-    # distingue "voci" — ogni punto e' un evento autonomo nello spazio sonoro.
-    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
-    punkt_track = mido.MidiTrack()
-    row_str = "-".join(str(x) for x in row_P)
-    punkt_track.name = f"Punktuelle (fila: {row_str})"
+    events_per_track = [[] for _ in range(num_tracks)]
 
-    events = []
     for i, point in enumerate(all_points):
         pitch_class = point['orig_pitch'] % 12
         octave = point['orig_pitch'] // 12
@@ -440,11 +477,12 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
         else:
             velocity = point['orig_velocity']
 
-        if serialize_timbre:
-            timbre_idx = row_RI[i % 12] % len(channels_present)
-            channel = channels_present[timbre_idx]
+        if serialize_timbre and num_tracks > 1:
+            target_track_idx = row_RI[i % 12] % num_tracks
         else:
-            channel = point['orig_channel']
+            target_track_idx = point['track_idx']
+
+        channel = track_channels[target_track_idx]
 
         note_start = point['start']
         if isolamento_punti:
@@ -452,17 +490,26 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
         else:
             note_len = max(1, duration)
 
-        events.append({'msg': mido.Message('note_on', note=new_pitch, velocity=velocity, channel=channel, time=0), 'abs_time': note_start})
-        events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=channel, time=0), 'abs_time': note_start + note_len})
+        events_per_track[target_track_idx].append({'msg': mido.Message('note_on', note=new_pitch, velocity=velocity, channel=channel, time=0), 'abs_time': note_start})
+        events_per_track[target_track_idx].append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=channel, time=0), 'abs_time': note_start + note_len})
 
-    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-    last_abs_time = 0
-    for event_data in events:
-        delta = max(0, event_data['abs_time'] - last_abs_time)
-        punkt_track.append(event_data['msg'].copy(time=delta))
-        last_abs_time = event_data['abs_time']
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    for track_idx in range(num_tracks):
+        new_track = mido.MidiTrack()
+        new_track.name = track_names[track_idx]
+        for _h in track_headers[track_idx]:
+            new_track.append(_h)
 
-    new_midi.tracks.append(punkt_track)
+        track_events = events_per_track[track_idx]
+        track_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+        last_abs_time = 0
+        for event_data in track_events:
+            delta = max(0, event_data['abs_time'] - last_abs_time)
+            new_track.append(event_data['msg'].copy(time=delta))
+            last_abs_time = event_data['abs_time']
+
+        new_midi.tracks.append(new_track)
+
     return new_midi, row
 
 
@@ -536,6 +583,7 @@ def midi_boulez_multiplication(original_midi, set_size=4, chord_density=0, regis
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
     for original_track in original_midi.tracks:
         _name = original_track.name if hasattr(original_track, 'name') else ''
+        _header = _extract_instrument_header(original_track)
         notes = extract_notes(original_track, original_midi.ticks_per_beat)
 
         if not notes:
@@ -557,6 +605,8 @@ def midi_boulez_multiplication(original_midi, set_size=4, chord_density=0, regis
         new_track = mido.MidiTrack()
         if _name:
             new_track.name = _name
+        for _h in _header:
+            new_track.append(_h)
         last_abs_time = 0
         for event_data in final_events:
             delta = max(0, event_data['abs_time'] - last_abs_time)
@@ -656,6 +706,7 @@ def midi_xenakis_stochastic(original_midi, sieve_moduli, mean_events_per_beat, p
 
     xenakis_track = mido.MidiTrack()
     xenakis_track.name = f"Xenakis Stochastic Cloud (sieve n={len(sieve)})"
+    xenakis_track.append(mido.Message('program_change', program=0, channel=0, time=0))  # Acoustic Grand Piano di default
 
     total_beats = total_ticks / ticks_per_beat
     lam = max(0.05, mean_events_per_beat)
@@ -725,15 +776,27 @@ def midi_cage_chance_operations(original_midi, silence_probability=0.15, duratio
     combinatoria (64 esiti equiprobabili) usata da Cage per costruire
     le proprie tabelle. Il silenzio ha silence_probability di sostituire
     ciascun evento: e' trattato come materiale, non come nota mancante.
+    Ogni nota resta sulla propria traccia/strumento originale: la struttura
+    a piu' tracce del brano di partenza (numero, nomi, program_change) e'
+    sempre preservata, altrimenti DAW come Logic Pro perdono l'assegnazione
+    degli strumenti e riproducono tutto con un patch di default.
     """
     rng = np.random.default_rng(seed)
     ticks_per_beat = original_midi.ticks_per_beat
     base_unit = max(1, ticks_per_beat // 4)
 
+    num_tracks = len(original_midi.tracks)
+    track_headers = [_extract_instrument_header(t) for t in original_midi.tracks]
+    track_names = [
+        (t.name if hasattr(t, 'name') and t.name else f"Traccia {i + 1}")
+        for i, t in enumerate(original_midi.tracks)
+    ]
+
     all_points = []
-    for track in original_midi.tracks:
+    for track_idx, track in enumerate(original_midi.tracks):
         notes = extract_notes(track, ticks_per_beat)
         for nd in notes:
+            nd['track_idx'] = track_idx
             all_points.append(nd)
 
     if not all_points:
@@ -752,11 +815,7 @@ def midi_cage_chance_operations(original_midi, silence_probability=0.15, duratio
     DURATION_CHART = [base_unit * (1 + (i % 8)) for i in range(64)]
     DYNAMICS_CHART = [int(v) for v in np.linspace(20, 120, 64)]
 
-    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
-    cage_track = mido.MidiTrack()
-    cage_track.name = "Music of Changes (I Ching chance operations)"
-
-    events = []
+    events_per_track = [[] for _ in range(num_tracks)]
     hexagram_log = []
     for point in all_points:
         hex_pitch = _cage_toss_hexagram(rng)
@@ -773,18 +832,28 @@ def midi_cage_chance_operations(original_midi, silence_probability=0.15, duratio
         duration = DURATION_CHART[hex_dur]
         velocity = DYNAMICS_CHART[hex_dyn]
 
+        target_track_idx = point['track_idx']
         note_start = point['start']
-        events.append({'msg': mido.Message('note_on', note=pitch, velocity=velocity, channel=point['channel'], time=0), 'abs_time': note_start})
-        events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=point['channel'], time=0), 'abs_time': note_start + max(1, duration)})
+        events_per_track[target_track_idx].append({'msg': mido.Message('note_on', note=pitch, velocity=velocity, channel=point['channel'], time=0), 'abs_time': note_start})
+        events_per_track[target_track_idx].append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=point['channel'], time=0), 'abs_time': note_start + max(1, duration)})
 
-    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-    last_abs_time = 0
-    for event_data in events:
-        delta = max(0, event_data['abs_time'] - last_abs_time)
-        cage_track.append(event_data['msg'].copy(time=delta))
-        last_abs_time = event_data['abs_time']
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    for track_idx in range(num_tracks):
+        new_track = mido.MidiTrack()
+        new_track.name = track_names[track_idx]
+        for _h in track_headers[track_idx]:
+            new_track.append(_h)
 
-    new_midi.tracks.append(cage_track)
+        track_events = events_per_track[track_idx]
+        track_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+        last_abs_time = 0
+        for event_data in track_events:
+            delta = max(0, event_data['abs_time'] - last_abs_time)
+            new_track.append(event_data['msg'].copy(time=delta))
+            last_abs_time = event_data['abs_time']
+
+        new_midi.tracks.append(new_track)
+
     return new_midi, hexagram_log
 
 
@@ -847,12 +916,15 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
         phrases = []
         current_phrase_events = []
         _track_name = original_track.name if hasattr(original_track, 'name') else ''
+        _header = _extract_instrument_header(original_track)
         current_phrase_start_tick = 0
 
         events_with_abs_time = []
         time_since_last_event = 0
         for msg in original_track:
             time_since_last_event += msg.time
+            if msg.type == 'program_change' or (msg.type == 'control_change' and msg.control in (0, 32)):
+                continue  # gia' catturati in _header, verranno fissati all'inizio
             events_with_abs_time.append({'msg': msg, 'abs_time': time_since_last_event})
 
         for event_data in events_with_abs_time:
@@ -868,7 +940,12 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
             phrases.append(current_phrase_events)
 
         if not phrases:
-            new_midi.tracks.append(mido.MidiTrack())
+            _empty_track = mido.MidiTrack()
+            if _track_name:
+                _empty_track.name = _track_name
+            for _h in _header:
+                _empty_track.append(_h)
+            new_midi.tracks.append(_empty_track)
             continue
 
         reorganized_phrases = []
@@ -898,6 +975,8 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
         new_track = mido.MidiTrack()
         if _track_name:
             new_track.name = _track_name
+        for _h in _header:
+            new_track.append(_h)
         flat_events_for_reconstruction = []
         absolute_time_in_reorganized_seq = 0
 
@@ -1001,6 +1080,7 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
 
     for original_track in original_midi.tracks:
         _dens_name = original_track.name if hasattr(original_track, 'name') else ''
+        _dens_header = _extract_instrument_header(original_track)
         notes = extract_notes(original_track, original_midi.ticks_per_beat)
 
         # Se la traccia non ha note (metadati, controller, ecc.) — passa intatta
@@ -1052,6 +1132,8 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
         new_track = mido.MidiTrack()
         if _dens_name:
             new_track.name = _dens_name
+        for _h in _dens_header:
+            new_track.append(_h)
         last_abs_time = 0
         for event_data in final_events:
             msg      = event_data['msg']
@@ -1449,7 +1531,7 @@ def midi_recomposer(original_midi, style):
 
     cfg = style_configs.get(style, style_configs["minimal"])
 
-    def build_track_from_pool(weighted_pool, vel_min, vel_max, channel, track_name):
+    def build_track_from_pool(weighted_pool, vel_min, vel_max, channel, track_name, instrument_header=None):
         """Costruisce una nuova traccia dal pool di pitch di una traccia originale."""
         if not weighted_pool:
             return None
@@ -1467,6 +1549,8 @@ def midi_recomposer(original_midi, style):
 
         new_track = mido.MidiTrack()
         new_track.name = track_name
+        for _h in (instrument_header or []):
+            new_track.append(_h)
 
         events = []
         current_tick = 0
@@ -1541,6 +1625,9 @@ def midi_recomposer(original_midi, style):
         channel_counts = Counter(channels)
         dominant_channel = channel_counts.most_common(1)[0][0]
 
+        # --- Header strumento (program_change/bank select) da preservare ---
+        _recomp_header = _extract_instrument_header(orig_track)
+
         # --- Pool di pitch pesato ---
         pitch_counts = Counter(pitches)
         weighted_pool = []
@@ -1557,15 +1644,17 @@ def midi_recomposer(original_midi, style):
         # --- Costruisci nuova traccia ---
         new_track = build_track_from_pool(
             weighted_pool, vel_min, vel_max,
-            dominant_channel, track_name
+            dominant_channel, track_name, instrument_header=_recomp_header
         )
 
         if new_track is not None:
             new_midi.tracks.append(new_track)
         else:
-            # Fallback: traccia vuota con nome originale
+            # Fallback: traccia vuota con nome originale (e strumento preservato)
             empty = mido.MidiTrack()
             empty.name = track_name
+            for _h in _recomp_header:
+                empty.append(_h)
             new_midi.tracks.append(empty)
 
     return new_midi
