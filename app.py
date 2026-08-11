@@ -1369,6 +1369,121 @@ def midi_bach_canon(original_midi, canon_type="Cancrizans (Retrogrado)", interva
     return new_midi, canon_type
 
 
+# --- Stile: Geometria Frattale (ispirato a Wallin/Sharp/Posadas) ---
+# NON e' la tecnica esatta di alcun compositore specifico: quei metodi non
+# sono documentati pubblicamente in dettaglio riproducibile (vedi nota nella
+# UI). Questo modulo usa due algoritmi frattali STANDARD e verificabili:
+#   - Insieme di Cantor: genera lo scheletro RITMICO (rimozione ricorsiva del
+#     terzo centrale di un intervallo -> pattern gerarchico presenza/assenza,
+#     auto-simile a scale temporali diverse).
+#   - IFS (Iterated Function System, tipo triangolo di Sierpinski): genera il
+#     contorno MELODICO (3 trasformazioni affini verso 3 vertici, iterate N
+#     volte -> profilo di altezza auto-simile).
+
+def _cantor_intervals(start, end, depth, min_width):
+    """Ricorsione dell'insieme di Cantor: ritorna la lista dei sotto-intervalli
+    sopravvissuti (terzo centrale rimosso ad ogni livello) fino a `depth`
+    livelli o larghezza minima `min_width`."""
+    width = end - start
+    if depth <= 0 or width < min_width:
+        return [(start, end)]
+    third = width / 3.0
+    left = _cantor_intervals(start, start + third, depth - 1, min_width)
+    right = _cantor_intervals(end - third, end, depth - 1, min_width)
+    return left + right
+
+
+def _ifs_sierpinski_points(num_points, seed=None):
+    """Genera `num_points` punti (x,y) in [0,1]x[0,1] tramite il sistema di
+    funzioni iterate del triangolo di Sierpinski: ad ogni passo il punto
+    corrente viene spostato a meta' strada verso uno dei 3 vertici del
+    triangolo, scelto a caso — il classico "chaos game"."""
+    rng = np.random.default_rng(seed)
+    vertices = [(0.0, 0.0), (1.0, 0.0), (0.5, 1.0)]
+    x, y = 0.5, 0.5
+    points = []
+    for i in range(num_points):
+        vx, vy = vertices[rng.integers(0, 3)]
+        x = (x + vx) / 2.0
+        y = (y + vy) / 2.0
+        if i >= 5:  # scarta i primi punti transitori, non ancora sull'attrattore
+            points.append((x, y))
+    return points
+
+
+def midi_fractal_geometry(original_midi, cantor_depth=4, min_width_ticks=None,
+                           pitch_range_semitones=24, seed=None):
+    """
+    Genera una nuova traccia il cui ritmo segue lo scheletro dell'insieme di
+    Cantor (istanti ricavati dai sotto-intervalli sopravvissuti dopo
+    `cantor_depth` rimozioni ricorsive del terzo centrale) e la cui melodia
+    segue il profilo d'altezza generato da un IFS stile Sierpinski (chaos
+    game), mappato sul centro/estensione di pitch del brano originale.
+    Le tracce originali restano intatte; il sistema frattale si aggiunge
+    come nuova traccia indipendente.
+    """
+    rng_seed = seed
+    ticks_per_beat = original_midi.ticks_per_beat
+
+    pitches_found = []
+    for track in original_midi.tracks:
+        for msg in track:
+            if msg.type == 'note_on' and msg.velocity > 0:
+                pitches_found.append(msg.note)
+    if not pitches_found:
+        st.warning("Nessuna nota trovata nel brano. Il modulo frattale non verra' aggiunto.")
+        return original_midi, (0, 0)
+    pitch_center = int(np.mean(pitches_found))
+
+    total_ticks = 0
+    for track in original_midi.tracks:
+        current_time = 0
+        for msg in track:
+            current_time += msg.time
+        total_ticks = max(total_ticks, current_time)
+    if total_ticks == 0:
+        total_ticks = ticks_per_beat * 4 * 8
+
+    if min_width_ticks is None:
+        min_width_ticks = max(1, ticks_per_beat // 8)
+
+    # --- Ritmo: scheletro dell'insieme di Cantor ---
+    cantor_segments = _cantor_intervals(0, total_ticks, cantor_depth, min_width_ticks)
+    cantor_segments.sort(key=lambda seg: seg[0])
+
+    # --- Melodia: profilo IFS (chaos game, triangolo di Sierpinski) ---
+    ifs_points = _ifs_sierpinski_points(len(cantor_segments), seed=rng_seed)
+
+    new_midi = mido.MidiFile(ticks_per_beat=ticks_per_beat)
+    for track in original_midi.tracks:
+        new_midi.tracks.append(track)
+
+    fractal_track = mido.MidiTrack()
+    fractal_track.name = f"Geometria Frattale (Cantor depth={cantor_depth} + IFS Sierpinski)"
+    fractal_track.append(mido.Message('program_change', program=0, channel=0, time=0))
+
+    events = []
+    for i, (seg_start, seg_end) in enumerate(cantor_segments):
+        y = ifs_points[i][1] if i < len(ifs_points) else 0.5
+        pitch = int(round(pitch_center + (y - 0.5) * pitch_range_semitones))
+        pitch = max(0, min(127, pitch))
+        note_len = max(1, int((seg_end - seg_start) * 0.8))
+        vel = int(np.clip(60 + (y - 0.5) * 40, 20, 110))
+        start_tick = int(seg_start)
+        events.append({'msg': mido.Message('note_on', note=pitch, velocity=vel, channel=0, time=0), 'abs_time': start_tick})
+        events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=0, time=0), 'abs_time': start_tick + note_len})
+
+    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+    last_abs_time = 0
+    for ev in events:
+        delta = max(0, ev['abs_time'] - last_abs_time)
+        fractal_track.append(ev['msg'].copy(time=delta))
+        last_abs_time = ev['abs_time']
+
+    new_midi.tracks.append(fractal_track)
+    return new_midi, (len(cantor_segments), pitch_center)
+
+
 # --- Funzioni di Decomposizione ---
 
 def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization):
@@ -1501,9 +1616,17 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
                 phrase_abs += msg_in_phrase.time
                 if msg_in_phrase.type == 'note_on' and msg_in_phrase.velocity > 0:
                     open_notes[(msg_in_phrase.note, msg_in_phrase.channel)] = phrase_abs
+                    flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': phrase_abs})
                 elif msg_in_phrase.type == 'note_off' or (msg_in_phrase.type == 'note_on' and msg_in_phrase.velocity == 0):
-                    open_notes.pop((msg_in_phrase.note, msg_in_phrase.channel), None)
-                flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': phrase_abs})
+                    key = (msg_in_phrase.note, msg_in_phrase.channel)
+                    if key in open_notes:
+                        open_notes.pop(key, None)
+                        flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': phrase_abs})
+                    # else: note_off "orfano" — il note_on apparteneva a una frase
+                    # precedente (gia' chiusa sinteticamente al suo confine, vedi sotto).
+                    # Scartato per evitare un doppio note_off sulla stessa nota.
+                else:
+                    flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': phrase_abs})
 
             # Chiudi note rimaste aperte alla fine della frase
             phrase_end = phrase_abs
@@ -1672,7 +1795,6 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength):
 
         # pitch_map: (pitch_orig, channel) -> lista di pitch nuovi (stack LIFO)
         # gestisce piu' note_on sullo stesso pitch prima del note_off
-        from collections import defaultdict
         pitch_map = defaultdict(list)
 
         for msg in original_track:
@@ -2283,6 +2405,12 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
             method_lines.append(f"   * Tipo di canone: {canon_t} | Intervallo: {interval_s} semitoni | Ritardo: {delay_b} beat")
             method_lines.append("   * Canone rigoroso — dux/comes (Bach, Offerta Musicale/Arte della Fuga)")
 
+        elif method_key == "MIDI Fractal Geometry":
+            cantor_d, n_segs, pitch_c = params
+            method_lines.append(f"   * Profondità Cantor: {cantor_d} | Segmenti generati: {n_segs} | Centro pitch: {pitch_c}")
+            method_lines.append("   * Insieme di Cantor (ritmo) + IFS/chaos game Sierpinski (melodia) — algoritmi frattali standard")
+            method_lines.append("   * NON è la tecnica documentata di un compositore specifico — vedi nota nell'interfaccia")
+
     report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
     report += ":: MOTORE: midi_decomposer [v1.0]\n"
     report += f":: FILE: {original_file}\n"
@@ -2381,6 +2509,7 @@ if uploaded_midi_file is not None:
             "MIDI Reich Phasing": "🌀 Steve Reich — Phasing",
             "MIDI Glass Additive": "➕ Philip Glass — Processo Additivo",
             "MIDI Bach Canon": "🎼 Johann Sebastian Bach — Canone Rigoroso",
+            "MIDI Fractal Geometry": "🌿 Geometria Frattale (ispirato a Wallin/Sharp/Posadas)",
         }
         # Metodi disponibili nella modalita' "🔧 Avanzato" (i Compositori hanno la loro modalita' dedicata)
         ADVANCED_METHODS_KEYS = [
@@ -2388,7 +2517,10 @@ if uploaded_midi_file is not None:
             "MIDI Density Transformer", "MIDI Random Pitch Transformer",
             "MIDI Rhythmic Base", "MIDI Recomposer",
         ]
-        # Ordine alfabetico per cognome del compositore
+        # Ordine alfabetico per cognome del compositore. "Geometria Frattale" resta
+        # in fondo e separata: non e' la tecnica documentata di un singolo autore
+        # (vedi nota nella UI), ma un algoritmo frattale standard onestamente
+        # etichettato come "ispirato a".
         COMPOSITORI = {
             "🎼 Johann Sebastian Bach — Canone Rigoroso": "MIDI Bach Canon",
             "🔷 Pierre Boulez — Moltiplicazione d'Accordi": "MIDI Boulez Multiplication",
@@ -2401,6 +2533,7 @@ if uploaded_midi_file is not None:
             "🧮 Scott Rickard — Costas Sequencer": "MIDI Costas Sequencer",
             "🎯 Karlheinz Stockhausen — Punktuelle Musik": "MIDI Stockhausen Punktuelle",
             "☁️ Iannis Xenakis — Musica Stocastica": "MIDI Xenakis Stochastic",
+            "🌿 Geometria Frattale (ispirato a Wallin/Sharp/Posadas)": "MIDI Fractal Geometry",
         }
 
         # --- STILI RICOMPOSIZIONE (usati dal pulsante Ricomponi) ---
@@ -2880,6 +3013,46 @@ if uploaded_midi_file is not None:
                         )
                         st.session_state.midi_ready = True
                         st.success(f"✅ Canone applicato! Tipo: {canon_used}")
+
+            elif compositore_key == "MIDI Fractal Geometry":
+                st.warning(
+                    "⚠️ **Non è la tecnica documentata di un singolo compositore.** Wallin, Sharp, Posadas e "
+                    "altri citano genericamente \"algoritmi frattali\" nei loro programmi di sala, ma non hanno "
+                    "mai pubblicato la formula esatta usata. Questo modulo applica due algoritmi frattali "
+                    "**standard e verificabili**, nello spirito (non nella lettera) di quei lavori."
+                )
+                st.info(
+                    "**Ritmo** — insieme di Cantor: rimozione ricorsiva del terzo centrale di un intervallo, "
+                    "genera uno scheletro temporale gerarchico e auto-simile a scale diverse.  \n"
+                    "**Melodia** — IFS (chaos game, triangolo di Sierpinski): 3 trasformazioni affini verso i "
+                    "vertici di un triangolo, iterate ripetutamente, generano un profilo di altezza auto-simile."
+                )
+                col_f1, col_f2 = st.columns(2)
+                with col_f1:
+                    cantor_depth = st.slider("Profondità Cantor (livelli di ricorsione):", 1, 8, 4, key="fractal_cantor_depth")
+                with col_f2:
+                    fractal_pitch_range = st.slider("Estensione melodica (semitoni):", 6, 48, 24, key="fractal_pitch_range")
+                fractal_seed_input = st.text_input("Seed (opzionale, per riproducibilità):", value="", key="fractal_seed")
+                fractal_seed = int(fractal_seed_input) if fractal_seed_input.strip().isdigit() else None
+
+                if st.button("🌿 Applica Geometria Frattale", type="primary", use_container_width=True, key="btn_fractal"):
+                    with st.spinner("Generando l'insieme di Cantor e il chaos game IFS..."):
+                        result_midi, fractal_info = midi_fractal_geometry(
+                            midi_data, cantor_depth, None, fractal_pitch_range, seed=fractal_seed
+                        )
+                        midi_out_bytes = io.BytesIO()
+                        result_midi.save(file=midi_out_bytes)
+                        midi_out_bytes.seek(0)
+                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
+                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Fractal.mid"
+                        st.session_state.midi_report   = build_report(
+                            uploaded_midi_file.name, midi_data, result_midi,
+                            ["MIDI Fractal Geometry"],
+                            {"MIDI Fractal Geometry": (cantor_depth, fractal_info[0], fractal_info[1])},
+                            midi_methods, stile=compositore_label
+                        )
+                        st.session_state.midi_ready = True
+                        st.success(f"✅ Sistema frattale generato! {fractal_info[0]} segmenti Cantor, centro pitch {fractal_info[1]}")
 
             else:  # Costas Sequencer
                 st.caption(
