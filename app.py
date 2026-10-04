@@ -6,6 +6,8 @@ import mido
 import random
 import numpy as np
 import io
+import os
+import zlib
 import functools
 import base64
 from collections import defaultdict
@@ -195,26 +197,169 @@ def _free_channels(midi):
     return free if free else melodic
 
 
-def reconstruct_track(notes, ticks_per_beat):
-    """Helper per ricostruire una traccia da una lista di note."""
-    new_track = mido.MidiTrack()
-    events = []
-    for note in notes:
-        events.append({'msg': mido.Message('note_on', note=note['pitch'], velocity=note['velocity'], channel=note['channel'], time=0), 'abs_time': note['start']})
-        events.append({'msg': mido.Message('note_off', note=note['pitch'], velocity=0, channel=note['channel'], time=0), 'abs_time': note['end']})
-    
-    events.sort(key=lambda x: x['abs_time'])
+# --- Seed: riproducibilita' (protocollo Loop507) ---
+_RUN_SEED_FALLBACK = {}
 
-    last_abs_time = 0
-    for event in events:
-        delta_time = event['abs_time'] - last_abs_time
-        if delta_time < 0:
-            delta_time = 0
-        
-        new_msg = event['msg'].copy(time=delta_time)
-        new_track.append(new_msg)
-        last_abs_time = event['abs_time']
-    return new_track
+
+def _current_run_seed():
+    """Seed dell'esecuzione corrente: lo imposta l'interfaccia (campo 'Seed globale',
+    oppure casuale a ogni esecuzione e riportato nel report). Fuori dall'app ne genera uno una volta."""
+    try:
+        s = st.session_state.get('_run_seed')
+    except Exception:
+        s = None
+    if s is None:
+        s = _RUN_SEED_FALLBACK.setdefault('v', random.SystemRandom().randrange(2 ** 31))
+    return int(s)
+
+
+def _effective_seed(seed, salt):
+    """Seed esplicito del metodo se presente (invariato, cosi' i vecchi seed continuano a valere);
+    altrimenti un seed derivato in modo stabile da (seed globale, nome metodo)."""
+    if seed is not None:
+        return int(seed)
+    return zlib.crc32(f"{_current_run_seed()}:{salt}".encode("utf-8"))
+
+
+def _rng(seed, salt):
+    """random.Random locale e riproducibile: nessun uso dello stato globale di `random`."""
+    return random.Random(_effective_seed(seed, salt))
+
+
+GM_PROGRAM_NAMES = [
+    'Acoustic Grand Piano', 'Bright Acoustic Piano', 'Electric Grand Piano', 'Honky-tonk Piano',
+    'Electric Piano 1', 'Electric Piano 2', 'Harpsichord', 'Clavinet',
+    'Celesta', 'Glockenspiel', 'Music Box', 'Vibraphone',
+    'Marimba', 'Xylophone', 'Tubular Bells', 'Dulcimer',
+    'Drawbar Organ', 'Percussive Organ', 'Rock Organ', 'Church Organ',
+    'Reed Organ', 'Accordion', 'Harmonica', 'Tango Accordion',
+    'Acoustic Guitar (nylon)', 'Acoustic Guitar (steel)', 'Electric Guitar (jazz)', 'Electric Guitar (clean)',
+    'Electric Guitar (muted)', 'Overdriven Guitar', 'Distortion Guitar', 'Guitar Harmonics',
+    'Acoustic Bass', 'Electric Bass (finger)', 'Electric Bass (pick)', 'Fretless Bass',
+    'Slap Bass 1', 'Slap Bass 2', 'Synth Bass 1', 'Synth Bass 2',
+    'Violin', 'Viola', 'Cello', 'Contrabass',
+    'Tremolo Strings', 'Pizzicato Strings', 'Orchestral Harp', 'Timpani',
+    'String Ensemble 1', 'String Ensemble 2', 'Synth Strings 1', 'Synth Strings 2',
+    'Choir Aahs', 'Voice Oohs', 'Synth Voice', 'Orchestra Hit',
+    'Trumpet', 'Trombone', 'Tuba', 'Muted Trumpet',
+    'French Horn', 'Brass Section', 'Synth Brass 1', 'Synth Brass 2',
+    'Soprano Sax', 'Alto Sax', 'Tenor Sax', 'Baritone Sax',
+    'Oboe', 'English Horn', 'Bassoon', 'Clarinet',
+    'Piccolo', 'Flute', 'Recorder', 'Pan Flute',
+    'Blown Bottle', 'Shakuhachi', 'Whistle', 'Ocarina',
+    'Lead 1 (square)', 'Lead 2 (sawtooth)', 'Lead 3 (calliope)', 'Lead 4 (chiff)',
+    'Lead 5 (charang)', 'Lead 6 (voice)', 'Lead 7 (fifths)', 'Lead 8 (bass + lead)',
+    'Pad 1 (new age)', 'Pad 2 (warm)', 'Pad 3 (polysynth)', 'Pad 4 (choir)',
+    'Pad 5 (bowed)', 'Pad 6 (metallic)', 'Pad 7 (halo)', 'Pad 8 (sweep)',
+    'FX 1 (rain)', 'FX 2 (soundtrack)', 'FX 3 (crystal)', 'FX 4 (atmosphere)',
+    'FX 5 (brightness)', 'FX 6 (goblins)', 'FX 7 (echoes)', 'FX 8 (sci-fi)',
+    'Sitar', 'Banjo', 'Shamisen', 'Koto',
+    'Kalimba', 'Bag pipe', 'Fiddle', 'Shanai',
+    'Tinkle Bell', 'Agogo', 'Steel Drums', 'Woodblock',
+    'Taiko Drum', 'Melodic Tom', 'Synth Drum', 'Reverse Cymbal',
+    'Guitar Fret Noise', 'Breath Noise', 'Seashore', 'Bird Tweet',
+    'Telephone Ring', 'Helicopter', 'Applause', 'Gunshot',
+]
+GM_PROGRAM_OPTIONS = ["Predefinito del metodo"] + [f"{i:03d} · {n}" for i, n in enumerate(GM_PROGRAM_NAMES)]
+_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+# Profili di tonalita' di Krumhansl-Kessler (stima della tonalita' dall'istogramma delle classi di altezza)
+_KS_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+_KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+
+
+def _generated_program(default=0):
+    """Programma GM per le tracce generate: scelta dell'utente ('gen_program_label') oppure il default del metodo."""
+    try:
+        label = st.session_state.get('gen_program_label')
+    except Exception:
+        label = None
+    if isinstance(label, str) and label[:3].isdigit():
+        return max(0, min(127, int(label[:3])))
+    return default
+
+
+def _generated_program_label():
+    """'Violin (40)' se l'utente ha scelto uno strumento, altrimenti None (per il report)."""
+    p = _generated_program(None)
+    return None if p is None else f"{GM_PROGRAM_NAMES[p]} ({p})"
+
+
+def estimate_key(midi, ignore_drums=True):
+    """Stima la tonalita' (Krumhansl-Schmuckler) dalle durate delle classi di altezza.
+    Ritorna (tonica 0-11, 'Maggiore'|'Minore', correlazione) oppure None se non ci sono note utili."""
+    hist = np.zeros(12)
+    for tr in midi.tracks:
+        for n in extract_notes(tr, midi.ticks_per_beat):
+            if ignore_drums and n['channel'] == DRUM_CHANNEL:
+                continue
+            hist[n['pitch'] % 12] += max(1, n['end'] - n['start'])
+    if hist.sum() == 0 or np.std(hist) == 0:
+        return None
+    best = None
+    for tonic in range(12):
+        for mode, profile in (("Maggiore", _KS_MAJOR), ("Minore", _KS_MINOR)):
+            r = np.corrcoef(hist, np.roll(profile, tonic))[0, 1]
+            if not np.isnan(r) and (best is None or r > best[2]):
+                best = (tonic, mode, float(r))
+    return best
+
+
+def validate_midi_output(source_midi, output_midi):
+    """Controlli di coerenza sul risultato: note totali, note non bilanciate (appese o note_off orfani),
+    durata prima/dopo, tempo/metrica/tonalita' preservati."""
+    def count(m):
+        notes, unbalanced = 0, 0
+        for tr in m.tracks:
+            c = defaultdict(int)
+            for x in tr:
+                if x.type == 'note_on' and x.velocity > 0:
+                    notes += 1
+                    c[(x.note, x.channel)] += 1
+                elif x.type in ('note_off', 'note_on'):
+                    c[(x.note, x.channel)] -= 1
+            unbalanced += sum(1 for v in c.values() if v != 0)
+        return notes, unbalanced
+
+    def duration(m):
+        try:
+            return round(m.length, 2)
+        except Exception:
+            return None
+
+    def meta_types(m):
+        return {x.type for tr in m.tracks for x in tr if x.is_meta and x.type in _GLOBAL_META_TYPES}
+
+    notes_in, _ = count(source_midi)
+    notes_out, unbalanced = count(output_midi)
+    meta_ok = meta_types(source_midi) <= meta_types(output_midi)
+    return {
+        'notes_in': notes_in, 'notes_out': notes_out, 'unbalanced': unbalanced,
+        'duration_in': duration(source_midi), 'duration_out': duration(output_midi),
+        'tracks_in': len(source_midi.tracks), 'tracks_out': len(output_midi.tracks),
+        'meta_ok': meta_ok, 'ok': unbalanced == 0 and meta_ok,
+    }
+
+
+def normalize_midi(midi):
+    """Se il file ha UNA sola traccia con note su piu' canali (tipo 0), la divide in una traccia per canale,
+    cosi' tutti i metodi lavorano per strumento. Ritorna (midi, e_stato_diviso)."""
+    if len(midi.tracks) == 1:
+        chans = {m.channel for m in midi.tracks[0] if m.type == 'note_on' and m.velocity > 0}
+        if len(chans) > 1:
+            return _split_type0_to_tracks(midi), True
+    return midi, False
+
+
+def append_events_to_track(track, events):
+    """Accoda a `track` gli eventi [{'msg', 'abs_time'}] convertendoli in delta-time.
+    Ordine stabile per tempo assoluto, con note_off prima di note_on allo stesso tick
+    (evita sovrapposizioni e note appese). Sostituisce il blocco sort+delta ripetuto ovunque."""
+    last = 0
+    for ev in sorted(events, key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1)):
+        track.append(ev['msg'].copy(time=max(0, ev['abs_time'] - last)))
+        last = ev['abs_time']
+    return track
+
 
 # --- Costas Array Utilities (costruzione di Welch, GF(p)) ---
 # Rif: J.P. Costas (1965); L. Welch construction via radice primitiva mod p.
@@ -367,18 +512,12 @@ def midi_costas_rhythmic_grid(original_midi, min_order, block_notes=None):
                 final_events.append({'msg': mido.Message('note_on', note=note_data['pitch'], velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': new_start})
                 final_events.append({'msg': mido.Message('note_off', note=note_data['pitch'], velocity=0, channel=note_data['channel'], time=0), 'abs_time': new_end})
 
-        final_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-
         new_track = mido.MidiTrack()
         if _name:
             new_track.name = _name
         for _h in _header:
             new_track.append(_h)
-        last_abs_time = 0
-        for event_data in final_events:
-            delta = max(0, event_data['abs_time'] - last_abs_time)
-            new_track.append(event_data['msg'].copy(time=delta))
-            last_abs_time = event_data['abs_time']
+        append_events_to_track(new_track, final_events)
 
         new_midi.tracks.append(new_track)
     return new_midi, (n, p, g)
@@ -418,7 +557,7 @@ def midi_costas_generator(original_midi, min_order, base_pitch, pitch_range_semi
     step_ticks = max(1, int(round(step_beats * original_midi.ticks_per_beat)))
     costas_track = mido.MidiTrack()
     costas_track.name = f"Costas Generator (n={n}, p={p}, g={g})"
-    costas_track.append(mido.Message('program_change', program=0, channel=channel, time=0))  # Acoustic Grand Piano di default
+    costas_track.append(mido.Message('program_change', program=_generated_program(0), channel=channel, time=0))  # Acoustic Grand Piano di default
 
     events = []
     t = 0
@@ -434,12 +573,7 @@ def midi_costas_generator(original_midi, min_order, base_pitch, pitch_range_semi
         t += step_ticks
         i += 1
 
-    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-    last_abs_time = 0
-    for event_data in events:
-        delta = max(0, event_data['abs_time'] - last_abs_time)
-        costas_track.append(event_data['msg'].copy(time=delta))
-        last_abs_time = event_data['abs_time']
+    append_events_to_track(costas_track, events)
 
     new_midi.tracks.append(costas_track)
     return new_midi, (n, p, g)
@@ -612,12 +746,7 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
             new_track.append(_h)
 
         track_events = events_per_track[track_idx]
-        track_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-        last_abs_time = 0
-        for event_data in track_events:
-            delta = max(0, event_data['abs_time'] - last_abs_time)
-            new_track.append(event_data['msg'].copy(time=delta))
-            last_abs_time = event_data['abs_time']
+        append_events_to_track(new_track, track_events)
 
         new_midi.tracks.append(new_track)
 
@@ -718,17 +847,12 @@ def midi_boulez_multiplication(original_midi, set_size=4, chord_density=0, regis
                 final_events.append({'msg': mido.Message('note_on', note=new_pitch, velocity=nd['velocity'], channel=nd['channel'], time=0), 'abs_time': nd['start']})
                 final_events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0, channel=nd['channel'], time=0), 'abs_time': nd['end']})
 
-        final_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
         new_track = mido.MidiTrack()
         if _name:
             new_track.name = _name
         for _h in _header:
             new_track.append(_h)
-        last_abs_time = 0
-        for event_data in final_events:
-            delta = max(0, event_data['abs_time'] - last_abs_time)
-            new_track.append(event_data['msg'].copy(time=delta))
-            last_abs_time = event_data['abs_time']
+        append_events_to_track(new_track, final_events)
 
         new_midi.tracks.append(new_track)
 
@@ -801,7 +925,7 @@ def midi_xenakis_stochastic(original_midi, sieve_moduli, mean_events_per_beat, p
     Copre l'intera durata del brano originale; le tracce originali restano
     intatte, la nuvola si aggiunge come nuova traccia.
     """
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(_effective_seed(seed, "xenakis"))
     gen_channel = _free_channels(original_midi)[0]
     sieve = generate_sieve(sieve_moduli, universe=(0, 128))
     if not sieve:
@@ -825,7 +949,7 @@ def midi_xenakis_stochastic(original_midi, sieve_moduli, mean_events_per_beat, p
 
     xenakis_track = mido.MidiTrack()
     xenakis_track.name = f"Xenakis Stochastic Cloud (sieve n={len(sieve)})"
-    xenakis_track.append(mido.Message('program_change', program=0, channel=gen_channel, time=0))  # Acoustic Grand Piano di default
+    xenakis_track.append(mido.Message('program_change', program=_generated_program(0), channel=gen_channel, time=0))  # Acoustic Grand Piano di default
 
     total_beats = total_ticks / ticks_per_beat
     lam = max(0.05, mean_events_per_beat)
@@ -851,12 +975,7 @@ def midi_xenakis_stochastic(original_midi, sieve_moduli, mean_events_per_beat, p
         events.append({'msg': mido.Message('note_on', note=pitch, velocity=velocity, channel=gen_channel, time=0), 'abs_time': start_tick})
         events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=gen_channel, time=0), 'abs_time': end_tick})
 
-    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-    last_abs_time = 0
-    for event_data in events:
-        delta = max(0, event_data['abs_time'] - last_abs_time)
-        xenakis_track.append(event_data['msg'].copy(time=delta))
-        last_abs_time = event_data['abs_time']
+    append_events_to_track(xenakis_track, events)
 
     new_midi.tracks.append(xenakis_track)
     return new_midi, sieve
@@ -901,7 +1020,7 @@ def midi_cage_chance_operations(original_midi, silence_probability=0.15, duratio
     sempre preservata, altrimenti DAW come Logic Pro perdono l'assegnazione
     degli strumenti e riproducono tutto con un patch di default.
     """
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(_effective_seed(seed, "cage"))
     ticks_per_beat = original_midi.ticks_per_beat
     base_unit = max(1, ticks_per_beat // 4)
 
@@ -965,12 +1084,7 @@ def midi_cage_chance_operations(original_midi, silence_probability=0.15, duratio
             new_track.append(_h)
 
         track_events = events_per_track[track_idx]
-        track_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-        last_abs_time = 0
-        for event_data in track_events:
-            delta = max(0, event_data['abs_time'] - last_abs_time)
-            new_track.append(event_data['msg'].copy(time=delta))
-            last_abs_time = event_data['abs_time']
+        append_events_to_track(new_track, track_events)
 
         new_midi.tracks.append(new_track)
 
@@ -1017,7 +1131,7 @@ def midi_eno_generative(original_midi, num_loops=6, min_loop_beats=8, max_loop_b
     volume/timbro di ciascun loop separatamente.
     """
     preserve = _drums_preserved()
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(_effective_seed(seed, "eno"))
     gen_channel = _free_channels(original_midi)[0]
     ticks_per_beat = original_midi.ticks_per_beat
 
@@ -1061,7 +1175,7 @@ def midi_eno_generative(original_midi, num_loops=6, min_loop_beats=8, max_loop_b
 
         loop_track = mido.MidiTrack()
         loop_track.name = f"Eno Loop {i + 1} (pitch={pitch}, ciclo={loop_len_ticks}t, primo={p})"
-        loop_track.append(mido.Message('program_change', program=0, channel=gen_channel, time=0))
+        loop_track.append(mido.Message('program_change', program=_generated_program(0), channel=gen_channel, time=0))
 
         events = []
         t = phase_offset
@@ -1071,12 +1185,7 @@ def midi_eno_generative(original_midi, num_loops=6, min_loop_beats=8, max_loop_b
             events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=gen_channel, time=0), 'abs_time': t + note_len})
             t += loop_len_ticks
 
-        events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-        last_abs_time = 0
-        for event_data in events:
-            delta = max(0, event_data['abs_time'] - last_abs_time)
-            loop_track.append(event_data['msg'].copy(time=delta))
-            last_abs_time = event_data['abs_time']
+        append_events_to_track(loop_track, events)
 
         new_midi.tracks.append(loop_track)
         loops_info.append((pitch, loop_len_ticks, p))
@@ -1146,7 +1255,7 @@ def midi_bach_canon(original_midi, num_voices=2, interval_semitones=7,
         aug = augmentation_factor if (v > 0 and transformation == "Aumentazione ritmica (comes raddoppiato)") else 1
         channel = bach_free[v % len(bach_free)]
         voice_track.name = f"Bach Canone Voce {v + 1} ({'dux' if v == 0 else 'comes'}, +{transpose}st, delay={v * delay_beats}beat, aug x{aug})"
-        voice_track.append(mido.Message('program_change', program=0, channel=channel, time=0))
+        voice_track.append(mido.Message('program_change', program=_generated_program(0), channel=channel, time=0))
 
         events = []
         voice_delay = delay_ticks * v
@@ -1160,12 +1269,7 @@ def midi_bach_canon(original_midi, num_voices=2, interval_semitones=7,
             events.append({'msg': mido.Message('note_on', note=pitch, velocity=n['velocity'], channel=channel, time=0), 'abs_time': start})
             events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=channel, time=0), 'abs_time': max(start + 1, end)})
 
-        events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-        last_abs_time = 0
-        for event_data in events:
-            delta = max(0, event_data['abs_time'] - last_abs_time)
-            voice_track.append(event_data['msg'].copy(time=delta))
-            last_abs_time = event_data['abs_time']
+        append_events_to_track(voice_track, events)
 
         new_midi.tracks.append(voice_track)
         voices_info.append((transpose, v * delay_beats, aug))
@@ -1225,7 +1329,7 @@ def midi_glass_additive(original_midi, cell_length_notes=8, direction="Additivo 
 
     glass_track = mido.MidiTrack()
     glass_track.name = f"Glass Additive Process (cellula={len(norm_cell)} note, {len(stages)} stadi)"
-    glass_track.append(mido.Message('program_change', program=0, channel=gen_channel, time=0))
+    glass_track.append(mido.Message('program_change', program=_generated_program(0), channel=gen_channel, time=0))
 
     events = []
     cursor = 0
@@ -1240,12 +1344,7 @@ def midi_glass_additive(original_midi, cell_length_notes=8, direction="Additivo 
                 events.append({'msg': mido.Message('note_off', note=n['pitch'], velocity=0, channel=gen_channel, time=0), 'abs_time': max(start + 1, end)})
             cursor += stage_dur
 
-    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-    last_abs_time = 0
-    for event_data in events:
-        delta = max(0, event_data['abs_time'] - last_abs_time)
-        glass_track.append(event_data['msg'].copy(time=delta))
-        last_abs_time = event_data['abs_time']
+    append_events_to_track(glass_track, events)
 
     new_midi.tracks.append(glass_track)
     return new_midi, stages
@@ -1300,7 +1399,7 @@ def midi_messiaen_modes(original_midi, mode_number=2, transposition=0,
     riapplicata ciclicamente. Struttura a piu' tracce sempre preservata.
     """
     preserve = _drums_preserved(preserve_drums)
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(_effective_seed(seed, "messiaen"))
     mode_intervals = MESSIAEN_MODES.get(mode_number, MESSIAEN_MODES[2])
     ticks_per_beat = original_midi.ticks_per_beat
     base_unit = max(1, ticks_per_beat // 4)
@@ -1348,12 +1447,7 @@ def midi_messiaen_modes(original_midi, mode_number=2, transposition=0,
             events.append({'msg': mido.Message('note_off', note=pitch, velocity=0, channel=n['channel'], time=0), 'abs_time': end})
             cursor = end
 
-        events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-        last_abs_time = 0
-        for event_data in events:
-            delta = max(0, event_data['abs_time'] - last_abs_time)
-            new_track.append(event_data['msg'].copy(time=delta))
-            last_abs_time = event_data['abs_time']
+        append_events_to_track(new_track, events)
 
         new_midi.tracks.append(new_track)
 
@@ -1428,7 +1522,7 @@ def midi_part_tintinnabuli(original_midi, tonic_key="C", triad_type="Minore",
         t_track = mido.MidiTrack()
         t_channel = part_free[track_idx % len(part_free)]
         t_track.name = f"{track_names[track_idx]} (T-voice tintinnabuli)"
-        t_track.append(mido.Message('program_change', program=8, channel=t_channel, time=0))  # celesta di default
+        t_track.append(mido.Message('program_change', program=_generated_program(8), channel=t_channel, time=0))  # celesta di default
 
         if not notes:
             new_midi.tracks.append(m_track)
@@ -1450,12 +1544,7 @@ def midi_part_tintinnabuli(original_midi, tonic_key="C", triad_type="Minore",
             t_events.append({'msg': mido.Message('note_off', note=t_pitch, velocity=0, channel=t_channel, time=0), 'abs_time': max(n['start'] + 1, n['end'])})
 
         for evs, trk in ((m_events, m_track), (t_events, t_track)):
-            evs.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-            last_abs_time = 0
-            for event_data in evs:
-                delta = max(0, event_data['abs_time'] - last_abs_time)
-                trk.append(event_data['msg'].copy(time=delta))
-                last_abs_time = event_data['abs_time']
+            append_events_to_track(trk, evs)
 
         new_midi.tracks.append(m_track)
         new_midi.tracks.append(t_track)
@@ -1517,11 +1606,11 @@ def midi_reich_phasing(original_midi, cell_length_notes=8, num_cycles=32,
 
     voice_a = mido.MidiTrack()
     voice_a.name = f"Reich Phasing Voce A (fissa, cellula={len(norm_cell)} note)"
-    voice_a.append(mido.Message('program_change', program=0, channel=ch_a, time=0))
+    voice_a.append(mido.Message('program_change', program=_generated_program(0), channel=ch_a, time=0))
 
     voice_b = mido.MidiTrack()
     voice_b.name = f"Reich Phasing Voce B (sfasa +{phase_shift_units} ogni {shift_every_n_cycles} cicli)"
-    voice_b.append(mido.Message('program_change', program=0, channel=ch_b, time=0))
+    voice_b.append(mido.Message('program_change', program=_generated_program(0), channel=ch_b, time=0))
 
     events_a, events_b = [], []
     current_phase_ticks = 0
@@ -1541,12 +1630,7 @@ def midi_reich_phasing(original_midi, cell_length_notes=8, num_cycles=32,
             current_phase_ticks += int(unit * phase_shift_units)
 
     for evs, trk in ((events_a, voice_a), (events_b, voice_b)):
-        evs.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-        last_abs_time = 0
-        for event_data in evs:
-            delta = max(0, event_data['abs_time'] - last_abs_time)
-            trk.append(event_data['msg'].copy(time=delta))
-            last_abs_time = event_data['abs_time']
+        append_events_to_track(trk, evs)
 
     new_midi.tracks.append(voice_a)
     new_midi.tracks.append(voice_b)
@@ -1556,13 +1640,14 @@ def midi_reich_phasing(original_midi, cell_length_notes=8, num_cycles=32,
 # --- Funzioni di Decomposizione ---
 
 @_preserves_meta
-def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization, preserve_drums=None):
+def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_shift_range, velocity_randomization, preserve_drums=None, seed=None):
     """
     Rimodella le note MIDI in base a una scala, tonalità e randomizzazione di pitch/velocity.
     Il pitch rimappato al note_on viene ricordato (stack per nota/canale) e riusato dal
     note_off corrispondente: nessuna nota resta appesa nella DAW anche con pitch_shift_range > 0.
     Un note_on con velocity 0 (= note_off) non viene mai trasformato in una nota vera.
     """
+    rng = _rng(seed, "note_remapper")
     preserve = _drums_preserved(preserve_drums)
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
 
@@ -1588,7 +1673,7 @@ def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_
 
             shifted_note = msg.note
             if pitch_shift_range > 0:
-                shifted_note += random.randint(-pitch_shift_range, pitch_shift_range)
+                shifted_note += rng.randint(-pitch_shift_range, pitch_shift_range)
             shifted_note = max(0, min(127, shifted_note))
 
             note_in_octave = (shifted_note - key_offset) % 12
@@ -1600,7 +1685,7 @@ def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_
             if is_on:
                 open_notes[key].append(new_note_pitch)
                 if velocity_randomization > 0:
-                    factor = 1 + random.uniform(-velocity_randomization / 100, velocity_randomization / 100)
+                    factor = 1 + rng.uniform(-velocity_randomization / 100, velocity_randomization / 100)
                     new_velocity = max(1, min(127, int(round(float(new_velocity) * factor))))
 
             new_track.append(msg.copy(note=new_note_pitch, velocity=new_velocity))
@@ -1609,8 +1694,9 @@ def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_
 
 
 @_preserves_meta
-def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_style):
+def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_style, seed=None):
     """Riorganizza le frasi MIDI."""
+    rng = _rng(seed, "phrase_reconstructor")
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
     ticks_per_phrase = original_midi.ticks_per_beat * phrase_length_beats
 
@@ -1631,6 +1717,8 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
             time_since_last_event += msg.time
             if msg.type == 'program_change' or (msg.type == 'control_change' and msg.control in (0, 32)):
                 continue  # gia' catturati in _header, verranno fissati all'inizio
+            if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
+                continue  # tempo/metrica/tonalita' non si rimescolano con le frasi: li ripristina _preserves_meta
             events_with_abs_time.append({'msg': msg, 'abs_time': time_since_last_event})
 
         for event_data in events_with_abs_time:
@@ -1657,7 +1745,7 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
         reorganized_phrases = []
         if reassembly_style == "Casuale":
             reorganized_phrases = list(phrases)
-            random.shuffle(reorganized_phrases)
+            rng.shuffle(reorganized_phrases)
         elif reassembly_style == "Inversione":
             reorganized_phrases = list(reversed(phrases))
         elif reassembly_style == "Ciclico A-B-A":
@@ -1669,7 +1757,7 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
             else:
                 st.warning(f"Troppo poche frasi ({len(phrases)}) per lo stile 'Ciclico A-B-A'. Verrà usata la riorganizzazione casuale.")
                 reorganized_phrases = list(phrases)
-                random.shuffle(reorganized_phrases)
+                rng.shuffle(reorganized_phrases)
         elif reassembly_style == "Dal Più Corto al Più Lungo":
             def get_phrase_duration_in_ticks(phrase_events_list):
                 if not phrase_events_list: return 0
@@ -1687,39 +1775,37 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
         absolute_time_in_reorganized_seq = 0
 
         for phrase_block in reorganized_phrases:
-            # Traccia note aperte in questa frase — chiudi quelle senza note_off
-            open_notes = {}  # (pitch, channel) -> abs_time di apertura
+            # Contatore delle note aperte in questa frase (per nota/canale).
+            # Una nota che inizia in una frase e finisce in quella successiva viene troncata
+            # a fine frase, e il suo note_off "orfano" (nell'altra frase) viene scartato:
+            # dopo il rimescolamento non resta nessuna nota appesa ne' nessun note_off senza note_on.
+            open_notes = defaultdict(int)  # (pitch, channel) -> note_on aperti
             phrase_abs = absolute_time_in_reorganized_seq
 
             for msg_in_phrase in phrase_block:
                 phrase_abs += msg_in_phrase.time
                 if msg_in_phrase.type == 'note_on' and msg_in_phrase.velocity > 0:
-                    open_notes[(msg_in_phrase.note, msg_in_phrase.channel)] = phrase_abs
+                    open_notes[(msg_in_phrase.note, msg_in_phrase.channel)] += 1
                 elif msg_in_phrase.type == 'note_off' or (msg_in_phrase.type == 'note_on' and msg_in_phrase.velocity == 0):
-                    open_notes.pop((msg_in_phrase.note, msg_in_phrase.channel), None)
+                    key = (msg_in_phrase.note, msg_in_phrase.channel)
+                    if open_notes[key] <= 0:
+                        continue  # note_off orfano: il suo note_on sta in un'altra frase
+                    open_notes[key] -= 1
                 flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': phrase_abs})
 
             # Chiudi note rimaste aperte alla fine della frase
             phrase_end = phrase_abs
-            for (pitch, ch) in list(open_notes.keys()):
-                flat_events_for_reconstruction.append({
-                    'msg': mido.Message('note_off', note=pitch, velocity=0, channel=ch, time=0),
-                    'abs_time': phrase_end
-                })
+            for (pitch, ch), n_open in open_notes.items():
+                for _ in range(n_open):
+                    flat_events_for_reconstruction.append({
+                        'msg': mido.Message('note_off', note=pitch, velocity=0, channel=ch, time=0),
+                        'abs_time': phrase_end
+                    })
 
             absolute_time_in_reorganized_seq = phrase_end
 
         # Ordina: note_off prima di note_on allo stesso tick
-        flat_events_for_reconstruction.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-
-        last_abs_time = 0
-        for event_data in flat_events_for_reconstruction:
-            msg = event_data['msg']
-            abs_time = event_data['abs_time']
-            delta_time = max(0, abs_time - last_abs_time)
-            new_msg = msg.copy(time=delta_time)
-            new_track.append(new_msg)
-            last_abs_time = abs_time
+        append_events_to_track(new_track, flat_events_for_reconstruction)
 
         new_midi.tracks.append(new_track)
     return new_midi
@@ -1777,13 +1863,14 @@ def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, sw
     return new_midi
 
 @_preserves_meta
-def midi_density_transformer(original_midi, add_note_probability, remove_note_probability, polyphony_mode, preserve_drums=None):
+def midi_density_transformer(original_midi, add_note_probability, remove_note_probability, polyphony_mode, preserve_drums=None, seed=None):
     """
     Aggiunge o rimuove note per alterare la densita' MIDI.
     Fix: tracce senza note vengono passate intatte.
     Fix: note aggiunte hanno durata esplicita uguale alla nota originale.
     Fix: note_off sempre dopo note_on — abs_time note_off = start + durata originale.
     """
+    rng = _rng(seed, "density")
     preserve = _drums_preserved(preserve_drums)
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
 
@@ -1797,7 +1884,7 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
             new_midi.tracks.append(original_track)
             continue
 
-        modified_notes = [note for note in notes if random.randint(0, 100) >= remove_note_probability]
+        modified_notes = [note for note in notes if rng.randint(0, 100) >= remove_note_probability]
 
         # Durata minima garantita: almeno 1 tick
         def safe_duration(note):
@@ -1807,7 +1894,7 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
         track_end_time = max(n['end'] for n in notes)
         drone_channel = _get_track_default_channel(original_track)  # il drone suona con lo strumento della traccia
 
-        if polyphony_mode == "Droni" and add_note_probability > 0 and drone_channel != DRUM_CHANNEL and random.randint(0, 100) < add_note_probability:
+        if polyphony_mode == "Droni" and add_note_probability > 0 and drone_channel != DRUM_CHANNEL and rng.randint(0, 100) < add_note_probability:
             drone_pitch = 36
             drone_velocity = 64
             final_events.append({'msg': mido.Message('note_on', note=drone_pitch, velocity=drone_velocity, channel=drone_channel, time=0), 'abs_time': 0})
@@ -1821,11 +1908,11 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
             final_events.append({'msg': mido.Message('note_on',  note=note_data['pitch'], velocity=note_data['velocity'], channel=note_data['channel'], time=0), 'abs_time': note_start})
             final_events.append({'msg': mido.Message('note_off', note=note_data['pitch'], velocity=0,                    channel=note_data['channel'], time=0), 'abs_time': note_end})
 
-            if (not (preserve and note_data['channel'] == DRUM_CHANNEL)) and random.randint(0, 100) < add_note_probability:
+            if (not (preserve and note_data['channel'] == DRUM_CHANNEL)) and rng.randint(0, 100) < add_note_probability:
                 if polyphony_mode == "Riempi Accordo (Triadi)":
                     intervals = [4, 7]
                 elif polyphony_mode == "Aggiungi Contro-Melodia":
-                    intervals = [random.choice([-5, -3, -2, 2, 3, 5])]
+                    intervals = [rng.choice([-5, -3, -2, 2, 3, 5])]
                 else:
                     intervals = []
 
@@ -1837,31 +1924,24 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
                         final_events.append({'msg': mido.Message('note_off', note=new_pitch, velocity=0,                    channel=note_data['channel'], time=0), 'abs_time': note_end})
 
         # Ordina per abs_time, note_off prima di note_on allo stesso tick (evita sovrapposizioni)
-        final_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-
         new_track = mido.MidiTrack()
         if _dens_name:
             new_track.name = _dens_name
         for _h in _dens_header:
             new_track.append(_h)
-        last_abs_time = 0
-        for event_data in final_events:
-            msg      = event_data['msg']
-            abs_time = event_data['abs_time']
-            delta    = max(0, abs_time - last_abs_time)
-            new_track.append(msg.copy(time=delta))
-            last_abs_time = abs_time
+        append_events_to_track(new_track, final_events)
 
         new_midi.tracks.append(new_track)
     return new_midi
 
 @_preserves_meta
-def midi_random_pitch_transformer(original_midi, random_pitch_strength, preserve_drums=None):
+def midi_random_pitch_transformer(original_midi, random_pitch_strength, preserve_drums=None, seed=None):
     """
     Randomizes the pitch of notes based on a given strength (probability).
     Usa (pitch, channel) come chiave e un contatore per gestire note duplicate
     sullo stesso pitch/canale — nessuna nota resta aperta nel DAW.
     """
+    rng = _rng(seed, "random_pitch")
     preserve = _drums_preserved(preserve_drums)
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
 
@@ -1881,8 +1961,8 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength, preserve
 
             if msg.type == 'note_on' and msg.velocity > 0:
                 key = (msg.note, msg.channel)
-                if random.randint(0, 100) < random_pitch_strength:
-                    new_pitch = random.randint(0, 127)
+                if rng.randint(0, 100) < random_pitch_strength:
+                    new_pitch = rng.randint(0, 127)
                 else:
                     new_pitch = msg.note
                 pitch_map[key].append(new_pitch)
@@ -1910,10 +1990,11 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength, preserve
 
 
 @_preserves_meta
-def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rhythmic_pattern_style):
+def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rhythmic_pattern_style, seed=None):
     """
     Aggiunge una o più tracce con una base ritmica che dura esattamente quanto il brano originale.
     """
+    rng = _rng(seed, "rhythmic_base")
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
     for track in original_midi.tracks:
         new_midi.tracks.append(track)
@@ -1979,9 +2060,9 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
         for i in range(total_subdivisions_in_measure):
             start_tick = i * ticks_per_subdivision
             duration = ticks_per_subdivision // 2 
-            if kick and random.random() < kick_prob: rhythmic_patterns_in_measure["kick"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': random.randint(80, 110)})
-            if snare and random.random() < snare_prob: rhythmic_patterns_in_measure["snare"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': random.randint(80, 110)})
-            if hihat and random.random() < hihat_prob: rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': random.randint(60, 90)})
+            if kick and rng.random() < kick_prob: rhythmic_patterns_in_measure["kick"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': rng.randint(80, 110)})
+            if snare and rng.random() < snare_prob: rhythmic_patterns_in_measure["snare"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': rng.randint(80, 110)})
+            if hihat and rng.random() < hihat_prob: rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': rng.randint(60, 90)})
 
     elif rhythmic_pattern_style == "Pattern Adattivo":
         note_on_counts = defaultdict(int)
@@ -2018,7 +2099,7 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
             if hihat:
                 ticks_per_eighth = ticks_per_beat // 2
                 for i in range(int(ticks_per_measure / ticks_per_eighth)):
-                    rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': i * ticks_per_eighth, 'duration_ticks': ticks_per_eighth // 2, 'velocity': random.randint(60, 90)})
+                    rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': i * ticks_per_eighth, 'duration_ticks': ticks_per_eighth // 2, 'velocity': rng.randint(60, 90)})
         else:
             st.warning("Nessuna nota trovata per un pattern adattivo. Verrà usato un pattern fisso.")
             if kick: rhythmic_patterns_in_measure["kick"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
@@ -2170,7 +2251,7 @@ def _split_type0_to_tracks(midi):
 
 
 @_preserves_meta
-def midi_recomposer(original_midi, style, preserve_drums=None):
+def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
     """
     Ricompone TRACCIA PER TRACCIA il MIDI originale.
     Se il file è tipo 0 (1 traccia, N canali) lo esplode prima in N tracce.
@@ -2181,6 +2262,7 @@ def midi_recomposer(original_midi, style, preserve_drums=None):
          usando solo le note di quella traccia come vocabolario
     Output: stesso numero di tracce/canali dell'originale — brano irriconoscibile.
     """
+    rng = _rng(seed, "recomposer")
     preserve = _drums_preserved(preserve_drums)
     from collections import Counter
 
@@ -2254,13 +2336,13 @@ def midi_recomposer(original_midi, style, preserve_drums=None):
 
         def pick_pitch(base=None):
             if base is None or cfg["pitch_step"] == 0:
-                return random.choice(weighted_pool)
-            direction = random.choice([-1, 1])
+                return rng.choice(weighted_pool)
+            direction = rng.choice([-1, 1])
             candidate = base + direction * cfg["pitch_step"]
             return min(weighted_pool, key=lambda p: abs(p - candidate))
 
         def pick_vel():
-            v = random.randint(vel_min, vel_max)
+            v = rng.randint(vel_min, vel_max)
             return max(1, min(127, int(v * cfg["vel_factor"])))
 
         new_track = mido.MidiTrack()
@@ -2270,14 +2352,14 @@ def midi_recomposer(original_midi, style, preserve_drums=None):
 
         events = []
         current_tick = 0
-        last_pitch = random.choice(weighted_pool)
+        last_pitch = rng.choice(weighted_pool)
 
         while current_tick < total_ticks:
             pitch = pick_pitch(last_pitch)
             pitch = max(0, min(127, pitch))
             vel   = pick_vel()
-            dur   = random.randint(*cfg["note_dur_range"])
-            gap   = random.randint(*cfg["gap_range"])
+            dur   = rng.randint(*cfg["note_dur_range"])
+            gap   = rng.randint(*cfg["gap_range"])
 
             # Per elettronico: snappa sulla griglia
             if style == "elettronico":
@@ -2390,149 +2472,219 @@ if 'midi_report'  not in st.session_state: st.session_state.midi_report  = ""
 if 'midi_filename' not in st.session_state: st.session_state.midi_filename = ""
 
 # --- Funzione Report ---
-def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, stile=None):
-    n_tracks_in  = len(original_midi.tracks)
-    n_tracks_out = len(output_midi.tracks)
-    duration     = round(original_midi.length, 2)
-    tpb          = original_midi.ticks_per_beat
+_METHOD_LABELS_EN = {
+    "MIDI Note Remapper": "🎶 Note Remapping (Vertical)",
+    "MIDI Phrase Reconstructor": "🔄 Phrase Reorganization (Horizontal)",
+    "MIDI Time Scrambler": "⏳ Rhythm/Duration Manipulation (Horizontal)",
+    "MIDI Density Transformer": "🎲 Density Control (Harmony/Counterpoint)",
+    "MIDI Random Pitch Transformer": "❓ Total Pitch Randomization (Chaos)",
+    "MIDI Rhythmic Base": "🥁 Add Rhythmic Base",
+    "MIDI Recomposer": "🔁 Recomposition (new piece from the original material)",
+    "MIDI Boulez Multiplication": "🔷 Pierre Boulez — Chord Multiplication",
+    "MIDI Xenakis Stochastic": "☁️ Iannis Xenakis — Stochastic Music (Clouds)",
+    "MIDI Cage Chance": "☯️ John Cage — Chance Operations (I Ching)",
+    "MIDI Eno Generative": "🌫️ Brian Eno — Generative Music (Asynchronous Loops)",
+    "MIDI Bach Canon": "🎻 Johann Sebastian Bach — Strict Canon",
+    "MIDI Glass Additive": "➕ Philip Glass — Additive Process",
+    "MIDI Messiaen Modes": "🕊️ Olivier Messiaen — Modes of Limited Transposition",
+}
 
-    method_lines = []
-    for i, method_key in enumerate(selected_methods):
-        params = parameters.get(method_key, [])
-        label  = midi_methods[method_key]
-        method_lines.append(f"{i+1}. {label}")
 
-        if method_key == "MIDI Note Remapper":
-            method_lines.append(f"   * Scala: {params[0]} | Tonalita': {params[1]}")
-            method_lines.append(f"   * Pitch Shift: +/-{params[2]} semitoni | Velocity: {params[3]}%")
-
-        elif method_key == "MIDI Phrase Reconstructor":
-            method_lines.append(f"   * Lunghezza frase: {params[0]} battute | Stile: {params[1]}")
-
-        elif method_key == "MIDI Time Scrambler":
-            method_lines.append(f"   * Stretch: {params[0]}x | Quantizzazione: {params[1]}% | Swing: {params[2]}%")
-
-        elif method_key == "MIDI Density Transformer":
-            method_lines.append(f"   * Aggiungi note: {params[0]}% | Rimuovi note: {params[1]}% | Polifonia: {params[2]}")
-
-        elif method_key == "MIDI Random Pitch Transformer":
-            method_lines.append(f"   * Forza randomizzazione: {params[0]}%")
-
-        elif method_key == "MIDI Rhythmic Base":
-            drums = []
-            if params[0]: drums.append("Cassa")
-            if params[1]: drums.append("Rullante")
-            if params[2]: drums.append("Hi-hat")
-            method_lines.append(f"   * Elementi: {', '.join(drums) if drums else 'Nessuno'}")
-            method_lines.append(f"   * Metrica: {params[3]} | Pattern: {params[4]}")
-
-        elif method_key == "MIDI Costas Sequencer":
-            costas_mode = params[0]
-            method_lines.append(f"   * Modalità: {costas_mode} | Ordine richiesto: {params[1]}")
-            if costas_mode == "Permutazione Pitch (Cromatica)":
-                method_lines.append(f"   * Trasposizione: {params[2]} ottave | Costruzione di Welch, n=12, p=13")
-            elif costas_mode == "Griglia Ritmica Costas":
-                method_lines.append("   * Costruzione di Welch (Scott Rickard / J.P. Costas)")
+def _describe_method(lang, key, p):
+    """Righe di report (lang 'it' o 'en') con i parametri usati da un metodo."""
+    def L(a, b):
+        return a if lang == "it" else b
+    yes, no = L("Sì", "Yes"), "No"
+    out = []
+    try:
+        if key == "MIDI Note Remapper":
+            out.append(L(f"   * Scala: {p[0]} | Tonalita': {p[1]}", f"   * Scale: {p[0]} | Key: {p[1]}"))
+            out.append(L(f"   * Pitch Shift: +/-{p[2]} semitoni | Velocity: {p[3]}%", f"   * Pitch shift: +/-{p[2]} semitones | Velocity: {p[3]}%"))
+        elif key == "MIDI Phrase Reconstructor":
+            out.append(L(f"   * Lunghezza frase: {p[0]} beat | Stile: {p[1]}", f"   * Phrase length: {p[0]} beats | Style: {p[1]}"))
+        elif key == "MIDI Time Scrambler":
+            out.append(L(f"   * Stretch: {p[0]}x | Quantizzazione: {p[1]}% | Swing: {p[2]}%", f"   * Stretch: {p[0]}x | Quantization: {p[1]}% | Swing: {p[2]}%"))
+        elif key == "MIDI Density Transformer":
+            out.append(L(f"   * Aggiungi note: {p[0]}% | Rimuovi note: {p[1]}% | Polifonia: {p[2]}", f"   * Add notes: {p[0]}% | Remove notes: {p[1]}% | Polyphony: {p[2]}"))
+        elif key == "MIDI Random Pitch Transformer":
+            out.append(L(f"   * Forza randomizzazione: {p[0]}%", f"   * Randomization strength: {p[0]}%"))
+        elif key == "MIDI Rhythmic Base":
+            names_it = [n for flag, n in zip(p[:3], ("Cassa", "Rullante", "Hi-hat")) if flag]
+            names_en = [n for flag, n in zip(p[:3], ("Kick", "Snare", "Hi-hat")) if flag]
+            out.append(L(f"   * Elementi: {', '.join(names_it) if names_it else 'Nessuno'}", f"   * Elements: {', '.join(names_en) if names_en else 'None'}"))
+            out.append(L(f"   * Metrica: {p[3]} | Pattern: {p[4]}", f"   * Meter: {p[3]} | Pattern: {p[4]}"))
+        elif key == "MIDI Recomposer":
+            out.append(L(f"   * Stile di ricomposizione: {p[0]}", f"   * Recomposition style: {p[0]}"))
+        elif key == "MIDI Costas Sequencer":
+            mode = p[0]
+            out.append(L(f"   * Modalità: {mode} | Ordine richiesto: {p[1]}", f"   * Mode: {mode} | Requested order: {p[1]}"))
+            if mode == "Permutazione Pitch (Cromatica)":
+                out.append(L(f"   * Trasposizione: {p[2]} ottave | Costruzione di Welch, n=12, p=13", f"   * Transposition: {p[2]} octaves | Welch construction, n=12, p=13"))
+            elif mode == "Griglia Ritmica Costas":
+                out.append(L("   * Costruzione di Welch (Scott Rickard / J.P. Costas)", "   * Welch construction (Scott Rickard / J.P. Costas)"))
             else:
-                method_lines.append(f"   * Pitch base: {params[2]} | Estensione: {params[3]} semitoni | Passo: {params[4]} beat")
+                out.append(L(f"   * Pitch base: {p[2]} | Estensione: {p[3]} semitoni | Passo: {p[4]} beat", f"   * Base pitch: {p[2]} | Range: {p[3]} semitones | Step: {p[4]} beats"))
+        elif key == "MIDI Stockhausen Punktuelle":
+            dur_on, dyn_on, timbre_on, iso_on, row_used = p
+            out.append(L(f"   * Fila dodecafonica: {row_used}", f"   * Twelve-tone row: {row_used}"))
+            fl_it = [n for f, n in ((dur_on, "Durata"), (dyn_on, "Dinamica"), (timbre_on, "Timbro")) if f]
+            fl_en = [n for f, n in ((dur_on, "Duration"), (dyn_on, "Dynamics"), (timbre_on, "Timbre")) if f]
+            out.append(L(f"   * Parametri serializzati: Altezza (P), {', '.join(fl_it) if fl_it else 'solo Altezza'}", f"   * Serialized parameters: Pitch (P), {', '.join(fl_en) if fl_en else 'pitch only'}"))
+            out.append(L(f"   * Isolamento punti (staccato): {yes if iso_on else no}", f"   * Point isolation (staccato): {yes if iso_on else no}"))
+            out.append(L("   * Serialismo integrale (Stockhausen/Boulez, rad. Messiaen 'Mode de valeurs')", "   * Integral serialism (Stockhausen/Boulez, after Messiaen 'Mode de valeurs')"))
+        elif key == "MIDI Boulez Multiplication":
+            set_size, chord_density, register_spread, set_a, set_b = p
+            out.append(L(f"   * Dimensione insiemi A/B: {set_size} | Densità accordo: {'completa' if not chord_density else chord_density} | Ottave: {register_spread}",
+                         f"   * Set size A/B: {set_size} | Chord density: {'full' if not chord_density else chord_density} | Octaves: {register_spread}"))
+            out.append(L(f"   * Insieme A: {set_a} | Insieme B: {set_b}", f"   * Set A: {set_a} | Set B: {set_b}"))
+            out.append(L("   * Moltiplicazione d'accordi (Boulez, 'Le Marteau sans maître' / Structures II)", "   * Chord multiplication (Boulez, 'Le Marteau sans maître' / Structures II)"))
+        elif key == "MIDI Xenakis Stochastic":
+            sieve_str, mean_ev, pc, ps, dm, vm, vs = p
+            out.append(L(f"   * Crivello (sieve): {sieve_str} | Tasso eventi: {mean_ev}/beat (processo di Poisson)", f"   * Sieve: {sieve_str} | Event rate: {mean_ev}/beat (Poisson process)"))
+            out.append(L(f"   * Altezza: Gauss(μ={pc}, σ={ps}) | Durata: Exp(μ={dm} beat) | Dinamica: Gauss(μ={vm}, σ={vs})",
+                         f"   * Pitch: Gauss(μ={pc}, σ={ps}) | Duration: Exp(μ={dm} beats) | Dynamics: Gauss(μ={vm}, σ={vs})"))
+            out.append(L("   * Musica stocastica (Xenakis, Pithoprakta/Achorripsis, 1955-57)", "   * Stochastic music (Xenakis, Pithoprakta/Achorripsis, 1955-57)"))
+        elif key == "MIDI Cage Chance":
+            silence_p, dur_var = p
+            out.append(L(f"   * Probabilità di silenzio per evento: {silence_p:.0%} | Varietà durata: {yes if dur_var else no}", f"   * Silence probability per event: {silence_p:.0%} | Duration variety: {yes if dur_var else no}"))
+            out.append(L("   * Operazioni di caso via I Ching, metodo delle tre monete (Cage, 'Music of Changes', 1951)", "   * Chance operations via I Ching, three-coin method (Cage, 'Music of Changes', 1951)"))
+        elif key == "MIDI Eno Generative":
+            n_loops, min_lb, max_lb, nlr, dm, vb = p
+            out.append(L(f"   * Numero loop: {n_loops} | Lunghezza: {min_lb}-{max_lb} beat | Estensione durata: ×{dm}", f"   * Loops: {n_loops} | Length: {min_lb}-{max_lb} beats | Duration stretch: ×{dm}"))
+            out.append(L(f"   * Rapporto durata nota/loop: {nlr} | Velocity base: {vb}", f"   * Note/loop duration ratio: {nlr} | Base velocity: {vb}"))
+            out.append(L("   * Loop asincroni a lunghezze incommensurabili (Eno, 'Music for Airports'/'Discreet Music')", "   * Asynchronous loops of incommensurable lengths (Eno, 'Music for Airports'/'Discreet Music')"))
+        elif key == "MIDI Bach Canon":
+            n_v, interval, delay, transf = p
+            out.append(L(f"   * Voci: {n_v} | Intervallo tra voci: {interval} semitoni | Ritardo (comes): {delay} beat", f"   * Voices: {n_v} | Interval between voices: {interval} semitones | Delay (comes): {delay} beats"))
+            out.append(L(f"   * Trasformazione: {transf}", f"   * Transformation: {transf}"))
+            out.append(L("   * Canone rigoroso (Bach, Arte della Fuga / Offerta Musicale)", "   * Strict canon (Bach, Art of Fugue / Musical Offering)"))
+        elif key == "MIDI Glass Additive":
+            cell_len, direction, repeats = p
+            out.append(L(f"   * Lunghezza cellula: {cell_len} note | Direzione: {direction} | Ripetizioni per stadio: {repeats}", f"   * Cell length: {cell_len} notes | Direction: {direction} | Repetitions per stage: {repeats}"))
+            out.append(L("   * Processo additivo (Glass, 'Two Pages'/'1+1'/'Music in Twelve Parts')", "   * Additive process (Glass, 'Two Pages'/'1+1'/'Music in Twelve Parts')"))
+        elif key == "MIDI Messiaen Modes":
+            mode_n, transp, nrr, cell_notes = p
+            out.append(L(f"   * Modo a trasposizione limitata: Modo {mode_n} | Trasposizione: +{transp} semitoni", f"   * Mode of limited transposition: Mode {mode_n} | Transposition: +{transp} semitones"))
+            out.append(L(f"   * Ritmo non retrogradabile: {yes if nrr else no} (cellula: {cell_notes} valori)", f"   * Non-retrogradable rhythm: {yes if nrr else no} (cell: {cell_notes} values)"))
+            out.append(L("   * Modi a trasposizione limitata (Messiaen, 'Technique de mon langage musical', 1944)", "   * Modes of limited transposition (Messiaen, 'Technique de mon langage musical', 1944)"))
+        elif key == "MIDI Part Tintinnabuli":
+            tonic, triad, position = p
+            out.append(L(f"   * Tonica: {tonic} {triad} | Posizione voce T: {position}", f"   * Tonic: {tonic} {triad} | T-voice position: {position}"))
+            out.append(L("   * Tintinnabuli (Pärt, dal 1976: 'Spiegel im Spiegel', 'Für Alina')", "   * Tintinnabuli (Pärt, since 1976: 'Spiegel im Spiegel', 'Für Alina')"))
+        elif key == "MIDI Reich Phasing":
+            cell_len, cycles, shift_units, shift_every = p
+            out.append(L(f"   * Lunghezza cellula: {cell_len} note | Cicli: {cycles}", f"   * Cell length: {cell_len} notes | Cycles: {cycles}"))
+            out.append(L(f"   * Sfasamento: +{shift_units} unità ogni {shift_every} cicli", f"   * Phase shift: +{shift_units} units every {shift_every} cycles"))
+            out.append(L("   * Phasing processuale (Reich, 'Piano Phase'/'Clapping Music')", "   * Process phasing (Reich, 'Piano Phase'/'Clapping Music')"))
+    except (IndexError, ValueError, TypeError):
+        out.append(L("   * (parametri non disponibili)", "   * (parameters unavailable)"))
+    return out
 
-        elif method_key == "MIDI Stockhausen Punktuelle":
-            dur_on, dyn_on, timbre_on, iso_on, row_used = params
-            method_lines.append(f"   * Fila dodecafonica: {row_used}")
-            flags = []
-            if dur_on: flags.append("Durata")
-            if dyn_on: flags.append("Dinamica")
-            if timbre_on: flags.append("Timbro")
-            method_lines.append(f"   * Parametri serializzati: Altezza (P), {', '.join(flags) if flags else 'solo Altezza'}")
-            method_lines.append(f"   * Isolamento punti (staccato): {'Sì' if iso_on else 'No'}")
-            method_lines.append("   * Serialismo integrale (Stockhausen/Boulez, rad. Messiaen 'Mode de valeurs')")
 
-        elif method_key == "MIDI Boulez Multiplication":
-            set_size, chord_density, register_spread, set_a, set_b = params
-            method_lines.append(f"   * Dimensione insiemi A/B: {set_size} | Densità accordo: {'completa' if not chord_density else chord_density} | Ottave: {register_spread}")
-            method_lines.append(f"   * Insieme A: {set_a} | Insieme B: {set_b}")
-            method_lines.append("   * Moltiplicazione d'accordi (Boulez, 'Le Marteau sans maître' / Structures II)")
+def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, stile=None):
+    """Report bilingue IT/EN in formato '::' (protocollo Loop507). `parameters` puo' essere un dict
+    {metodo: parametri} oppure una lista allineata a selected_methods (serve per le catene con metodi ripetuti)."""
+    val = validate_midi_output(original_midi, output_midi)
+    tpb = original_midi.ticks_per_beat
+    dur = lambda d: f"{d:.2f}" if d is not None else "n/a"
+    gm_label = _generated_program_label()
 
-        elif method_key == "MIDI Xenakis Stochastic":
-            sieve_str, mean_ev, pc, ps, dm, vm, vs = params
-            method_lines.append(f"   * Crivello (sieve): {sieve_str} | Tasso eventi: {mean_ev}/beat (processo di Poisson)")
-            method_lines.append(f"   * Altezza: Gauss(μ={pc}, σ={ps}) | Durata: Exp(μ={dm} beat) | Dinamica: Gauss(μ={vm}, σ={vs})")
-            method_lines.append("   * Musica stocastica (Xenakis, Pithoprakta/Achorripsis, 1955-57)")
+    def methods_block(lang):
+        lines = []
+        for i, key in enumerate(selected_methods):
+            p = parameters.get(key, []) if isinstance(parameters, dict) else parameters[i]
+            label = midi_methods.get(key, key)
+            if lang == "en":
+                label = _METHOD_LABELS_EN.get(key, label)
+            lines.append(f"{i+1}. {label}")
+            lines.extend(_describe_method(lang, key, p))
+        return "\n".join(lines)
 
-        elif method_key == "MIDI Cage Chance":
-            silence_p, dur_var = params
-            method_lines.append(f"   * Probabilità di silenzio per evento: {silence_p:.0%} | Varietà durata: {'Sì' if dur_var else 'No'}")
-            method_lines.append("   * Operazioni di caso via I Ching, metodo delle tre monete (Cage, 'Music of Changes', 1951)")
+    status_it = "OK" if val['ok'] else "ATTENZIONE: note non bilanciate o tempo/metrica persi"
+    status_en = "OK" if val['ok'] else "WARNING: unbalanced notes or tempo/meter lost"
+    yn_it = "sì" if val['meta_ok'] else "NO"
+    yn_en = "yes" if val['meta_ok'] else "NO"
 
-        elif method_key == "MIDI Eno Generative":
-            num_loops_r, min_lb, max_lb, nlr, dm, vb = params
-            method_lines.append(f"   * Numero loop: {num_loops_r} | Lunghezza: {min_lb}-{max_lb} beat | Estensione durata: ×{dm}")
-            method_lines.append(f"   * Rapporto durata nota/loop: {nlr} | Velocity base: {vb}")
-            method_lines.append("   * Loop asincroni a lunghezze incommensurabili (Eno, 'Music for Airports'/'Discreet Music')")
-
-        elif method_key == "MIDI Bach Canon":
-            num_voices_r, interval_r, delay_r, transf_r = params
-            method_lines.append(f"   * Voci: {num_voices_r} | Intervallo tra voci: {interval_r} semitoni | Ritardo (comes): {delay_r} beat")
-            method_lines.append(f"   * Trasformazione: {transf_r}")
-            method_lines.append("   * Canone rigoroso (Bach, Arte della Fuga / Offerta Musicale)")
-
-        elif method_key == "MIDI Glass Additive":
-            cell_len_r, direction_r, repeats_r = params
-            method_lines.append(f"   * Lunghezza cellula: {cell_len_r} note | Direzione: {direction_r} | Ripetizioni per stadio: {repeats_r}")
-            method_lines.append("   * Processo additivo (Glass, 'Two Pages'/'1+1'/'Music in Twelve Parts')")
-
-        elif method_key == "MIDI Messiaen Modes":
-            mode_r, transp_r, nrr_r, cell_notes_r = params
-            method_lines.append(f"   * Modo a trasposizione limitata: Modo {mode_r} | Trasposizione: +{transp_r} semitoni")
-            method_lines.append(f"   * Ritmo non retrogradabile: {'Sì' if nrr_r else 'No'} (cellula: {cell_notes_r} valori)")
-            method_lines.append("   * Modi a trasposizione limitata (Messiaen, 'Technique de mon langage musical', 1944)")
-
-        elif method_key == "MIDI Part Tintinnabuli":
-            tonic_r, triad_r, position_r = params
-            method_lines.append(f"   * Tonica: {tonic_r} {triad_r} | Posizione voce T: {position_r}")
-            method_lines.append("   * Tintinnabuli (Pärt, dal 1976: 'Spiegel im Spiegel', 'Für Alina')")
-
-        elif method_key == "MIDI Reich Phasing":
-            cell_len_r, cycles_r, shift_units_r, shift_every_r = params
-            method_lines.append(f"   * Lunghezza cellula: {cell_len_r} note | Cicli: {cycles_r}")
-            method_lines.append(f"   * Sfasamento: +{shift_units_r} unità ogni {shift_every_r} cicli")
-            method_lines.append("   * Phasing processuale (Reich, 'Piano Phase'/'Clapping Music')")
-
-    report = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
-    report += ":: MOTORE: midi_decomposer [v1.0]\n"
-    report += f":: FILE: {original_file}\n"
+    r = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
+    r += ":: MOTORE / ENGINE: midi_decomposer [v1.1]\n"
+    r += f":: FILE: {original_file}\n"
     if stile:
-        report += f":: STILE: {stile}\n"
-    report += f":: TRACCE: {n_tracks_in} | DURATA: {duration} sec | TICKS/BEAT: {tpb}\n"
-    report += "\n"
-    report += "\"Il file e' entrato come partitura. E' uscito come esperimento.\"\n"
-    report += "\n"
-    report += "> METODI APPLICATI (in ordine):\n"
-    report += "\n".join(method_lines) + "\n"
-    report += "\n"
-    report += "> TECHNICAL LOG SHEET:\n"
-    report += f"* Tracce originali: {n_tracks_in} -> Tracce output: {n_tracks_out}\n"
-    report += f"* Metodi applicati: {len(selected_methods)}\n"
-    report += "\n"
-    report += "> Regia e Algoritmo: Loop507\n"
-    report += "\n"
-    report += "#loop507 #mididecomposer #generativemusic #midiprocessing\n"
-    report += "#structuraldecomposition #algorithmicmusic #experimentalmusic"
-    return report
+        r += f":: STILE / STYLE: {stile}\n"
+    r += f":: TRACCE / TRACKS: {val['tracks_in']} | DURATA / DURATION: {dur(val['duration_in'])} sec | TICKS/BEAT: {tpb}\n"
+    r += f":: SEED: {_current_run_seed()} | BATTERIA / DRUMS: {'preservata / preserved' if _drums_preserved() else 'non preservata / not preserved'}\n"
+    if gm_label:
+        r += f":: STRUMENTO TRACCE GENERATE / GENERATED-TRACK INSTRUMENT: {gm_label}\n"
+    r += "\n====[ IT ]====\n"
+    r += "\"Il file e' entrato come partitura. E' uscito come esperimento.\"\n\n"
+    r += "> METODI APPLICATI (in ordine):\n" + methods_block("it") + "\n\n"
+    r += "> VALIDAZIONE:\n"
+    r += f"* Note: {val['notes_in']} -> {val['notes_out']} | Durata: {dur(val['duration_in'])} -> {dur(val['duration_out'])} sec\n"
+    r += f"* Note non bilanciate: {val['unbalanced']} | Tempo/metrica preservati: {yn_it}\n"
+    r += f"* Esito: {status_it}\n\n"
+    r += "> TECHNICAL LOG SHEET:\n"
+    r += f"* Tracce originali: {val['tracks_in']} -> Tracce output: {val['tracks_out']}\n"
+    r += f"* Metodi applicati: {len(selected_methods)}\n\n"
+    r += "> Regia e Algoritmo: Loop507\n"
+    r += "\n====[ EN ]====\n"
+    r += "\"The file came in as a score. It came out as an experiment.\"\n\n"
+    r += "> APPLIED METHODS (in order):\n" + methods_block("en") + "\n\n"
+    r += "> VALIDATION:\n"
+    r += f"* Notes: {val['notes_in']} -> {val['notes_out']} | Duration: {dur(val['duration_in'])} -> {dur(val['duration_out'])} sec\n"
+    r += f"* Unbalanced notes: {val['unbalanced']} | Tempo/meter preserved: {yn_en}\n"
+    r += f"* Result: {status_en}\n\n"
+    r += "> TECHNICAL LOG SHEET:\n"
+    r += f"* Original tracks: {val['tracks_in']} -> Output tracks: {val['tracks_out']}\n"
+    r += f"* Methods applied: {len(selected_methods)}\n\n"
+    r += "> Direction & Algorithm: Loop507\n\n"
+    r += "#loop507 #mididecomposer #generativemusic #midiprocessing\n"
+    r += "#structuraldecomposition #algorithmicmusic #experimentalmusic"
+    return r
+
+
+def finalize_result(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, suffix, stile=None, chain=False):
+    """Salva il risultato in session_state (bytes, nome file, report) per il download persistente.
+    Unico punto di uscita per tutti i pulsanti dell'app. Con chain=True il passo viene accodato alla
+    cronologia dei passi precedenti (stesso file di partenza): il report elenca l'intera catena."""
+    methods = list(selected_methods)
+    plist = [parameters.get(k, ()) for k in methods] if isinstance(parameters, dict) else list(parameters)
+    history = []
+    if chain and st.session_state.get('chain_source') == original_file:
+        history = list(st.session_state.get('chain_history', []))
+    for k, p in zip(methods, plist):
+        history.append({'method': k, 'params': p, 'suffix': suffix, 'stile': stile})
+    suffixes = list(dict.fromkeys(h['suffix'] for h in history))
+    stiles = list(dict.fromkeys(h['stile'] for h in history if h['stile']))
+
+    buf = io.BytesIO()
+    output_midi.save(file=buf)
+    base_name = os.path.splitext(os.path.basename(original_file))[0]
+    st.session_state.midi_bytes    = buf.getvalue()
+    st.session_state.midi_filename = f"{base_name}_{'_'.join(suffixes)}.mid"
+    st.session_state.midi_report   = build_report(
+        original_file, original_midi, output_midi,
+        [h['method'] for h in history], [h['params'] for h in history], midi_methods,
+        stile=" → ".join(stiles) if stiles else None
+    )
+    st.session_state.midi_ready    = True
+    st.session_state.chain_history = history
+    st.session_state.chain_source  = original_file
+    if not validate_midi_output(original_midi, output_midi)['ok']:
+        st.warning("⚠️ Il risultato contiene note non bilanciate o ha perso tempo/metrica: vedi la sezione VALIDAZIONE del report.")
+
 
 # --- Player MIDI in-browser (web component html-midi-player, no dipendenze server) ---
-def render_midi_player(midi_bytes, label, key_suffix=""):
-    """
-    Incorpora un lettore/visualizzatore MIDI direttamente nel browser dell'utente,
-    usando la libreria 'html-midi-player' (Tone.js + soundfont via CDN).
-    Nessuna sintesi lato server: funziona anche su Streamlit Cloud.
-    """
+def _player_html(midi_bytes, label, key_suffix=""):
+    """HTML del player. Se la libreria (CDN) non carica entro 5 secondi mostra un avviso invece di un riquadro vuoto."""
     b64_midi = base64.b64encode(midi_bytes).decode("utf-8")
     data_uri = f"data:audio/midi;base64,{b64_midi}"
-    html_code = f"""
+    return f"""
     <script src="https://cdn.jsdelivr.net/combine/npm/tone@14.7.58,npm/@magenta/music@1.23.1/es6/core.js,npm/focus-visible@5,npm/html-midi-player@1.5.0"></script>
     <div style="background:#111;border-radius:8px;padding:12px;font-family:sans-serif;">
         <p style="color:#ddd;margin:0 0 8px 0;font-size:14px;">🎧 {label}</p>
+        <div id="midi-fallback-{key_suffix}" style="display:none;color:#f5b041;font-size:13px;margin-bottom:8px;">
+            ⚠️ Anteprima non disponibile (libreria del player non raggiungibile: rete bloccata o CDN offline).
+            Il file e' comunque corretto: scaricalo e aprilo in una DAW.
+        </div>
         <midi-player
             src="{data_uri}"
             sound-font
@@ -2546,8 +2698,24 @@ def render_midi_player(midi_bytes, label, key_suffix=""):
             style="width:100%;display:block;margin-top:8px;">
         </midi-visualizer>
     </div>
+    <script>
+        setTimeout(function () {{
+            if (!window.customElements || !customElements.get('midi-player')) {{
+                var f = document.getElementById('midi-fallback-{key_suffix}');
+                if (f) f.style.display = 'block';
+            }}
+        }}, 5000);
+    </script>
     """
-    components.html(html_code, height=260, scrolling=False)
+
+
+def render_midi_player(midi_bytes, label, key_suffix=""):
+    """
+    Incorpora un lettore/visualizzatore MIDI direttamente nel browser dell'utente,
+    usando la libreria 'html-midi-player' (Tone.js + soundfont via CDN).
+    Nessuna sintesi lato server: funziona anche su Streamlit Cloud.
+    """
+    components.html(_player_html(midi_bytes, label, key_suffix), height=260, scrolling=False)
 
 # --- Sezione Upload File MIDI ---
 st.subheader("🎵 Carica il tuo file MIDI (.mid o .midi)")
@@ -2563,6 +2731,10 @@ if uploaded_midi_file is not None:
 
     try:
         midi_data = mido.MidiFile(file=uploaded_midi_file)
+        midi_data, _was_split = normalize_midi(midi_data)
+        if _was_split:
+            st.info(f"ℹ️ File MIDI di tipo 0 (una sola traccia con più canali): diviso automaticamente in "
+                    f"{len(midi_data.tracks)} tracce (una per canale), così tutti i metodi lavorano per strumento.")
         st.subheader("File MIDI Caricato: Panoramica")
         st.write(f"Nome file: **{uploaded_midi_file.name}**")
         st.write(f"Numero di tracce: **{len(midi_data.tracks)}**")
@@ -2575,6 +2747,18 @@ if uploaded_midi_file is not None:
 
         st.markdown("---")
         st.subheader("⚙️ Modalita' di Decomposizione")
+        _gs_col1, _gs_col2 = st.columns([1, 2])
+        with _gs_col1:
+            _global_seed_input = st.text_input(
+                "🎲 Seed globale (opzionale)", value="", key="global_seed",
+                help="Stesso file + stessi parametri + stesso seed = stesso risultato. "
+                     "Se vuoto ne viene scelto uno casuale, riportato nel report (riga ':: SEED'). "
+                     "Il seed specifico di un compositore, se compilato, ha la precedenza.",
+            )
+        _gs_value = _global_seed_input.strip()
+        st.session_state["_run_seed"] = int(_gs_value) if _gs_value.isdigit() else random.SystemRandom().randrange(2 ** 31)
+        with _gs_col2:
+            st.caption(f"Seed di questa esecuzione: **{st.session_state['_run_seed']}**")
         st.checkbox(
             "🥁 Preserva la batteria (canale MIDI 10)",
             value=True,
@@ -2708,17 +2892,12 @@ if uploaded_midi_file is not None:
             if st.button("🔁 Ricomponi", type="primary", use_container_width=True, key="btn_recomponi"):
                 with st.spinner("Ricomponendo traccia per traccia..."):
                     recomposed = midi_recomposer(midi_data, style_key)
-                    midi_out_bytes = io.BytesIO()
-                    recomposed.save(file=midi_out_bytes)
-                    midi_out_bytes.seek(0)
-                    st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                    st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Recomposed.mid"
-                    st.session_state.midi_report   = build_report(
+                    finalize_result(
                         uploaded_midi_file.name, midi_data, recomposed,
                         ["MIDI Recomposer"], {"MIDI Recomposer": (style_key,)},
-                        midi_methods, stile=style_label
+                        midi_methods, stile=style_label,
+                        suffix="Recomposed"
                     )
-                    st.session_state.midi_ready = True
                     st.success(
                         f"✅ Ricomposizione completata! "
                         f"{len(midi_data.tracks)} tracce originali → "
@@ -2733,6 +2912,34 @@ if uploaded_midi_file is not None:
             )
             compositore_label = st.selectbox("Scegli compositore/tecnica:", list(COMPOSITORI.keys()), key="compositore_select")
             compositore_key = COMPOSITORI[compositore_label]
+
+            _chain_available = bool(
+                st.session_state.midi_ready and st.session_state.midi_bytes
+                and st.session_state.get('chain_source') == uploaded_midi_file.name
+            )
+            _cc1, _cc2 = st.columns(2)
+            with _cc1:
+                _chain_checked = st.checkbox(
+                    "🔗 Concatena sul risultato precedente", value=False, key="chain_composers",
+                    help="Applica la tecnica scelta al risultato dell'ultima elaborazione invece che al file caricato "
+                         "(es. Messiaen → Boulez → Reich). Il report elenca tutta la catena. "
+                         "Ha effetto dopo aver generato un primo risultato.",
+                )
+            with _cc2:
+                st.selectbox(
+                    "🎹 Strumento delle tracce generate", GM_PROGRAM_OPTIONS, key="gen_program_label",
+                    help="Programma General MIDI per le tracce nuove create dai compositori "
+                         "(Xenakis, Eno, Glass, Reich, Bach, Costas, voce T di Pärt). "
+                         "'Predefinito' mantiene la scelta originale di ogni metodo.",
+                )
+            chain_active = bool(_chain_checked and _chain_available)
+            if _chain_checked and not _chain_available:
+                st.caption("🔗 Nessun risultato precedente per questo file: il primo passo parte dal file caricato.")
+            source_midi = midi_data
+            if chain_active:
+                source_midi = mido.MidiFile(file=io.BytesIO(st.session_state.midi_bytes))
+                _steps = " → ".join(dict.fromkeys(h["suffix"] for h in st.session_state.get("chain_history", [])))
+                st.caption(f"🔗 Input: risultato precedente ({_steps}). Il nuovo passo verrà aggiunto alla catena.")
 
             if compositore_key == "MIDI Stockhausen Punktuelle":
                 st.info(
@@ -2753,20 +2960,16 @@ if uploaded_midi_file is not None:
                 if st.button("🎯 Applica Punktuelle Musik", type="primary", use_container_width=True, key="btn_stockhausen"):
                     with st.spinner("Serializzando i 4 parametri (Stockhausen/Boulez)..."):
                         result_midi, row_used = midi_stockhausen_punktuelle(
-                            midi_data, serialize_duration, serialize_dynamics, serialize_timbre, isolamento_punti
+                            source_midi, serialize_duration, serialize_dynamics, serialize_timbre, isolamento_punti
                         )
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Stockhausen.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Stockhausen Punktuelle"],
                             {"MIDI Stockhausen Punktuelle": (serialize_duration, serialize_dynamics, serialize_timbre, isolamento_punti, row_used)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Stockhausen"
                         )
-                        st.session_state.midi_ready = True
                         st.success(f"✅ Punktuelle Musik applicata! Fila dodecafonica usata: {row_used}")
 
             elif compositore_key == "MIDI Boulez Multiplication":
@@ -2786,27 +2989,23 @@ if uploaded_midi_file is not None:
                     limita_densita = st.checkbox("Limita densità accordo", value=False, key="boulez_limit_density")
                     chord_density = st.slider("Note per accordo:", 2, 12, 6, key="boulez_chord_density") if limita_densita else 0
 
-                _preview_a, _preview_b = derive_boulez_sets(midi_data, set_size)
+                _preview_a, _preview_b = derive_boulez_sets(source_midi, set_size)
                 _preview_pivot = _preview_b[0] if _preview_b else 0
                 _preview_mult = boulez_multiply_sets(_preview_a, _preview_b, _preview_pivot)
                 st.caption(f"Anteprima — Insieme A: {_preview_a} | Insieme B: {_preview_b} | Aggregato risultante: {_preview_mult} ({len(_preview_mult)} classi)")
 
                 if st.button("🔷 Applica Moltiplicazione d'Accordi", type="primary", use_container_width=True, key="btn_boulez"):
                     with st.spinner("Moltiplicando gli insiemi di classi di altezza..."):
-                        result_midi, sets_info = midi_boulez_multiplication(midi_data, set_size, chord_density, register_spread)
+                        result_midi, sets_info = midi_boulez_multiplication(source_midi, set_size, chord_density, register_spread)
                         set_a, set_b, multiplied = sets_info
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Boulez.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Boulez Multiplication"],
                             {"MIDI Boulez Multiplication": (set_size, chord_density, register_spread, set_a, set_b)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Boulez"
                         )
-                        st.session_state.midi_ready = True
                         st.success(f"✅ Moltiplicazione applicata! Aggregato: {multiplied} ({len(multiplied)} classi di altezza)")
 
             elif compositore_key == "MIDI Xenakis Stochastic":
@@ -2842,21 +3041,17 @@ if uploaded_midi_file is not None:
                 if st.button("☁️ Applica Musica Stocastica", type="primary", use_container_width=True, key="btn_xenakis"):
                     with st.spinner("Generando la nuvola stocastica (Poisson + Gauss + crivello)..."):
                         result_midi, sieve_used = midi_xenakis_stochastic(
-                            midi_data, sieve_pairs, mean_events_per_beat, pitch_center, pitch_spread,
+                            source_midi, sieve_pairs, mean_events_per_beat, pitch_center, pitch_spread,
                             duration_mean, velocity_mean, velocity_spread, seed=xenakis_seed
                         )
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Xenakis.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Xenakis Stochastic"],
                             {"MIDI Xenakis Stochastic": (sieve_input, mean_events_per_beat, pitch_center, pitch_spread, duration_mean, velocity_mean, velocity_spread)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Xenakis"
                         )
-                        st.session_state.midi_ready = True
                         st.success(f"✅ Nuvola stocastica generata! Crivello effettivo: {len(sieve_used)} classi disponibili su 128")
 
             elif compositore_key == "MIDI Cage Chance":
@@ -2878,20 +3073,16 @@ if uploaded_midi_file is not None:
                 if st.button("☯️ Applica Operazioni di Caso", type="primary", use_container_width=True, key="btn_cage"):
                     with st.spinner("Lanciando le monete dell'I Ching (64 esagrammi per parametro)..."):
                         result_midi, hexagram_log = midi_cage_chance_operations(
-                            midi_data, silence_probability, duration_variety, seed=cage_seed
+                            source_midi, silence_probability, duration_variety, seed=cage_seed
                         )
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Cage.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Cage Chance"],
                             {"MIDI Cage Chance": (silence_probability, duration_variety)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Cage"
                         )
-                        st.session_state.midi_ready = True
                         n_eventi_originali = len(hexagram_log)
                         n_silenzi = sum(1 for h in hexagram_log if (h[3] / 64.0) < silence_probability)
                         st.success(f"✅ Operazioni di caso applicate! {n_eventi_originali - n_silenzi} suoni, {n_silenzi} silenzi su {n_eventi_originali} esagrammi lanciati")
@@ -2920,21 +3111,17 @@ if uploaded_midi_file is not None:
                 if st.button("🌫️ Applica Musica Generativa", type="primary", use_container_width=True, key="btn_eno"):
                     with st.spinner("Costruendo i cicli asincroni (lunghezze basate su numeri primi)..."):
                         result_midi, loops_info = midi_eno_generative(
-                            midi_data, num_loops, min_loop_beats, max_loop_beats,
+                            source_midi, num_loops, min_loop_beats, max_loop_beats,
                             note_length_ratio, duration_multiplier, velocity_base, seed=eno_seed
                         )
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Eno.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Eno Generative"],
                             {"MIDI Eno Generative": (num_loops, min_loop_beats, max_loop_beats, note_length_ratio, duration_multiplier, velocity_base)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Eno"
                         )
-                        st.session_state.midi_ready = True
                         loop_desc = ", ".join(f"{p}t" for _, p, _ in loops_info[:6])
                         st.success(f"✅ Sistema generativo creato! {len(loops_info)} loop asincroni, cicli: {loop_desc}{'...' if len(loops_info) > 6 else ''}")
 
@@ -2963,20 +3150,16 @@ if uploaded_midi_file is not None:
                 if st.button("🎻 Applica Canone", type="primary", use_container_width=True, key="btn_bach"):
                     with st.spinner("Costruendo il canone (dux/comes)..."):
                         result_midi, voices_info = midi_bach_canon(
-                            midi_data, num_voices, interval_semitones, delay_beats, transformation, augmentation_factor
+                            source_midi, num_voices, interval_semitones, delay_beats, transformation, augmentation_factor
                         )
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Bach.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Bach Canon"],
                             {"MIDI Bach Canon": (num_voices, interval_semitones, delay_beats, transformation)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Bach"
                         )
-                        st.session_state.midi_ready = True
                         st.success(f"✅ Canone applicato! {len(voices_info)} voci generate.")
 
             elif compositore_key == "MIDI Glass Additive":
@@ -3000,20 +3183,16 @@ if uploaded_midi_file is not None:
                 if st.button("➕ Applica Processo Additivo", type="primary", use_container_width=True, key="btn_glass"):
                     with st.spinner("Costruendo il processo additivo..."):
                         result_midi, stages = midi_glass_additive(
-                            midi_data, cell_length_notes, direction, repeats_per_stage
+                            source_midi, cell_length_notes, direction, repeats_per_stage
                         )
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Glass.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Glass Additive"],
                             {"MIDI Glass Additive": (cell_length_notes, direction, repeats_per_stage)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Glass"
                         )
-                        st.session_state.midi_ready = True
                         st.success(f"✅ Processo additivo generato! {len(stages)} stadi.")
 
             elif compositore_key == "MIDI Messiaen Modes":
@@ -3038,20 +3217,16 @@ if uploaded_midi_file is not None:
                 if st.button("🕊️ Applica Modi di Messiaen", type="primary", use_container_width=True, key="btn_messiaen"):
                     with st.spinner("Riquantizzando sul modo scelto..."):
                         result_midi, mode_used = midi_messiaen_modes(
-                            midi_data, mode_number, transposition, non_retrogradable_rhythm, rhythm_cell_notes, seed=messiaen_seed
+                            source_midi, mode_number, transposition, non_retrogradable_rhythm, rhythm_cell_notes, seed=messiaen_seed
                         )
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Messiaen.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Messiaen Modes"],
                             {"MIDI Messiaen Modes": (mode_number, transposition, non_retrogradable_rhythm, rhythm_cell_notes)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Messiaen"
                         )
-                        st.session_state.midi_ready = True
                         st.success(f"✅ Modo {mode_number} applicato! Classi: {mode_used}")
 
             elif compositore_key == "MIDI Part Tintinnabuli":
@@ -3072,23 +3247,28 @@ if uploaded_midi_file is not None:
                         key="part_t_position"
                     )
 
+                _key_est = estimate_key(source_midi)
+                if _key_est:
+                    _est_tonic, _est_mode = _NOTE_NAMES[_key_est[0]], _key_est[1]
+                    _use_est = st.checkbox(
+                        f"🔍 Usa la tonalità stimata dal brano ({_est_tonic} {_est_mode.lower()})", value=False, key="part_auto_key",
+                        help="Stima Krumhansl-Schmuckler dalle durate delle note (batteria esclusa). Se attivo sostituisce Tonica e Triade scelte sopra.",
+                    )
+                    if _use_est:
+                        tonic_key, triad_type = _est_tonic, _est_mode
                 if st.button("🔔 Applica Tintinnabuli", type="primary", use_container_width=True, key="btn_part"):
                     with st.spinner("Calcolando la voce tintinnabuli..."):
                         result_midi, triad_used = midi_part_tintinnabuli(
-                            midi_data, tonic_key, triad_type, t_voice_position
+                            source_midi, tonic_key, triad_type, t_voice_position
                         )
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Part.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Part Tintinnabuli"],
                             {"MIDI Part Tintinnabuli": (tonic_key, triad_type, t_voice_position)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Part"
                         )
-                        st.session_state.midi_ready = True
                         st.success(f"✅ Tintinnabuli applicato! Triade: {triad_used}")
 
             elif compositore_key == "MIDI Reich Phasing":
@@ -3109,20 +3289,16 @@ if uploaded_midi_file is not None:
                 if st.button("🌀 Applica Phasing", type="primary", use_container_width=True, key="btn_reich"):
                     with st.spinner("Costruendo lo sfasamento processuale..."):
                         result_midi, final_phase = midi_reich_phasing(
-                            midi_data, cell_length_notes_r, num_cycles, phase_shift_units, shift_every_n_cycles
+                            source_midi, cell_length_notes_r, num_cycles, phase_shift_units, shift_every_n_cycles
                         )
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Reich.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Reich Phasing"],
                             {"MIDI Reich Phasing": (cell_length_notes_r, num_cycles, phase_shift_units, shift_every_n_cycles)},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Reich"
                         )
-                        st.session_state.midi_ready = True
                         st.success(f"✅ Phasing applicato! Sfasamento finale: {final_phase} tick.")
 
             else:  # Costas Sequencer
@@ -3164,23 +3340,19 @@ if uploaded_midi_file is not None:
                     with st.spinner("Generando la matrice di Costas (costruzione di Welch)..."):
                         cmode, corder, cp1, cp2, cp3 = costas_params
                         if cmode == "Permutazione Pitch (Cromatica)":
-                            result_midi, costas_info = midi_costas_pitch_permutation(midi_data, transpose_octave=cp1)
+                            result_midi, costas_info = midi_costas_pitch_permutation(source_midi, transpose_octave=cp1)
                         elif cmode == "Griglia Ritmica Costas":
-                            result_midi, costas_info = midi_costas_rhythmic_grid(midi_data, corder)
+                            result_midi, costas_info = midi_costas_rhythmic_grid(source_midi, corder)
                         else:
-                            result_midi, costas_info = midi_costas_generator(midi_data, corder, cp1, cp2, cp3)
+                            result_midi, costas_info = midi_costas_generator(source_midi, corder, cp1, cp2, cp3)
 
-                        midi_out_bytes = io.BytesIO()
-                        result_midi.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Costas.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Costas Sequencer"], {"MIDI Costas Sequencer": costas_params},
-                            midi_methods, stile=compositore_label
+                            midi_methods, stile=compositore_label,
+                            chain=chain_active,
+                            suffix="Costas"
                         )
-                        st.session_state.midi_ready = True
                         n_costas, p_costas, g_costas = costas_info
                         st.success(f"✅ Costas Sequencer applicato! Ordine effettivo n={n_costas} (p={p_costas}, g={g_costas})")
 
@@ -3275,16 +3447,11 @@ if uploaded_midi_file is not None:
 
                     if decomposed_midi_file:
                         st.success("Decomposizione MIDI completata!")
-                        midi_out_bytes = io.BytesIO()
-                        decomposed_midi_file.save(file=midi_out_bytes)
-                        midi_out_bytes.seek(0)
-                        st.session_state.midi_bytes    = midi_out_bytes.getvalue()
-                        st.session_state.midi_filename = f"{uploaded_midi_file.name.split('.')[0]}_Decomposed.mid"
-                        st.session_state.midi_report   = build_report(
+                        finalize_result(
                             uploaded_midi_file.name, midi_data, decomposed_midi_file,
-                            selected_methods_keys, parameters, midi_methods, stile=None
+                            selected_methods_keys, parameters, midi_methods, stile=None,
+                            suffix="Decomposed"
                         )
-                        st.session_state.midi_ready = True
 
                         def get_track_display_name(track, index):
                             track_name = next((msg.name for msg in track if msg.type == 'track_name'), None)
@@ -3311,7 +3478,7 @@ if uploaded_midi_file is not None:
                                     single_track_bytes = io.BytesIO()
                                     single_track_midi.save(file=single_track_bytes)
                                     single_track_bytes.seek(0)
-                                    original_file_base_name = uploaded_midi_file.name.split('.')[0]
+                                    original_file_base_name = os.path.splitext(os.path.basename(uploaded_midi_file.name))[0]
                                     track_name_for_file = get_track_display_name(decomposed_midi_file.tracks[track_index], track_index).replace(' ', '_').replace(':', '')
                                     st.download_button(
                                         label=f"💾 Scarica {track_options[track_index]}",
@@ -3355,6 +3522,16 @@ else:
         **🥁 Batteria:** con *Preserva la batteria* (attivo di default) il canale MIDI 10 resta intatto nei metodi che alterano altezza o struttura.
 
         **⏱️ Tempo e metrica:** tempo, metrica e tonalità del file originale vengono mantenuti nel file generato.
+
+        **🎲 Seed:** con lo stesso *Seed globale* (o quello scritto nel report, riga `:: SEED`) ottieni lo stesso risultato.
+
+        **🔗 Concatenazione:** nei Compositori puoi applicare una tecnica al risultato della precedente; il report elenca tutta la catena.
+
+        **🎹 Strumento GM:** scegli lo strumento delle tracce generate dai compositori.
+
+        **✅ Validazione e report bilingue:** ogni risultato è controllato (note bilanciate, tempo/metrica) e il report è in italiano e inglese.
+
+        **📂 File tipo 0:** i file con una sola traccia e più canali vengono divisi automaticamente in una traccia per canale.
         """)
 # RISULTATI PERSISTENTI
 if st.session_state.midi_ready and st.session_state.midi_bytes:
