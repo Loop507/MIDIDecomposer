@@ -198,6 +198,35 @@ def _restore_global_meta(source_midi, result_midi):
     return result_midi
 
 
+def _force_source_tempo_map(source_midi, result_midi):
+    """Solo per metodi che NON cambiano la scala dei tick (es. Recomposer): sostituisce
+    TUTTI i set_tempo del risultato con la mappa dei tempi completa del sorgente, cosi'
+    la durata in secondi non puo' derivare da tempi persi, parziali o duplicati."""
+    src = []
+    seen = set()
+    for t, m in _collect_global_meta(source_midi):
+        if m.type == 'set_tempo' and (t, m.tempo) not in seen:
+            seen.add((t, m.tempo)); src.append((t, m))
+    if not src or not result_midi.tracks:
+        return result_midi
+    # togli ogni set_tempo dal risultato (mantenendo i tempi assoluti degli altri eventi)
+    for i, tr in enumerate(result_midi.tracks):
+        evs, t = [], 0
+        for msg in tr:
+            t += msg.time
+            if msg.is_meta and msg.type in ('set_tempo', 'end_of_track'):
+                continue
+            evs.append((t, msg))
+        if i == 0:
+            evs = [(tt, m) for tt, m in src] + evs
+            evs.sort(key=lambda e: e[0])  # stabile: i tempi (inseriti prima) precedono gli altri a pari tick
+        new_tr, last = mido.MidiTrack(), 0
+        for tt, msg in evs:
+            new_tr.append(msg.copy(time=tt - last)); last = tt
+        result_midi.tracks[i] = new_tr
+    return result_midi
+
+
 def _preserves_meta(func):
     """Decoratore: garantisce che tempo/metrica/tonalita' del brano originale
     sopravvivano a qualunque trasformazione (ricostruita da zero o no)."""
@@ -2299,11 +2328,18 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
 
     tpb = original_midi.ticks_per_beat
 
-    # Durata totale originale in ticks
+    # Durata totale originale in ticks = fine dell'ultima NOTA (non somma di tutti i delta:
+    # code vuote, end_of_track lontani, meta/CC finali non devono allungare il brano)
     total_ticks = 0
     for track in original_midi.tracks:
-        t = sum(msg.time for msg in track)
-        total_ticks = max(total_ticks, t)
+        t = 0
+        for msg in track:
+            t += msg.time
+            if msg.type in ('note_on', 'note_off'):
+                total_ticks = max(total_ticks, t)
+    if total_ticks == 0:
+        for track in original_midi.tracks:
+            total_ticks = max(total_ticks, sum(msg.time for msg in track))
     if total_ticks == 0:
         total_ticks = tpb * 4 * 32  # fallback 32 battute
 
@@ -2489,6 +2525,7 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
                 empty.append(_h)
             new_midi.tracks.append(empty)
 
+    _force_source_tempo_map(original_midi, new_midi)
     return new_midi
 
 # --- Session State ---
@@ -2924,6 +2961,12 @@ if uploaded_midi_file is not None:
                         midi_methods, stile=style_label,
                         suffix="Recomposed"
                     )
+                    _v = validate_midi_output(midi_data, recomposed)
+                    if _v['duration_in'] and _v['duration_out'] and abs(_v['duration_out'] - _v['duration_in']) > 0.02 * _v['duration_in']:
+                        st.warning(f"⚠️ Durata diversa dall'originale: {_v['duration_in']} s → {_v['duration_out']} s. "
+                                   f"Incolla questi due numeri (e il tipo di file) per il debug.")
+                    else:
+                        st.caption(f"⏱️ Durata: {_v['duration_in']} s → {_v['duration_out']} s")
                     st.success(
                         f"✅ Ricomposizione completata! "
                         f"{len(midi_data.tracks)} tracce originali → "
