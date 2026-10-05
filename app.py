@@ -145,9 +145,35 @@ def _restore_global_meta(source_midi, result_midi):
     La prima traccia viene sostituita da una copia: i MIDI originali non sono mai modificati."""
     if source_midi is result_midi:
         return result_midi
-    present = {msg.type for tr in result_midi.tracks for msg in tr
-               if msg.is_meta and msg.type in _GLOBAL_META_TYPES}
-    missing = [(t, m) for (t, m) in _collect_global_meta(source_midi) if m.type not in present]
+    def _sig(t, m):
+        d = m.dict(); d.pop('time', None)
+        return (t, tuple(sorted(d.items())))
+
+    # Eventi globali del sorgente (senza duplicati) e di quelli gia' presenti nel risultato.
+    src_meta, seen = [], set()
+    for t, m in _collect_global_meta(source_midi):
+        k = _sig(t, m)
+        if k not in seen:
+            seen.add(k)
+            src_meta.append((t, m))
+    res_meta = []
+    for tr in result_midi.tracks:
+        t = 0
+        for msg in tr:
+            t += msg.time
+            if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
+                res_meta.append((t, msg))
+    res_sigs = {_sig(t, m) for t, m in res_meta}
+    missing = []
+    for typ in _GLOBAL_META_TYPES:
+        src_t = [(t, m) for t, m in src_meta if m.type == typ]
+        n_res = sum(1 for _, m in res_meta if m.type == typ)
+        if n_res == 0:
+            missing += src_t                      # tipo perso del tutto: ripristina tutto
+        elif n_res < len(src_t):
+            # perso solo in parte (es. cambi di tempo stavano in una traccia ricomposta):
+            # reinserisci solo quelli che mancano, per tempo assoluto e contenuto
+            missing += [(t, m) for t, m in src_t if _sig(t, m) not in res_sigs]
     if not missing:
         return result_midi
     if not result_midi.tracks:
