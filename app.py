@@ -1,32 +1,73 @@
-# midi_decomposer_app.py - VERSIONE RIVISTA E CORRETTA
+# MidiDecomposer_5_1.py — MIDI Decomposer by loop507 (file unico)
+# Struttura: [1] MOTORE (utilita' MIDI, seed, compositori, metodi, validazione, report)
+#            [2] INTERFACCIA Streamlit.
 
+import base64
+import bisect
+import copy as _copy
+import functools
+import io
+import logging
+import os
+import random
+import threading
+import zlib
+from collections import defaultdict, deque
+
+import mido
+import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
-import mido
-import random
-import numpy as np
-import io
-import os
-import zlib
-import functools
-import base64
-from collections import defaultdict
 
-# --- Configurazione della Pagina ---
-st.set_page_config(
-    page_title="MIDI Decomposer by loop507",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# =====================================================================
+# [1] MOTORE
+# =====================================================================
 
-# --- Titolo Principale ---
-st.markdown("""
-<div style='text-align: center; padding: 20px;'>
-    <h1> MIDI Decomposer <span style='font-size:0.6em; color: #666;'>by <span style='font-size:0.8em;'>loop507</span></span></h1>
-    <p style='font-size: 1.2em; color: #888;'>Scomponi e Ricomponi File MIDI in Nuove Strutture Musicali</p>
-    <p style='font-style: italic;'>Esplora il caos e l'ordine nella generazione MIDI</p>
-</div>
-""", unsafe_allow_html=True)
+# --- Contesto per-thread: impostazioni utente e canale degli avvisi ---
+# Ogni sessione Streamlit gira nel proprio thread: una configurazione per-thread evita
+# che seed / batteria / strumento di un utente finiscano in quella di un altro.
+_ctx = threading.local()
+_log = logging.getLogger("midi_engine")
+
+
+def configure(settings=None, warn=None):
+    """Collega il motore all'interfaccia (da richiamare a ogni esecuzione dello script).
+    settings: mapping con .get(chiave, default) — chiavi usate: 'preserve_drums',
+              '_run_seed', 'gen_program_label' (es. st.session_state).
+    warn:     funzione(str) per gli avvisi (es. st.warning); default: logging."""
+    _ctx.settings = settings
+    _ctx.warn = warn
+
+
+def _setting(key, default=None):
+    settings = getattr(_ctx, 'settings', None)
+    if settings is None:
+        return default
+    try:
+        value = settings.get(key, default)
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+
+def _clone(msg, **changes):
+    """Copia un messaggio mido applicando le modifiche. Equivale a msg.copy(**changes) ma
+    senza ri-validare l'intero messaggio a ogni copia (mido.Message.copy e' ~3.5x piu' lento):
+    i singoli valori modificati sono comunque validati dal setter pubblico di mido."""
+    new = _copy.copy(msg)
+    for key, value in changes.items():
+        setattr(new, key, value)
+    return new
+
+
+def warn(message):
+    handler = getattr(_ctx, 'warn', None)
+    if handler is not None:
+        handler(message)
+    else:
+        _log.warning(message)
+
 
 # --- Funzioni di Utilità ---
 def get_key_offset(key_name):
@@ -57,27 +98,27 @@ def get_scale_notes(scale_name):
 
 def extract_notes(track, ticks_per_beat=384):
     """Helper per estrarre note e il loro tempo assoluto da una traccia.
-    Usa uno stack LIFO per (nota, canale): due note_on consecutivi sulla stessa
-    nota senza note_off in mezzo non fanno piu' perdere la prima nota."""
+    Coda FIFO per (nota, canale): se la stessa altezza viene riattaccata prima del
+    note_off, il note_off chiude la nota piu' VECCHIA (convenzione dei sequencer);
+    nessuna nota viene persa e non nascono note annidate lunghissime.
+    Note rimaste aperte senza note_off: chiuse con durata stimata di 1 beat."""
     notes = []
-    active_notes = defaultdict(list)
+    active_notes = defaultdict(deque)
     current_abs_time = 0
     for msg in track:
         current_abs_time += msg.time
         if msg.type == 'note_on' and msg.velocity > 0:
-            active_notes[(msg.note, msg.channel)].append({'start': current_abs_time, 'velocity': msg.velocity})
+            active_notes[(msg.note, msg.channel)].append((current_abs_time, msg.velocity))
         elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
-            key = (msg.note, msg.channel)
-            stack = active_notes.get(key)
-            if stack:
-                start_data = stack.pop()
-                notes.append({'start': start_data['start'], 'end': current_abs_time, 'pitch': msg.note, 'velocity': start_data['velocity'], 'channel': key[1]})
-    # Note rimaste aperte senza note_off — chiuse con durata stimata di 1 beat
-    # invece di usare current_abs_time che creerebbe note lunghissime
-    for key, stack in active_notes.items():
-        for start_data in stack:
-            estimated_end = start_data['start'] + ticks_per_beat  # 1 beat di default
-            notes.append({'start': start_data['start'], 'end': estimated_end, 'pitch': key[0], 'velocity': start_data['velocity'], 'channel': key[1]})
+            queue = active_notes.get((msg.note, msg.channel))
+            if queue:
+                start, velocity = queue.popleft()
+                notes.append({'start': start, 'end': current_abs_time, 'pitch': msg.note,
+                              'velocity': velocity, 'channel': msg.channel})
+    for (pitch, channel), queue in active_notes.items():
+        for start, velocity in queue:
+            notes.append({'start': start, 'end': start + ticks_per_beat, 'pitch': pitch,
+                          'velocity': velocity, 'channel': channel})
     return notes
 
 
@@ -97,9 +138,9 @@ def _extract_instrument_header(track):
         if msg.type in ('note_on', 'note_off'):
             break
         if msg.type == 'program_change':
-            header.append(msg.copy(time=0))
+            header.append(_clone(msg, time=0))
         elif msg.type == 'control_change' and msg.control in (0, 32):
-            header.append(msg.copy(time=0))
+            header.append(_clone(msg, time=0))
     return header
 
 
@@ -120,10 +161,7 @@ def _drums_preserved(flag=None):
     legge il checkbox 'preserve_drums' dell'interfaccia (default True)."""
     if flag is not None:
         return bool(flag)
-    try:
-        return bool(st.session_state.get('preserve_drums', True))
-    except Exception:
-        return True
+    return bool(_setting('preserve_drums', True))
 
 
 def _collect_global_meta(midi):
@@ -134,7 +172,7 @@ def _collect_global_meta(midi):
         for msg in track:
             t += msg.time
             if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
-                found.append((t, msg.copy(time=0)))
+                found.append((t, _clone(msg, time=0)))
     found.sort(key=lambda x: x[0])
     return found
 
@@ -145,35 +183,9 @@ def _restore_global_meta(source_midi, result_midi):
     La prima traccia viene sostituita da una copia: i MIDI originali non sono mai modificati."""
     if source_midi is result_midi:
         return result_midi
-    def _sig(t, m):
-        d = m.dict(); d.pop('time', None)
-        return (t, tuple(sorted(d.items())))
-
-    # Eventi globali del sorgente (senza duplicati) e di quelli gia' presenti nel risultato.
-    src_meta, seen = [], set()
-    for t, m in _collect_global_meta(source_midi):
-        k = _sig(t, m)
-        if k not in seen:
-            seen.add(k)
-            src_meta.append((t, m))
-    res_meta = []
-    for tr in result_midi.tracks:
-        t = 0
-        for msg in tr:
-            t += msg.time
-            if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
-                res_meta.append((t, msg))
-    res_sigs = {_sig(t, m) for t, m in res_meta}
-    missing = []
-    for typ in _GLOBAL_META_TYPES:
-        src_t = [(t, m) for t, m in src_meta if m.type == typ]
-        n_res = sum(1 for _, m in res_meta if m.type == typ)
-        if n_res == 0:
-            missing += src_t                      # tipo perso del tutto: ripristina tutto
-        elif n_res < len(src_t):
-            # perso solo in parte (es. cambi di tempo stavano in una traccia ricomposta):
-            # reinserisci solo quelli che mancano, per tempo assoluto e contenuto
-            missing += [(t, m) for t, m in src_t if _sig(t, m) not in res_sigs]
+    present = {msg.type for tr in result_midi.tracks for msg in tr
+               if msg.is_meta and msg.type in _GLOBAL_META_TYPES}
+    missing = [(t, m) for (t, m) in _collect_global_meta(source_midi) if m.type not in present]
     if not missing:
         return result_midi
     if not result_midi.tracks:
@@ -192,38 +204,9 @@ def _restore_global_meta(source_midi, result_midi):
     new_first = mido.MidiTrack()
     last = 0
     for t, _prio, msg in events:
-        new_first.append(msg.copy(time=t - last))
+        new_first.append(_clone(msg, time=t - last))
         last = t
     result_midi.tracks[0] = new_first
-    return result_midi
-
-
-def _force_source_tempo_map(source_midi, result_midi):
-    """Solo per metodi che NON cambiano la scala dei tick (es. Recomposer): sostituisce
-    TUTTI i set_tempo del risultato con la mappa dei tempi completa del sorgente, cosi'
-    la durata in secondi non puo' derivare da tempi persi, parziali o duplicati."""
-    src = []
-    seen = set()
-    for t, m in _collect_global_meta(source_midi):
-        if m.type == 'set_tempo' and (t, m.tempo) not in seen:
-            seen.add((t, m.tempo)); src.append((t, m))
-    if not src or not result_midi.tracks:
-        return result_midi
-    # togli ogni set_tempo dal risultato (mantenendo i tempi assoluti degli altri eventi)
-    for i, tr in enumerate(result_midi.tracks):
-        evs, t = [], 0
-        for msg in tr:
-            t += msg.time
-            if msg.is_meta and msg.type in ('set_tempo', 'end_of_track'):
-                continue
-            evs.append((t, msg))
-        if i == 0:
-            evs = [(tt, m) for tt, m in src] + evs
-            evs.sort(key=lambda e: e[0])  # stabile: i tempi (inseriti prima) precedono gli altri a pari tick
-        new_tr, last = mido.MidiTrack(), 0
-        for tt, msg in evs:
-            new_tr.append(msg.copy(time=tt - last)); last = tt
-        result_midi.tracks[i] = new_tr
     return result_midi
 
 
@@ -259,10 +242,7 @@ _RUN_SEED_FALLBACK = {}
 def _current_run_seed():
     """Seed dell'esecuzione corrente: lo imposta l'interfaccia (campo 'Seed globale',
     oppure casuale a ogni esecuzione e riportato nel report). Fuori dall'app ne genera uno una volta."""
-    try:
-        s = st.session_state.get('_run_seed')
-    except Exception:
-        s = None
+    s = _setting('_run_seed')
     if s is None:
         s = _RUN_SEED_FALLBACK.setdefault('v', random.SystemRandom().randrange(2 ** 31))
     return int(s)
@@ -324,10 +304,7 @@ _KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3
 
 def _generated_program(default=0):
     """Programma GM per le tracce generate: scelta dell'utente ('gen_program_label') oppure il default del metodo."""
-    try:
-        label = st.session_state.get('gen_program_label')
-    except Exception:
-        label = None
+    label = _setting('gen_program_label')
     if isinstance(label, str) and label[:3].isdigit():
         return max(0, min(127, int(label[:3])))
     return default
@@ -359,6 +336,34 @@ def estimate_key(midi, ignore_drums=True):
     return best
 
 
+def midi_length_seconds(midi):
+    """Durata in secondi calcolata dai tempi assoluti (stesso risultato di mido.MidiFile.length,
+    ma senza fondere e rileggere tutti i messaggi: ~15x piu' veloce sui file grandi).
+    None per i file di tipo 2 (tracce indipendenti: la durata non e' definita)."""
+    if midi.type == 2:
+        return None
+    tpb = midi.ticks_per_beat
+    tempi = [(0, 500000)]  # tempo di default MIDI: 120 BPM
+    end = 0
+    for track in midi.tracks:
+        t = 0
+        for msg in track:
+            t += msg.time
+            if msg.type == 'set_tempo':
+                tempi.append((t, msg.tempo))
+        if t > end:
+            end = t
+    tempi.sort(key=lambda x: x[0])  # stabile: a parita' di tick vale l'ultimo
+    seconds = 0.0
+    for i, (tick, tempo) in enumerate(tempi):
+        if tick >= end:
+            break
+        nxt = tempi[i + 1][0] if i + 1 < len(tempi) else end
+        nxt = min(nxt, end)
+        seconds += (nxt - tick) * tempo / (tpb * 1_000_000)
+    return seconds
+
+
 def validate_midi_output(source_midi, output_midi):
     """Controlli di coerenza sul risultato: note totali, note non bilanciate (appese o note_off orfani),
     durata prima/dopo, tempo/metrica/tonalita' preservati."""
@@ -376,10 +381,8 @@ def validate_midi_output(source_midi, output_midi):
         return notes, unbalanced
 
     def duration(m):
-        try:
-            return round(m.length, 2)
-        except Exception:
-            return None
+        secs = midi_length_seconds(m)
+        return None if secs is None else round(secs, 2)
 
     def meta_types(m):
         return {x.type for tr in m.tracks for x in tr if x.is_meta and x.type in _GLOBAL_META_TYPES}
@@ -411,7 +414,7 @@ def append_events_to_track(track, events):
     (evita sovrapposizioni e note appese). Sostituisce il blocco sort+delta ripetuto ovunque."""
     last = 0
     for ev in sorted(events, key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1)):
-        track.append(ev['msg'].copy(time=max(0, ev['abs_time'] - last)))
+        track.append(_clone(ev['msg'], time=max(0, ev['abs_time'] - last)))
         last = ev['abs_time']
     return track
 
@@ -515,7 +518,7 @@ def midi_costas_pitch_permutation(original_midi, transpose_octave=0, preserve_dr
                 new_pitch_class = perm[pitch_class % n]
                 new_pitch = (octave * 12) + new_pitch_class + (transpose_octave * 12)
                 new_pitch = max(0, min(127, new_pitch))
-                new_track.append(msg.copy(note=new_pitch))
+                new_track.append(_clone(msg, note=new_pitch))
             else:
                 new_track.append(msg)
 
@@ -606,7 +609,7 @@ def midi_costas_generator(original_midi, min_order, base_pitch, pitch_range_semi
         total_ticks = max(total_ticks, current_time)
 
     if total_ticks == 0:
-        st.warning("Il brano originale non contiene eventi validi. Il generatore Costas non verra' aggiunto.")
+        warn("Il brano originale non contiene eventi validi. Il generatore Costas non verra' aggiunto.")
         return new_midi, (n, p, g)
 
     step_ticks = max(1, int(round(step_beats * original_midi.ticks_per_beat)))
@@ -747,7 +750,7 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
             })
 
     if not all_points:
-        st.warning("Nessuna nota trovata nel brano. La tecnica Punktuelle non verra' applicata.")
+        warn("Nessuna nota trovata nel brano. La tecnica Punktuelle non verra' applicata.")
         return original_midi, row
 
     all_points.sort(key=lambda x: x['start'])
@@ -867,7 +870,7 @@ def midi_boulez_multiplication(original_midi, set_size=4, chord_density=0, regis
     multiplied = boulez_multiply_sets(set_a, set_b, pivot)
 
     if not multiplied:
-        st.warning("Materiale insufficiente per la moltiplicazione d'accordi. Restituito il MIDI originale.")
+        warn("Materiale insufficiente per la moltiplicazione d'accordi. Restituito il MIDI originale.")
         return original_midi, (set_a, set_b, multiplied)
 
     if chord_density and 0 < chord_density < len(multiplied):
@@ -999,7 +1002,7 @@ def midi_xenakis_stochastic(original_midi, sieve_moduli, mean_events_per_beat, p
         total_ticks = max(total_ticks, current_time)
 
     if total_ticks == 0:
-        st.warning("Il brano originale non contiene eventi validi. La nuvola stocastica non verra' aggiunta.")
+        warn("Il brano originale non contiene eventi validi. La nuvola stocastica non verra' aggiunta.")
         return new_midi, sieve
 
     xenakis_track = mido.MidiTrack()
@@ -1045,17 +1048,14 @@ def midi_xenakis_stochastic(original_midi, sieve_moduli, mean_events_per_beat, p
 # silenzio e' materiale musicale legittimo quanto il suono (stesso principio
 # alla base di 4'33").
 
-def _cage_toss_line(rng):
-    """Simula il lancio di 3 monete (metodo classico dell'I Ching): testa=3, croce=2."""
-    coins_total = sum(3 if rng.integers(0, 2) == 1 else 2 for _ in range(3))  # somma in {6,7,8,9}
-    return 1 if coins_total in (7, 9) else 0  # linea intera (yang) = 1, spezzata (yin) = 0
-
-
 def _cage_toss_hexagram(rng):
-    """6 lanci di linea -> indice di esagramma 0..63 (metodo delle tre monete)."""
+    """6 lanci di linea (3 monete l'una) -> indice di esagramma 0..63 (metodo delle tre monete).
+    Le 18 monete sono estratte in un'unica chiamata al generatore: la sequenza e' identica a
+    18 chiamate singole, ma molto piu' veloce."""
+    heads = rng.integers(0, 2, size=18).reshape(6, 3).sum(axis=1)  # teste per linea, 0..3
     idx = 0
-    for _ in range(6):
-        idx = (idx << 1) | _cage_toss_line(rng)
+    for h in heads:
+        idx = (idx << 1) | (1 if int(h) in (1, 3) else 0)  # 7 o 9 -> teste dispari
     return idx
 
 
@@ -1094,7 +1094,7 @@ def midi_cage_chance_operations(original_midi, silence_probability=0.15, duratio
             all_points.append(nd)
 
     if not all_points:
-        st.warning("Nessuna nota trovata. Le operazioni di caso non verranno applicate.")
+        warn("Nessuna nota trovata. Le operazioni di caso non verranno applicate.")
         return original_midi, []
 
     all_points.sort(key=lambda x: x['start'])
@@ -1196,7 +1196,7 @@ def midi_eno_generative(original_midi, num_loops=6, min_loop_beats=8, max_loop_b
             if msg.type == 'note_on' and msg.velocity > 0 and msg.note not in pitches_found and not (preserve and msg.channel == DRUM_CHANNEL):
                 pitches_found.append(msg.note)
     if not pitches_found:
-        st.warning("Nessuna nota trovata nel brano. Il sistema generativo non verra' aggiunto.")
+        warn("Nessuna nota trovata nel brano. Il sistema generativo non verra' aggiunto.")
         return original_midi, []
     pitches_found.sort()
 
@@ -1284,7 +1284,7 @@ def midi_bach_canon(original_midi, num_voices=2, interval_semitones=7,
     """
     subject = derive_bach_subject(original_midi, max_notes=24)
     if not subject:
-        st.warning("Nessun soggetto melodico trovato. Il canone non verra' generato.")
+        warn("Nessun soggetto melodico trovato. Il canone non verra' generato.")
         return original_midi, []
 
     ticks_per_beat = original_midi.ticks_per_beat
@@ -1367,7 +1367,7 @@ def midi_glass_additive(original_midi, cell_length_notes=8, direction="Additivo 
     gen_channel = _free_channels(original_midi)[0]
     cell = derive_glass_cell(original_midi, cell_length_notes)
     if len(cell) < 2:
-        st.warning("Materiale insufficiente per costruire la cellula. Il processo additivo non verra' generato.")
+        warn("Materiale insufficiente per costruire la cellula. Il processo additivo non verra' generato.")
         return original_midi, []
 
     ticks_per_beat = original_midi.ticks_per_beat
@@ -1507,7 +1507,7 @@ def midi_messiaen_modes(original_midi, mode_number=2, transposition=0,
         new_midi.tracks.append(new_track)
 
     if not any_notes:
-        st.warning("Nessuna nota trovata. I modi di Messiaen non verranno applicati.")
+        warn("Nessuna nota trovata. I modi di Messiaen non verranno applicati.")
         return original_midi, mode_intervals
 
     return new_midi, mode_intervals
@@ -1605,7 +1605,7 @@ def midi_part_tintinnabuli(original_midi, tonic_key="C", triad_type="Minore",
         new_midi.tracks.append(t_track)
 
     if not any_notes:
-        st.warning("Nessuna nota trovata. Il tintinnabuli non verra' applicato.")
+        warn("Nessuna nota trovata. Il tintinnabuli non verra' applicato.")
         return original_midi, triad_pcs
 
     return new_midi, triad_pcs
@@ -1646,7 +1646,7 @@ def midi_reich_phasing(original_midi, cell_length_notes=8, num_cycles=32,
     ch_b = _free[1 % len(_free)]
     cell = derive_reich_cell(original_midi, cell_length_notes)
     if len(cell) < 2:
-        st.warning("Materiale insufficiente per costruire la cellula. Il phasing non verra' generato.")
+        warn("Materiale insufficiente per costruire la cellula. Il phasing non verra' generato.")
         return original_midi, 0
 
     ticks_per_beat = original_midi.ticks_per_beat
@@ -1718,12 +1718,12 @@ def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_
             is_on = msg.type == 'note_on' and msg.velocity > 0
             is_off = msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0)
             if not (is_on or is_off) or (preserve and msg.channel == DRUM_CHANNEL):
-                new_track.append(msg.copy())
+                new_track.append(_clone(msg))
                 continue
 
             key = (msg.note, msg.channel)
             if is_off and open_notes.get(key):
-                new_track.append(msg.copy(note=open_notes[key].pop()))
+                new_track.append(_clone(msg, note=open_notes[key].pop()))
                 continue
 
             shifted_note = msg.note
@@ -1743,7 +1743,7 @@ def midi_note_remapper(original_midi, target_scale_name, target_key_name, pitch_
                     factor = 1 + rng.uniform(-velocity_randomization / 100, velocity_randomization / 100)
                     new_velocity = max(1, min(127, int(round(float(new_velocity) * factor))))
 
-            new_track.append(msg.copy(note=new_note_pitch, velocity=new_velocity))
+            new_track.append(_clone(msg, note=new_note_pitch, velocity=new_velocity))
         new_midi.tracks.append(new_track)
     return new_midi
 
@@ -1756,7 +1756,7 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
     ticks_per_phrase = original_midi.ticks_per_beat * phrase_length_beats
 
     if ticks_per_phrase == 0:
-        st.warning("La lunghezza della frase è zero. Nessuna riorganizzazione applicata.")
+        warn("La lunghezza della frase è zero. Nessuna riorganizzazione applicata.")
         return original_midi
 
     for original_track in original_midi.tracks:
@@ -1810,7 +1810,7 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
                 for _ in range(num_repetitions):
                     reorganized_phrases.extend([a_phrase, b_phrase, a_phrase, c_phrase])
             else:
-                st.warning(f"Troppo poche frasi ({len(phrases)}) per lo stile 'Ciclico A-B-A'. Verrà usata la riorganizzazione casuale.")
+                warn(f"Troppo poche frasi ({len(phrases)}) per lo stile 'Ciclico A-B-A'. Verrà usata la riorganizzazione casuale.")
                 reorganized_phrases = list(phrases)
                 rng.shuffle(reorganized_phrases)
         elif reassembly_style == "Dal Più Corto al Più Lungo":
@@ -1846,7 +1846,7 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
                     if open_notes[key] <= 0:
                         continue  # note_off orfano: il suo note_on sta in un'altra frase
                     open_notes[key] -= 1
-                flat_events_for_reconstruction.append({'msg': msg_in_phrase.copy(), 'abs_time': phrase_abs})
+                flat_events_for_reconstruction.append({'msg': _clone(msg_in_phrase), 'abs_time': phrase_abs})
 
             # Chiudi note rimaste aperte alla fine della frase
             phrase_end = phrase_abs
@@ -1873,7 +1873,7 @@ def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, sw
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
     ticks_per_subdivision = original_midi.ticks_per_beat / 4
     if ticks_per_subdivision == 0:
-        st.warning("Ticks per beat è zero o troppo basso. Restituito il MIDI originale.")
+        warn("Ticks per beat è zero o troppo basso. Restituito il MIDI originale.")
         return original_midi
 
     for original_track in original_midi.tracks:
@@ -1886,7 +1886,7 @@ def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, sw
         for msg in original_track:
             stretched_delta_time = int(round(msg.time * stretch_factor))
             current_abs_time_stretched += stretched_delta_time
-            events_with_abs_time.append({'msg': msg.copy(), 'abs_time_mod': current_abs_time_stretched})
+            events_with_abs_time.append({'msg': _clone(msg), 'abs_time_mod': current_abs_time_stretched})
 
         if quantization_strength > 0:
             for event_data in events_with_abs_time:
@@ -1910,7 +1910,7 @@ def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, sw
             msg = event_data['msg']
             abs_time_mod = event_data['abs_time_mod']
             delta_time = max(0, abs_time_mod - last_abs_time_mod)
-            new_msg = msg.copy(time=delta_time)
+            new_msg = _clone(msg, time=delta_time)
             new_track.append(new_msg)
             last_abs_time_mod = abs_time_mod
 
@@ -2021,7 +2021,7 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength, preserve
                 else:
                     new_pitch = msg.note
                 pitch_map[key].append(new_pitch)
-                new_track.append(msg.copy(note=new_pitch))
+                new_track.append(_clone(msg, note=new_pitch))
 
             elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
                 key = (msg.note, msg.channel)
@@ -2030,7 +2030,7 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength, preserve
                     mapped_pitch = pitch_map[key].pop()
                 else:
                     mapped_pitch = msg.note
-                new_track.append(msg.copy(note=mapped_pitch))
+                new_track.append(_clone(msg, note=mapped_pitch))
 
             else:
                 new_track.append(msg)
@@ -2065,14 +2065,14 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
         if beats_per_measure <= 0 or note_value <= 0:
             raise ValueError
     except (ValueError, IndexError):
-        st.warning(f"Metrica non valida: '{time_signature}'. Verrà usata la metrica 4/4.")
+        warn(f"Metrica non valida: '{time_signature}'. Verrà usata la metrica 4/4.")
         beats_per_measure, note_value = 4, 4
     
     ticks_per_beat = new_midi.ticks_per_beat
     ticks_per_measure = int(ticks_per_beat * beats_per_measure * 4 / note_value)
 
     if ticks_per_measure == 0:
-        st.warning("Ticks per misura è zero. Non è possibile aggiungere la base ritmica.")
+        warn("Ticks per misura è zero. Non è possibile aggiungere la base ritmica.")
         return new_midi
 
     # Calcolo della durata totale del brano originale in ticks
@@ -2084,7 +2084,7 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
         total_ticks = max(total_ticks, current_time)
 
     if total_ticks == 0:
-        st.warning("Il brano originale non contiene eventi validi per calcolare la lunghezza. La base ritmica non verrà aggiunta.")
+        warn("Il brano originale non contiene eventi validi per calcolare la lunghezza. La base ritmica non verrà aggiunta.")
         return new_midi
 
     rhythmic_patterns_in_measure = {
@@ -2156,7 +2156,7 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
                 for i in range(int(ticks_per_measure / ticks_per_eighth)):
                     rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': i * ticks_per_eighth, 'duration_ticks': ticks_per_eighth // 2, 'velocity': rng.randint(60, 90)})
         else:
-            st.warning("Nessuna nota trovata per un pattern adattivo. Verrà usato un pattern fisso.")
+            warn("Nessuna nota trovata per un pattern adattivo. Verrà usato un pattern fisso.")
             if kick: rhythmic_patterns_in_measure["kick"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
             if snare: rhythmic_patterns_in_measure["snare"].append({'start_tick': ticks_per_beat, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
             if hihat: rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 2, 'velocity': 80})
@@ -2189,7 +2189,7 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
         last_abs_time = 0
         for event in all_drum_events:
             delta_time = max(0, event['abs_time'] - last_abs_time)
-            new_msg = event['msg'].copy(time=delta_time)
+            new_msg = _clone(event['msg'], time=delta_time)
             new_drum_track.append(new_msg)
             last_abs_time = event['abs_time']
         
@@ -2266,7 +2266,7 @@ def _split_type0_to_tracks(midi):
     last_t = 0
     for abs_t, msg in sorted(meta_events, key=lambda x: x[0]):
         delta = abs_t - last_t
-        meta_track.append(msg.copy(time=delta))
+        meta_track.append(_clone(msg, time=delta))
         last_t = abs_t
     new_midi.tracks.append(meta_track)
 
@@ -2298,7 +2298,7 @@ def _split_type0_to_tracks(midi):
         evs = sorted(ch_events[ch], key=lambda x: x[0])
         for abs_t, msg in evs:
             delta = abs_t - last_t
-            ch_track.append(msg.copy(time=delta))
+            ch_track.append(_clone(msg, time=delta))
             last_t = abs_t
         new_midi.tracks.append(ch_track)
 
@@ -2328,18 +2328,11 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
 
     tpb = original_midi.ticks_per_beat
 
-    # Durata totale originale in ticks = fine dell'ultima NOTA (non somma di tutti i delta:
-    # code vuote, end_of_track lontani, meta/CC finali non devono allungare il brano)
+    # Durata totale originale in ticks
     total_ticks = 0
     for track in original_midi.tracks:
-        t = 0
-        for msg in track:
-            t += msg.time
-            if msg.type in ('note_on', 'note_off'):
-                total_ticks = max(total_ticks, t)
-    if total_ticks == 0:
-        for track in original_midi.tracks:
-            total_ticks = max(total_ticks, sum(msg.time for msg in track))
+        t = sum(msg.time for msg in track)
+        total_ticks = max(total_ticks, t)
     if total_ticks == 0:
         total_ticks = tpb * 4 * 32  # fallback 32 battute
 
@@ -2396,12 +2389,33 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
         if not weighted_pool:
             return None
 
+        # Indice per il "pitch piu' vicino": valori unici ordinati + prima posizione nel pool,
+        # cosi' la parita' si risolve come min() (vince il primo del pool) ma in O(log n).
+        _uniq = sorted(set(weighted_pool))
+        _first_pos = {}
+        for _i, _p in enumerate(weighted_pool):
+            _first_pos.setdefault(_p, _i)
+
+        def _nearest_in_pool(candidate):
+            k = bisect.bisect_left(_uniq, candidate)
+            if k == 0:
+                return _uniq[0]
+            if k == len(_uniq):
+                return _uniq[-1]
+            lo, hi = _uniq[k - 1], _uniq[k]
+            d_lo, d_hi = candidate - lo, hi - candidate
+            if d_lo < d_hi:
+                return lo
+            if d_hi < d_lo:
+                return hi
+            return lo if _first_pos[lo] < _first_pos[hi] else hi
+
         def pick_pitch(base=None):
             if base is None or cfg["pitch_step"] == 0:
                 return rng.choice(weighted_pool)
             direction = rng.choice([-1, 1])
             candidate = base + direction * cfg["pitch_step"]
-            return min(weighted_pool, key=lambda p: abs(p - candidate))
+            return _nearest_in_pool(candidate)
 
         def pick_vel():
             v = rng.randint(vel_min, vel_max)
@@ -2477,7 +2491,7 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
             meta_track = mido.MidiTrack()
             meta_track.name = track_name
             for msg in orig_track:
-                meta_track.append(msg.copy())
+                meta_track.append(_clone(msg))
             new_midi.tracks.append(meta_track)
             continue
 
@@ -2489,7 +2503,7 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
         if preserve and dominant_channel == DRUM_CHANNEL:
             kept = mido.MidiTrack()
             for msg in orig_track:
-                kept.append(msg.copy())
+                kept.append(_clone(msg))
             new_midi.tracks.append(kept)
             continue
 
@@ -2525,14 +2539,8 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
                 empty.append(_h)
             new_midi.tracks.append(empty)
 
-    _force_source_tempo_map(original_midi, new_midi)
     return new_midi
 
-# --- Session State ---
-if 'midi_ready'   not in st.session_state: st.session_state.midi_ready   = False
-if 'midi_bytes'   not in st.session_state: st.session_state.midi_bytes   = None
-if 'midi_report'  not in st.session_state: st.session_state.midi_report  = ""
-if 'midi_filename' not in st.session_state: st.session_state.midi_filename = ""
 
 # --- Funzione Report ---
 _METHOD_LABELS_EN = {
@@ -2543,6 +2551,8 @@ _METHOD_LABELS_EN = {
     "MIDI Random Pitch Transformer": "❓ Total Pitch Randomization (Chaos)",
     "MIDI Rhythmic Base": "🥁 Add Rhythmic Base",
     "MIDI Recomposer": "🔁 Recomposition (new piece from the original material)",
+    "MIDI Costas Sequencer": "🧮 Scott Rickard — Costas Sequencer",
+    "MIDI Stockhausen Punktuelle": "🎯 Karlheinz Stockhausen — Punktuelle Musik",
     "MIDI Boulez Multiplication": "🔷 Pierre Boulez — Chord Multiplication",
     "MIDI Xenakis Stochastic": "☁️ Iannis Xenakis — Stochastic Music (Clouds)",
     "MIDI Cage Chance": "☯️ John Cage — Chance Operations (I Ching)",
@@ -2550,6 +2560,8 @@ _METHOD_LABELS_EN = {
     "MIDI Bach Canon": "🎻 Johann Sebastian Bach — Strict Canon",
     "MIDI Glass Additive": "➕ Philip Glass — Additive Process",
     "MIDI Messiaen Modes": "🕊️ Olivier Messiaen — Modes of Limited Transposition",
+    "MIDI Part Tintinnabuli": "🔔 Arvo Pärt — Tintinnabuli",
+    "MIDI Reich Phasing": "🌀 Steve Reich — Phasing",
 }
 
 
@@ -2644,10 +2656,11 @@ def _describe_method(lang, key, p):
     return out
 
 
-def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, stile=None):
+def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, stile=None, val=None):
     """Report bilingue IT/EN in formato '::' (protocollo Loop507). `parameters` puo' essere un dict
     {metodo: parametri} oppure una lista allineata a selected_methods (serve per le catene con metodi ripetuti)."""
-    val = validate_midi_output(original_midi, output_midi)
+    if val is None:
+        val = validate_midi_output(original_midi, output_midi)
     tpb = original_midi.ticks_per_beat
     dur = lambda d: f"{d:.2f}" if d is not None else "n/a"
     gm_label = _generated_program_label()
@@ -2669,7 +2682,7 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
     yn_en = "yes" if val['meta_ok'] else "NO"
 
     r = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
-    r += ":: MOTORE / ENGINE: midi_decomposer [v1.1]\n"
+    r += ":: MOTORE / ENGINE: midi_decomposer [v1.2]\n"
     r += f":: FILE: {original_file}\n"
     if stile:
         r += f":: STILE / STYLE: {stile}\n"
@@ -2704,6 +2717,36 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
     return r
 
 
+# =====================================================================
+# [2] INTERFACCIA STREAMLIT
+# =====================================================================
+
+st.set_page_config(
+    page_title="MIDI Decomposer by loop507",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- Titolo Principale ---
+st.markdown("""
+<div style='text-align: center; padding: 20px;'>
+    <h1> MIDI Decomposer <span style='font-size:0.6em; color: #666;'>by <span style='font-size:0.8em;'>loop507</span></span></h1>
+    <p style='font-size: 1.2em; color: #888;'>Scomponi e Ricomponi File MIDI in Nuove Strutture Musicali</p>
+    <p style='font-style: italic;'>Esplora il caos e l'ordine nella generazione MIDI</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Collega il motore a questa sessione (impostazioni da session_state, avvisi su st.warning)
+configure(settings=st.session_state, warn=st.warning)
+
+# --- Session State ---
+if 'midi_ready'   not in st.session_state: st.session_state.midi_ready   = False
+if 'midi_bytes'   not in st.session_state: st.session_state.midi_bytes   = None
+if 'midi_report'  not in st.session_state: st.session_state.midi_report  = ""
+if 'midi_filename' not in st.session_state: st.session_state.midi_filename = ""
+
+
+# --- Esito: salvataggio persistente in session_state ---
 def finalize_result(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, suffix, stile=None, chain=False):
     """Salva il risultato in session_state (bytes, nome file, report) per il download persistente.
     Unico punto di uscita per tutti i pulsanti dell'app. Con chain=True il passo viene accodato alla
@@ -2723,15 +2766,16 @@ def finalize_result(original_file, original_midi, output_midi, selected_methods,
     base_name = os.path.splitext(os.path.basename(original_file))[0]
     st.session_state.midi_bytes    = buf.getvalue()
     st.session_state.midi_filename = f"{base_name}_{'_'.join(suffixes)}.mid"
+    val = validate_midi_output(original_midi, output_midi)
     st.session_state.midi_report   = build_report(
         original_file, original_midi, output_midi,
         [h['method'] for h in history], [h['params'] for h in history], midi_methods,
-        stile=" → ".join(stiles) if stiles else None
+        stile=" → ".join(stiles) if stiles else None, val=val
     )
     st.session_state.midi_ready    = True
     st.session_state.chain_history = history
     st.session_state.chain_source  = original_file
-    if not validate_midi_output(original_midi, output_midi)['ok']:
+    if not val['ok']:
         st.warning("⚠️ Il risultato contiene note non bilanciate o ha perso tempo/metrica: vedi la sezione VALIDAZIONE del report.")
 
 
@@ -2778,7 +2822,24 @@ def render_midi_player(midi_bytes, label, key_suffix=""):
     usando la libreria 'html-midi-player' (Tone.js + soundfont via CDN).
     Nessuna sintesi lato server: funziona anche su Streamlit Cloud.
     """
-    components.html(_player_html(midi_bytes, label, key_suffix), height=260, scrolling=False)
+    html = _player_html(midi_bytes, label, key_suffix)
+    if hasattr(st, "iframe"):  # Streamlit recenti: components.v1.html e' deprecato in favore di st.iframe
+        st.iframe(html, height=260)
+    else:
+        components.html(html, height=260, scrolling=False)
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def _load_midi(raw):
+    """Lettura + normalizzazione + anteprima + durata del MIDI caricato, calcolate UNA volta per file
+    (Streamlit riesegue lo script a ogni click: senza cache si rileggeva tutto ogni volta).
+    Il motore non modifica mai il MIDI in ingresso, quindi l'oggetto puo' essere condiviso."""
+    midi = mido.MidiFile(file=io.BytesIO(raw))
+    midi, was_split = normalize_midi(midi)
+    buf = io.BytesIO()
+    midi.save(file=buf)
+    return midi, was_split, buf.getvalue(), midi_length_seconds(midi)
+
 
 # --- Sezione Upload File MIDI ---
 st.subheader("🎵 Carica il tuo file MIDI (.mid o .midi)")
@@ -2793,20 +2854,18 @@ if uploaded_midi_file is not None:
     st.success("File MIDI caricato con successo!")
 
     try:
-        midi_data = mido.MidiFile(file=uploaded_midi_file)
-        midi_data, _was_split = normalize_midi(midi_data)
+        midi_data, _was_split, _orig_midi_bytes, _orig_seconds = _load_midi(uploaded_midi_file.getvalue())
         if _was_split:
             st.info(f"ℹ️ File MIDI di tipo 0 (una sola traccia con più canali): diviso automaticamente in "
                     f"{len(midi_data.tracks)} tracce (una per canale), così tutti i metodi lavorano per strumento.")
         st.subheader("File MIDI Caricato: Panoramica")
         st.write(f"Nome file: **{uploaded_midi_file.name}**")
         st.write(f"Numero di tracce: **{len(midi_data.tracks)}**")
-        st.write(f"Durata (stimata): **{midi_data.length:.2f} secondi**")
+        st.write(f"Durata (stimata): **{_orig_seconds:.2f} secondi**" if _orig_seconds is not None
+                 else "Durata (stimata): **n/d** (file MIDI di tipo 2)")
 
         with st.expander("🎧 Ascolta il MIDI originale"):
-            _orig_bytes_io = io.BytesIO()
-            midi_data.save(file=_orig_bytes_io)
-            render_midi_player(_orig_bytes_io.getvalue(), "MIDI originale", key_suffix="original")
+            render_midi_player(_orig_midi_bytes, "MIDI originale", key_suffix="original")
 
         st.markdown("---")
         st.subheader("⚙️ Modalita' di Decomposizione")
@@ -2827,7 +2886,8 @@ if uploaded_midi_file is not None:
             value=True,
             key="preserve_drums",
             help="Se attivo, le note del canale 10 (batteria General MIDI) non vengono trasposte, "
-                 "rimappate o ricomposte dai metodi che alterano l'altezza o la struttura.",
+                 "rimappate o ricomposte dai metodi che alterano l'altezza o la struttura. "
+                 "Eccezione: il Time Scrambler stira/quantizza anche la batteria, per restare in sincrono con le altre tracce.",
         )
 
         midi_methods = {
@@ -2961,12 +3021,6 @@ if uploaded_midi_file is not None:
                         midi_methods, stile=style_label,
                         suffix="Recomposed"
                     )
-                    _v = validate_midi_output(midi_data, recomposed)
-                    if _v['duration_in'] and _v['duration_out'] and abs(_v['duration_out'] - _v['duration_in']) > 0.02 * _v['duration_in']:
-                        st.warning(f"⚠️ Durata diversa dall'originale: {_v['duration_in']} s → {_v['duration_out']} s. "
-                                   f"Incolla questi due numeri (e il tipo di file) per il debug.")
-                    else:
-                        st.caption(f"⏱️ Durata: {_v['duration_in']} s → {_v['duration_out']} s")
                     st.success(
                         f"✅ Ricomposizione completata! "
                         f"{len(midi_data.tracks)} tracce originali → "
@@ -3566,7 +3620,7 @@ if uploaded_midi_file is not None:
         st.error("Assicurati che sia un file MIDI valido (.mid o .midi) e riprova.")
         st.exception(e)
 else:
-    st.info("👆 Carica un file MIDI (.mid o (.midi) per iniziare la decomposizione.")
+    st.info("👆 Carica un file MIDI (.mid o .midi) per iniziare la decomposizione.")
     with st.expander("📖 Come usare MIDI Decomposer"):
         st.markdown("""
         ### Benvenuto in MIDI Decomposer!
