@@ -122,24 +122,35 @@ def extract_notes(track, ticks_per_beat=384):
     return notes
 
 
+# Controller "di mix" letti prima della prima nota: volume (7), pan (10), expression (11),
+# riverbero (91), chorus (93). Senza di essi una traccia ricostruita torna ai valori di default
+# della DAW (volume pieno, pan al centro, niente effetti) e il bilanciamento originale va perso.
+_MIX_CCS = (7, 10, 11, 91, 93)
+
+
+def _is_instrument_header_msg(msg):
+    """True per i messaggi che definiscono strumento e mix di una traccia."""
+    if msg.type == 'program_change':
+        return True
+    return msg.type == 'control_change' and (msg.control in (0, 32) or msg.control in _MIX_CCS)
+
+
 def _extract_instrument_header(track):
     """
-    Estrae i messaggi che definiscono lo strumento di una traccia originale
-    (program_change ed eventuali control_change di bank select 0/32), letti
-    prima del primo evento nota. Le funzioni che ricostruiscono una traccia
+    Estrae i messaggi che definiscono strumento e mix di una traccia originale
+    (program_change, bank select 0/32, volume/pan/expression/riverbero/chorus),
+    letti prima del primo evento nota. Le funzioni che ricostruiscono una traccia
     da zero a partire dalle sole note (extract_notes) devono ri-applicare
     questi messaggi in testa alla nuova traccia — altrimenti la DAW (es.
     Logic Pro) assegna il proprio strumento di default (tipicamente
-    "Steinway Grand Piano") a tutte le tracce, perdendo l'orchestrazione
-    originale anche quando il numero e i nomi delle tracce sono corretti.
+    "Steinway Grand Piano") a tutte le tracce e azzera il bilanciamento, perdendo
+    l'orchestrazione originale anche quando numero e nomi delle tracce sono corretti.
     """
     header = []
     for msg in track:
         if msg.type in ('note_on', 'note_off'):
             break
-        if msg.type == 'program_change':
-            header.append(_clone(msg, time=0))
-        elif msg.type == 'control_change' and msg.control in (0, 32):
+        if _is_instrument_header_msg(msg):
             header.append(_clone(msg, time=0))
     return header
 
@@ -814,6 +825,7 @@ def derive_twelve_tone_row(original_midi):
 
 
 @_preserves_meta
+@_keeps_tempo_map
 def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serialize_dynamics=True,
                                  serialize_timbre=True, isolamento_punti=True, preserve_drums=None):
     """
@@ -859,7 +871,10 @@ def midi_stockhausen_punktuelle(original_midi, serialize_duration=True, serializ
     ]
     track_channels = [_get_track_default_channel(t) for t in original_midi.tracks]
     # tracce verso cui il 'timbro' seriale puo' saltare (la batteria resta al suo posto)
-    timbre_targets = [k for k in range(num_tracks) if not (preserve and track_channels[k] == DRUM_CHANNEL)]
+    # (solo tracce con note: una traccia di metadati/tempo non deve ricevere note su un canale a caso)
+    _has_notes = [any(m.type == 'note_on' and m.velocity > 0 for m in t) for t in original_midi.tracks]
+    timbre_targets = [k for k in range(num_tracks)
+                      if _has_notes[k] and not (preserve and track_channels[k] == DRUM_CHANNEL)]
 
     # Raccogli tutte le note come punti indipendenti, in ordine cronologico assoluto
     all_points = []
@@ -1187,6 +1202,7 @@ def _cage_toss_hexagram(rng):
 
 
 @_preserves_meta
+@_keeps_tempo_map
 def midi_cage_chance_operations(original_midi, silence_probability=0.15, duration_variety=True, seed=None):
     """
     Operazioni di caso in stile "Music of Changes": ogni nota del brano
@@ -1572,6 +1588,7 @@ def build_non_retrogradable_rhythm(cell_length, base_unit_ticks, rng):
 
 
 @_preserves_meta
+@_keeps_tempo_map
 def midi_messiaen_modes(original_midi, mode_number=2, transposition=0,
                          non_retrogradable_rhythm=True, rhythm_cell_notes=7, seed=None, preserve_drums=None):
     """
@@ -1669,6 +1686,7 @@ def _part_nearest_triad_tone(pitch, triad_pcs, position="T-1 (piu' vicina sotto)
 
 
 @_preserves_meta
+@_keeps_tempo_map
 def midi_part_tintinnabuli(original_midi, tonic_key="C", triad_type="Minore",
                             t_voice_position="T-1 (piu' vicina sotto)", preserve_drums=None):
     """
@@ -1707,8 +1725,8 @@ def midi_part_tintinnabuli(original_midi, tonic_key="C", triad_type="Minore",
         t_track.append(mido.Message('program_change', program=_generated_program(8), channel=t_channel, time=0))  # celesta di default
 
         if not notes:
-            new_midi.tracks.append(m_track)
-            new_midi.tracks.append(t_track)
+            # traccia di metadati/tempo: passa intatta, senza creare due tracce vuote (M/T) in DAW
+            new_midi.tracks.append(mido.MidiTrack([_clone(m) for m in track]))
             continue
         any_notes = True
         notes.sort(key=lambda n: n['start'])
@@ -1729,7 +1747,8 @@ def midi_part_tintinnabuli(original_midi, tonic_key="C", triad_type="Minore",
             append_events_to_track(trk, evs)
 
         new_midi.tracks.append(m_track)
-        new_midi.tracks.append(t_track)
+        if t_events:  # niente traccia T vuota (es. per la batteria preservata): in DAW sarebbe solo rumore
+            new_midi.tracks.append(t_track)
 
     if not any_notes:
         warn("Nessuna nota trovata. Il tintinnabuli non verra' applicato.")
@@ -1895,10 +1914,15 @@ def midi_phrase_reconstructor(original_midi, phrase_length_beats, reassembly_sty
 
         events_with_abs_time = []
         time_since_last_event = 0
+        _seen_note = False
         for msg in original_track:
             time_since_last_event += msg.time
+            if msg.type in ('note_on', 'note_off'):
+                _seen_note = True
             if msg.type == 'program_change' or (msg.type == 'control_change' and msg.control in (0, 32)):
                 continue  # gia' catturati in _header, verranno fissati all'inizio
+            if not _seen_note and _is_instrument_header_msg(msg):
+                continue  # volume/pan/effetti iniziali: stanno nell'header, non si rimescolano con le frasi
             if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
                 continue  # tempo/metrica/tonalita' non si rimescolano con le frasi: li ripristina _preserves_meta
             events_with_abs_time.append({'msg': msg, 'abs_time': time_since_last_event})
@@ -2331,19 +2355,11 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
 
 
 # Mappatura General MIDI: numero programma → nome famiglia strumentale
-_GM_FAMILY = [
-    "Piano","Chromatic Perc","Organ","Guitar",
-    "Bass","Strings","Ensemble","Brass",
-    "Reed","Pipe","Synth Lead","Synth Pad",
-    "Synth FX","Ethnic","Percussive","Sound FX",
-]
-
 def _gm_track_name(program, channel):
-    """Restituisce il nome GM della famiglia strumentale dato il programma e il canale."""
+    """Nome GM dello strumento (es. 'Violin', 'Acoustic Grand Piano') dato programma e canale; 'Drums' sul canale 10."""
     if channel == 9:
         return "Drums"
-    family = _GM_FAMILY[min(program // 8, 15)]
-    return family
+    return GM_PROGRAM_NAMES[max(0, min(127, int(program)))]
 
 
 def _split_type0_to_tracks(midi):
