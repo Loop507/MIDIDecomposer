@@ -347,6 +347,96 @@ def _trims_tail(func):
     return wrapper
 
 
+# --- Ottimizzazione dell'output per le DAW ---
+_GLOBAL_META_RANK = {'set_tempo': 0, 'time_signature': 1, 'key_signature': 2}
+
+
+def _build_track(items):
+    """[(tick_assoluto, priorita', msg)] -> MidiTrack con delta-time (ordine stabile per (tick, priorita'))."""
+    track = mido.MidiTrack()
+    last = 0
+    for at, _prio, msg in sorted(items, key=lambda x: (x[0], x[1])):
+        track.append(_clone(msg, time=at - last))
+        last = at
+    return track
+
+
+def daw_optimize(midi, split_channels=True):
+    """Rende il MIDI di output piu' robusto all'import nelle DAW. Non modifica `midi`.
+      1. Tempo, metrica e tonalita' stanno SOLO nella prima traccia (come prevede lo standard
+         MIDI: 'tempo information should always be stored in the first MTrk chunk').
+      2. Tempo e metrica espliciti al tick 0 (default 120 BPM, 4/4): senza, alcune DAW importano
+         valori propri (es. Ardour ricade su 120 BPM, 4/4).
+      3. Una traccia = un canale (split_channels): Ableton Live ignora i canali MIDI e fonde in
+         un'unica clip i canali di una traccia; FL Studio e MuseScore li trattano per canale.
+    Ritorna (nuovo_midi, info). Note, tempi e durata restano identici."""
+    info = {'tempo_moved': False, 'defaults': [], 'tracks_split': 0, 'tracks_added': 0}
+    if midi.type == 2 or not midi.tracks:
+        return midi, info
+
+    # 1) eventi globali di tutte le tracce: per ogni (tick, tipo) vince l'ultimo (come la fusione di mido)
+    glob = {}
+    for track in midi.tracks:
+        at = 0
+        for msg in track:
+            at += msg.time
+            if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
+                glob[(at, msg.type)] = _clone(msg, time=0)
+    info['tempo_moved'] = any(msg.is_meta and msg.type in _GLOBAL_META_TYPES
+                              for track in midi.tracks[1:] for msg in track)
+    # 2) tempo e metrica espliciti all'inizio
+    if (0, 'set_tempo') not in glob:
+        glob[(0, 'set_tempo')] = mido.MetaMessage('set_tempo', tempo=500000, time=0)
+        info['defaults'].append('tempo 120 BPM')
+    if (0, 'time_signature') not in glob:
+        glob[(0, 'time_signature')] = mido.MetaMessage('time_signature', numerator=4, denominator=4, time=0)
+        info['defaults'].append('metrica 4/4')
+    glob_items = [(at, _GLOBAL_META_RANK[typ], msg) for (at, typ), msg in glob.items()]
+
+    # 3) ricostruzione: globali solo in traccia 0; poi una traccia per canale
+    rebuilt = []
+    for idx, track in enumerate(midi.tracks):
+        items = []
+        at = 0
+        for msg in track:
+            at += msg.time
+            if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
+                continue
+            items.append((at, 10, msg))
+        if idx == 0:
+            items.extend(glob_items)
+        rebuilt.append((track, items))
+
+    out_tracks = []
+    for track, items in rebuilt:
+        note_count = defaultdict(int)
+        for _at, _p, msg in items:
+            if msg.type == 'note_on' and msg.velocity > 0:
+                note_count[msg.channel] += 1
+        if not split_channels or len(note_count) < 2:
+            out_tracks.append(_build_track(items))
+            continue
+        dominant = max(note_count, key=lambda c: (note_count[c], -c))
+        base = track.name if getattr(track, 'name', '') else 'Traccia'
+        pieces = {c: [] for c in note_count}
+        for entry in items:
+            msg = entry[2]
+            ch = getattr(msg, 'channel', None)
+            pieces[ch if ch in pieces else dominant].append(entry)
+        info['tracks_split'] += 1
+        out_tracks.append(_build_track(pieces[dominant]))
+        for ch in sorted(c for c in pieces if c != dominant):
+            program = next((m.program for _a, _p, m in pieces[ch] if m.type == 'program_change'), None)
+            label = "Drums" if ch == DRUM_CHANNEL else (GM_PROGRAM_NAMES[program] if program is not None else f"ch {ch + 1}")
+            piece = _build_track([(0, 0, mido.MetaMessage('track_name', name=f"{base} - {label}", time=0))] + pieces[ch])
+            out_tracks.append(piece)
+            info['tracks_added'] += 1
+
+    new_midi = mido.MidiFile(type=1 if len(out_tracks) > 1 else midi.type, ticks_per_beat=midi.ticks_per_beat)
+    new_midi.tracks.extend(out_tracks)
+    return new_midi, info
+
+
 def _free_channels(midi):
     """Canali MIDI non usati dal brano (batteria esclusa), per le tracce generate.
     Se il brano li usa tutti, ripiega sui 15 canali melodici."""
@@ -2804,7 +2894,7 @@ def _describe_method(lang, key, p):
     return out
 
 
-def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, stile=None, val=None):
+def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, stile=None, val=None, daw_info=None):
     """Report bilingue IT/EN in formato '::' (protocollo Loop507). `parameters` puo' essere un dict
     {metodo: parametri} oppure una lista allineata a selected_methods (serve per le catene con metodi ripetuti)."""
     if val is None:
@@ -2838,6 +2928,10 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
     r += f":: SEED: {_current_run_seed()} | BATTERIA / DRUMS: {'preservata / preserved' if _drums_preserved() else 'non preservata / not preserved'}\n"
     if gm_label:
         r += f":: STRUMENTO TRACCE GENERATE / GENERATED-TRACK INSTRUMENT: {gm_label}\n"
+    if daw_info is not None:
+        r += (":: DAW: tempo+metrica in prima traccia, un canale per traccia "
+              f"(tracce divise: {daw_info['tracks_split']}, aggiunte: {daw_info['tracks_added']}) / "
+              "tempo+meter in first track, one channel per track\n")
     r += "\n====[ IT ]====\n"
     r += "\"Il file e' entrato come partitura. E' uscito come esperimento.\"\n\n"
     r += "> METODI APPLICATI (in ordine):\n" + methods_block("it") + "\n\n"
@@ -2909,6 +3003,10 @@ def finalize_result(original_file, original_midi, output_midi, selected_methods,
     suffixes = list(dict.fromkeys(h['suffix'] for h in history))
     stiles = list(dict.fromkeys(h['stile'] for h in history if h['stile']))
 
+    daw_info = None
+    if st.session_state.get('daw_optimize', True):
+        output_midi, daw_info = daw_optimize(output_midi)
+
     buf = io.BytesIO()
     output_midi.save(file=buf)
     base_name = os.path.splitext(os.path.basename(original_file))[0]
@@ -2918,7 +3016,7 @@ def finalize_result(original_file, original_midi, output_midi, selected_methods,
     st.session_state.midi_report   = build_report(
         original_file, original_midi, output_midi,
         [h['method'] for h in history], [h['params'] for h in history], midi_methods,
-        stile=" → ".join(stiles) if stiles else None, val=val
+        stile=" → ".join(stiles) if stiles else None, val=val, daw_info=daw_info
     )
     st.session_state.midi_ready    = True
     st.session_state.chain_history = history
@@ -3036,6 +3134,16 @@ if uploaded_midi_file is not None:
             help="Se attivo, le note del canale 10 (batteria General MIDI) non vengono trasposte, "
                  "rimappate o ricomposte dai metodi che alterano l'altezza o la struttura. "
                  "Eccezione: il Time Scrambler stira/quantizza anche la batteria, per restare in sincrono con le altre tracce.",
+        )
+
+        st.checkbox(
+            "🎚️ Ottimizza l'output per la DAW",
+            value=True,
+            key="daw_optimize",
+            help="Tempo e metrica nella prima traccia (come prevede lo standard MIDI) ed espliciti all'inizio; "
+                 "una traccia per canale. Ableton Live ignora i canali MIDI e unirebbe in un'unica clip le parti "
+                 "di una traccia multi-canale; FL Studio importa un canale alla volta. Note, tempi e durata "
+                 "restano identici.",
         )
 
         midi_methods = {
