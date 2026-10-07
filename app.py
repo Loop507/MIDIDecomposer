@@ -361,6 +361,45 @@ def _build_track(items):
     return track
 
 
+def _global_meta_with_defaults(midi):
+    """{(tick, tipo): messaggio} di tempo/metrica/tonalita' di tutto il file (a parita' di tick vince
+    l'ultimo, come la fusione di mido), con tempo 120 BPM e metrica 4/4 espliciti al tick 0 se
+    mancano. Ritorna (dizionario, elenco dei default aggiunti)."""
+    glob = {}
+    for track in midi.tracks:
+        at = 0
+        for msg in track:
+            at += msg.time
+            if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
+                glob[(at, msg.type)] = _clone(msg, time=0)
+    defaults = []
+    if (0, 'set_tempo') not in glob:
+        glob[(0, 'set_tempo')] = mido.MetaMessage('set_tempo', tempo=500000, time=0)
+        defaults.append('tempo 120 BPM')
+    if (0, 'time_signature') not in glob:
+        glob[(0, 'time_signature')] = mido.MetaMessage('time_signature', numerator=4, denominator=4, time=0)
+        defaults.append('metrica 4/4')
+    return glob, defaults
+
+
+def track_to_midi_file(midi, index):
+    """MIDI con la sola traccia `index`, completo di tempo/metrica/tonalita' del file di origine.
+    Salvare una traccia da sola senza questi eventi fa importare il file a 120 BPM, 4/4
+    (la DAW non trova la mappa dei tempi): la parte suonerebbe a velocita' sbagliata."""
+    glob, _defaults = _global_meta_with_defaults(midi)
+    items = []
+    at = 0
+    for msg in midi.tracks[index]:
+        at += msg.time
+        if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
+            continue
+        items.append((at, 10, msg))
+    items.extend((tick, _GLOBAL_META_RANK[typ], msg) for (tick, typ), msg in glob.items())
+    single = mido.MidiFile(type=1, ticks_per_beat=midi.ticks_per_beat)
+    single.tracks.append(_build_track(items))
+    return single
+
+
 def daw_optimize(midi, split_channels=True):
     """Rende il MIDI di output piu' robusto all'import nelle DAW. Non modifica `midi`.
       1. Tempo, metrica e tonalita' stanno SOLO nella prima traccia (come prevede lo standard
@@ -374,23 +413,10 @@ def daw_optimize(midi, split_channels=True):
     if midi.type == 2 or not midi.tracks:
         return midi, info
 
-    # 1) eventi globali di tutte le tracce: per ogni (tick, tipo) vince l'ultimo (come la fusione di mido)
-    glob = {}
-    for track in midi.tracks:
-        at = 0
-        for msg in track:
-            at += msg.time
-            if msg.is_meta and msg.type in _GLOBAL_META_TYPES:
-                glob[(at, msg.type)] = _clone(msg, time=0)
+    # 1) eventi globali di tutte le tracce + 2) tempo e metrica espliciti all'inizio
+    glob, info['defaults'] = _global_meta_with_defaults(midi)
     info['tempo_moved'] = any(msg.is_meta and msg.type in _GLOBAL_META_TYPES
                               for track in midi.tracks[1:] for msg in track)
-    # 2) tempo e metrica espliciti all'inizio
-    if (0, 'set_tempo') not in glob:
-        glob[(0, 'set_tempo')] = mido.MetaMessage('set_tempo', tempo=500000, time=0)
-        info['defaults'].append('tempo 120 BPM')
-    if (0, 'time_signature') not in glob:
-        glob[(0, 'time_signature')] = mido.MetaMessage('time_signature', numerator=4, denominator=4, time=0)
-        info['defaults'].append('metrica 4/4')
     glob_items = [(at, _GLOBAL_META_RANK[typ], msg) for (at, typ), msg in glob.items()]
 
     # 3) ricostruzione: globali solo in traccia 0; poi una traccia per canale
@@ -434,6 +460,136 @@ def daw_optimize(midi, split_channels=True):
 
     new_midi = mido.MidiFile(type=1 if len(out_tracks) > 1 else midi.type, ticks_per_beat=midi.ticks_per_beat)
     new_midi.tracks.extend(out_tracks)
+    return new_midi, info
+
+
+# --- Variazioni di groove della batteria ---
+# Ruoli GM del canale 10 (altezza = strumento del kit). Le variazioni usano SOLO altezze gia' presenti
+# nella batteria del brano: nessun pezzo del kit viene inventato.
+_DRUM_ROLES = {
+    'kick': (36, 35),
+    'snare': (38, 40, 37),
+    'hat_closed': (42, 44),
+    'tom': (47, 45, 43, 41, 48, 50),
+    'crash': (49, 57, 55, 52),
+}
+
+
+def drum_variations(midi, amount=0.4, seed=None):
+    """Varia il groove della batteria (canale 10) mantenendo le altezze del kit. Non modifica `midi`.
+    amount 0..1 = intensita'. Tecniche (tutte con sorteggio riproducibile dal seed):
+      - umanizzazione: dinamica con accenti sul battere / sui levare piu' leggeri, micro-spostamenti di tempo;
+      - colpi mancanti: qualche colpo cade (mai la cassa sul battere ne' i crash);
+      - ghost note del rullante: colpi leggerissimi sui sedicesimi liberi;
+      - fill: nell'ultima battuta di ogni frase da 4, l'ultimo movimento diventa un rullo di sedicesimi
+        su tom (o rullante), con crescendo, e un crash sul battere successivo se il kit lo ha.
+    Le note non-batteria restano identiche; la durata del brano non cambia.
+    Ritorna (nuovo_midi, info)."""
+    info = {'ghost': 0, 'fills': 0, 'dropped': 0, 'crash': 0, 'tracks': 0}
+    amount = max(0.0, min(1.0, float(amount)))
+    if amount <= 0 or midi.type == 2:
+        return midi, info
+    rng = random.Random(_effective_seed(seed, "drumvar"))
+    tpb = midi.ticks_per_beat
+    ts = next((m for _t, m in _collect_global_meta(midi) if m.type == 'time_signature'), None)
+    numer, denom = (ts.numerator, ts.denominator) if ts else (4, 4)
+    bar = max(1, int(tpb * 4 * numer / max(1, denom)))
+    step = max(1, tpb // 4)  # sedicesimo
+    jitter = max(0, int(tpb / 48 * amount * 2))
+
+    new_tracks = []
+    for track in midi.tracks:
+        notes = extract_notes(track, tpb)
+        drum = sorted((n for n in notes if n['channel'] == DRUM_CHANNEL), key=lambda n: (n['start'], n['pitch']))
+        if not drum:
+            new_tracks.append(track)
+            continue
+        info['tracks'] += 1
+        present = {n['pitch'] for n in drum}
+        role = {r: next((p for p in pits if p in present), None) for r, pits in _DRUM_ROLES.items()}
+        t_first = min(n['start'] for n in drum)
+        t_last = max(n['end'] for n in drum)
+        occupied = {(n['start'], n['pitch']) for n in drum}
+
+        # fill: battute di fine frase (ogni 4 battute) e relativo ultimo movimento
+        fill_bars = set()
+        last_bar_index = (t_last - 1) // bar
+        for b in range(3, last_bar_index + 1, 4):
+            if (b + 1) * bar <= t_last and rng.random() < amount and (role['tom'] or role['snare']):
+                fill_bars.add(b)
+        fill_zones = [((b + 1) * bar - tpb, (b + 1) * bar) for b in sorted(fill_bars)]
+
+        out_notes = []
+        for n in drum:
+            in_fill = any(a <= n['start'] < z for a, z in fill_zones)
+            is_anchor = (n['start'] % tpb == 0 and n['pitch'] in _DRUM_ROLES['kick']) or n['pitch'] in _DRUM_ROLES['crash']
+            if in_fill and not n['pitch'] in _DRUM_ROLES['crash']:
+                continue  # sostituito dal rullo
+            if not is_anchor and rng.random() < 0.10 * amount:
+                info['dropped'] += 1
+                continue
+            vel = n['velocity']
+            if n['start'] % bar == 0:
+                vel += int(8 * amount)
+            elif n['start'] % max(1, tpb // 2) != 0:
+                vel -= int(6 * amount)
+            vel += rng.randint(-int(12 * amount), int(12 * amount))
+            shift = rng.randint(-jitter, jitter) if jitter and not is_anchor else 0
+            start = max(0, n['start'] + shift)
+            end = max(start + 1, n['end'] + shift)
+            out_notes.append((start, end, n['pitch'], max(1, min(127, vel))))
+
+        # ghost note del rullante sui sedicesimi liberi
+        if role['snare'] is not None:
+            per_bar = 1 + int(2 * amount)
+            first_bar, last_b = t_first // bar, (t_last - 1) // bar
+            for b in range(first_bar, last_b + 1):
+                if b in fill_bars or rng.random() >= amount:
+                    continue
+                for _ in range(per_bar):
+                    pos = b * bar + rng.randrange(0, max(1, bar // step)) * step
+                    if (pos % tpb == 0 or not (t_first <= pos < t_last - step)
+                            or (pos, role['snare']) in occupied
+                            or any(a <= pos < z for a, z in fill_zones)):
+                        continue
+                    out_notes.append((pos, pos + max(1, step // 2), role['snare'], rng.randint(22, 44)))
+                    occupied.add((pos, role['snare']))
+                    info['ghost'] += 1
+
+        # fill: rullo di sedicesimi con crescendo + crash sul battere successivo
+        for (a, z) in fill_zones:
+            pitches = [p for p in _DRUM_ROLES['tom'] if p in present] or [role['snare']]
+            count = max(1, (z - a) // step)
+            for i in range(count):
+                pos = a + i * step
+                vel = int(58 + (110 - 58) * i / max(1, count - 1))
+                out_notes.append((pos, min(z, pos + step), pitches[i % len(pitches)], max(1, min(127, vel))))
+            info['fills'] += 1
+            if role['crash'] is not None and z < t_last and (z, role['crash']) not in occupied:
+                out_notes.append((z, min(t_last, z + tpb), role['crash'], 100))
+                info['crash'] += 1
+
+        # ricostruzione: i messaggi non-batteria restano com'erano
+        items = []
+        at = 0
+        for msg in track:
+            at += msg.time
+            if msg.type in ('note_on', 'note_off') and msg.channel == DRUM_CHANNEL:
+                continue
+            if msg.is_meta and msg.type == 'end_of_track':
+                prio = 99
+            elif msg.type in ('note_on', 'note_off'):
+                prio = 7
+            else:
+                prio = 1
+            items.append((at, prio, msg))
+        for start, end, pitch, vel in out_notes:
+            items.append((start, 6, mido.Message('note_on', note=pitch, velocity=vel, channel=DRUM_CHANNEL, time=0)))
+            items.append((end, 5, mido.Message('note_off', note=pitch, velocity=0, channel=DRUM_CHANNEL, time=0)))
+        new_tracks.append(_build_track(items))
+
+    new_midi = mido.MidiFile(type=midi.type, ticks_per_beat=tpb)
+    new_midi.tracks.extend(new_tracks)
     return new_midi, info
 
 
@@ -1332,7 +1488,11 @@ def midi_cage_chance_operations(original_midi, silence_probability=0.15, duratio
 
     all_points.sort(key=lambda x: x['start'])
 
-    pitches = [p['pitch'] for p in all_points]
+    preserve = _drums_preserved()
+    drum_points = [p for p in all_points if preserve and p['channel'] == DRUM_CHANNEL]
+    melodic_points = [p for p in all_points if not (preserve and p['channel'] == DRUM_CHANNEL)]
+
+    pitches = [p['pitch'] for p in (melodic_points or all_points)]
     pitch_lo, pitch_hi = min(pitches), max(pitches)
     if pitch_hi <= pitch_lo:
         pitch_hi = pitch_lo + 12
@@ -1344,7 +1504,11 @@ def midi_cage_chance_operations(original_midi, silence_probability=0.15, duratio
 
     events_per_track = [[] for _ in range(num_tracks)]
     hexagram_log = []
-    for point in all_points:
+    # Batteria preservata: i colpi restano com'erano (altezza = strumento del kit), niente caso
+    for point in drum_points:
+        events_per_track[point['track_idx']].append({'msg': mido.Message('note_on', note=point['pitch'], velocity=point['velocity'], channel=point['channel'], time=0), 'abs_time': point['start']})
+        events_per_track[point['track_idx']].append({'msg': mido.Message('note_off', note=point['pitch'], velocity=0, channel=point['channel'], time=0), 'abs_time': max(point['end'], point['start'] + 1)})
+    for point in melodic_points:
         hex_pitch = _cage_toss_hexagram(rng)
         hex_dur = _cage_toss_hexagram(rng) if duration_variety else hex_pitch
         hex_dyn = _cage_toss_hexagram(rng)
@@ -2181,7 +2345,11 @@ def midi_density_transformer(original_midi, add_note_probability, remove_note_pr
             new_midi.tracks.append(original_track)
             continue
 
-        modified_notes = [note for note in notes if rng.randint(0, 100) >= remove_note_probability]
+        # (il sorteggio avviene sempre, cosi' la sequenza casuale delle altre tracce non cambia;
+        #  i colpi di batteria con "Preserva la batteria" attivo non vengono mai rimossi)
+        modified_notes = [note for note in notes
+                          if rng.randint(0, 100) >= remove_note_probability
+                          or (preserve and note['channel'] == DRUM_CHANNEL)]
 
         # Durata minima garantita: almeno 1 tick
         def safe_duration(note):
@@ -2894,7 +3062,7 @@ def _describe_method(lang, key, p):
     return out
 
 
-def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, stile=None, val=None, daw_info=None):
+def build_report(original_file, original_midi, output_midi, selected_methods, parameters, midi_methods, stile=None, val=None, daw_info=None, drum_info=None):
     """Report bilingue IT/EN in formato '::' (protocollo Loop507). `parameters` puo' essere un dict
     {metodo: parametri} oppure una lista allineata a selected_methods (serve per le catene con metodi ripetuti)."""
     if val is None:
@@ -2928,6 +3096,10 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
     r += f":: SEED: {_current_run_seed()} | BATTERIA / DRUMS: {'preservata / preserved' if _drums_preserved() else 'non preservata / not preserved'}\n"
     if gm_label:
         r += f":: STRUMENTO TRACCE GENERATE / GENERATED-TRACK INSTRUMENT: {gm_label}\n"
+    if drum_info is not None:
+        r += (f":: VARIAZIONI BATTERIA / DRUM VARIATIONS: intensita' {drum_info['amount']:.0%} | ghost note: {drum_info['ghost']}, "
+              f"fill: {drum_info['fills']}, crash: {drum_info['crash']}, colpi tolti: {drum_info['dropped']} "
+              "(altezze del kit invariate / kit pitches unchanged)\n")
     if daw_info is not None:
         r += (":: DAW: tempo+metrica in prima traccia, un canale per traccia "
               f"(tracce divise: {daw_info['tracks_split']}, aggiunte: {daw_info['tracks_added']}) / "
@@ -3003,6 +3175,11 @@ def finalize_result(original_file, original_midi, output_midi, selected_methods,
     suffixes = list(dict.fromkeys(h['suffix'] for h in history))
     stiles = list(dict.fromkeys(h['stile'] for h in history if h['stile']))
 
+    drum_info = None
+    if st.session_state.get('drum_var', False):
+        _amount = st.session_state.get('drum_var_amount', 40) / 100.0
+        output_midi, drum_info = drum_variations(output_midi, _amount)
+        drum_info['amount'] = _amount
     daw_info = None
     if st.session_state.get('daw_optimize', True):
         output_midi, daw_info = daw_optimize(output_midi)
@@ -3016,7 +3193,7 @@ def finalize_result(original_file, original_midi, output_midi, selected_methods,
     st.session_state.midi_report   = build_report(
         original_file, original_midi, output_midi,
         [h['method'] for h in history], [h['params'] for h in history], midi_methods,
-        stile=" → ".join(stiles) if stiles else None, val=val, daw_info=daw_info
+        stile=" → ".join(stiles) if stiles else None, val=val, daw_info=daw_info, drum_info=drum_info
     )
     st.session_state.midi_ready    = True
     st.session_state.chain_history = history
@@ -3133,7 +3310,23 @@ if uploaded_midi_file is not None:
             key="preserve_drums",
             help="Se attivo, le note del canale 10 (batteria General MIDI) non vengono trasposte, "
                  "rimappate o ricomposte dai metodi che alterano l'altezza o la struttura. "
-                 "Eccezione: il Time Scrambler stira/quantizza anche la batteria, per restare in sincrono con le altre tracce.",
+                 "Eccezioni: il Time Scrambler stira/quantizza anche la batteria, per restare in sincrono con le altre "
+                 "tracce; Riorganizzazione Frasi riordina nel tempo anche i colpi di batteria (stesse altezze). "
+                 "I compositori generativi (Eno, Bach, Glass, Reich, Xenakis, Costas...) non creano parti di batteria: "
+                 "la lasciano com'e' (usa 'Varia il groove della batteria' per variarla).",
+        )
+
+        _drum_var_on = st.checkbox(
+            "🥁 Varia il groove della batteria",
+            value=False,
+            key="drum_var",
+            help="Opzionale, per qualsiasi metodo: umanizza dinamica e tempi, toglie qualche colpo, aggiunge ghost note "
+                 "del rullante e fill (rullo di tom + crash) a fine frase. Usa solo le altezze gia' presenti nella "
+                 "batteria del brano: il kit non cambia. Se non c'e' batteria non fa nulla.",
+        )
+        st.slider(
+            "Intensita' variazioni batteria (%)", min_value=10, max_value=100, value=40, step=5,
+            key="drum_var_amount", disabled=not _drum_var_on,
         )
 
         st.checkbox(
@@ -3861,9 +4054,7 @@ if uploaded_midi_file is not None:
                             )
                             if selected_tracks_indices:
                                 for track_index in selected_tracks_indices:
-                                    single_track_midi = mido.MidiFile()
-                                    single_track_midi.tracks.append(decomposed_midi_file.tracks[track_index])
-                                    single_track_midi.ticks_per_beat = decomposed_midi_file.ticks_per_beat
+                                    single_track_midi = track_to_midi_file(decomposed_midi_file, track_index)
                                     single_track_bytes = io.BytesIO()
                                     single_track_midi.save(file=single_track_bytes)
                                     single_track_bytes.seek(0)
@@ -3929,6 +4120,11 @@ if st.session_state.midi_ready and st.session_state.midi_bytes:
     render_midi_player(st.session_state.midi_bytes, "MIDI decomposto/ricomposto", key_suffix="result")
 
     st.subheader("Scarica il tuo MIDI Decomposto")
+    st.caption(
+        "🍎 **Logic Pro:** apri il file con *File ▸ Apri* (non *Importa*). L'importazione carica solo le note e i "
+        "controller e **ignora tempo, metrica, nomi delle tracce e marker**; con *Apri* Logic crea una traccia di "
+        "strumento software per ogni traccia MIDI, scegliendo lo strumento dal program change."
+    )
     c_d1, c_d2 = st.columns(2)
     with c_d1:
         st.download_button(
