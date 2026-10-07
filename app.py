@@ -226,6 +226,75 @@ def _preserves_meta(func):
     return wrapper
 
 
+def _tempo_pairs(midi):
+    """[(tick_assoluto, tempo)] di tutti i set_tempo del file, in ordine di tick
+    (a parita' di tick, ordine delle tracce: come la fusione di mido)."""
+    return [(t, m.tempo) for t, m in _collect_global_meta(midi) if m.type == 'set_tempo']
+
+
+def _sync_tempo_map(source_midi, result_midi):
+    """Fa coincidere la mappa dei tempi del risultato con quella del sorgente.
+    Serve ai metodi che ricostruiscono le tracce SENZA cambiare la scala dei tick: se il tempo
+    del brano e' sparso su piu' tracce (es. una traccia 'tempo' a 60 BPM + un set_tempo a 190 BPM
+    dentro una traccia di note), la ricostruzione ne perdeva una parte e la durata cambiava
+    (es. 5 minuti -> 16). Se le due mappe sono gia' uguali non tocca nulla.
+    Le tracce del risultato non vengono mai modificate sul posto (possono essere condivise)."""
+    if source_midi is result_midi:
+        return result_midi
+    src = _tempo_pairs(source_midi)
+    res = _tempo_pairs(result_midi)
+    if dict(src) == dict(res):  # mappa effettiva uguale (l'ultimo tempo a ogni tick vince)
+        return result_midi
+    for i, track in enumerate(result_midi.tracks):
+        if not any(msg.is_meta and msg.type == 'set_tempo' for msg in track):
+            continue
+        rebuilt = mido.MidiTrack()
+        carry = 0
+        for msg in track:
+            if msg.is_meta and msg.type == 'set_tempo':
+                carry += msg.time
+                continue
+            rebuilt.append(_clone(msg, time=msg.time + carry) if carry else msg)
+            carry = 0
+        result_midi.tracks[i] = rebuilt
+    if not result_midi.tracks:
+        result_midi.tracks.append(mido.MidiTrack())
+    first = result_midi.tracks[0]
+    events = []
+    t = 0
+    for msg in first:
+        t += msg.time
+        if msg.is_meta and msg.type == 'end_of_track':
+            continue
+        events.append((t, 1, msg))
+    for tick, tempo in src:
+        events.append((tick, 0, mido.MetaMessage('set_tempo', tempo=tempo, time=0)))
+    events.sort(key=lambda e: (e[0], e[1]))
+    new_first = mido.MidiTrack()
+    last = 0
+    for t, _prio, msg in events:
+        new_first.append(_clone(msg, time=t - last))
+        last = t
+    result_midi.tracks[0] = new_first
+    return result_midi
+
+
+def _keeps_tempo_map(func):
+    """Decoratore per i metodi che ricostruiscono le tracce mantenendo i tick:
+    il tempo (e quindi la durata in secondi) del brano originale resta quello originale."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+        original = args[0] if args else kwargs.get('original_midi')
+        if original is not None:
+            if isinstance(result, tuple) and result and isinstance(result[0], mido.MidiFile):
+                _sync_tempo_map(original, result[0])
+            elif isinstance(result, mido.MidiFile):
+                _sync_tempo_map(original, result)
+        return result
+    return wrapper
+
+
 def _free_channels(midi):
     """Canali MIDI non usati dal brano (batteria esclusa), per le tracce generate.
     Se il brano li usa tutti, ripiega sui 15 canali melodici."""
@@ -853,6 +922,7 @@ def derive_boulez_sets(original_midi, set_size=4):
 
 
 @_preserves_meta
+@_keeps_tempo_map
 def midi_boulez_multiplication(original_midi, set_size=4, chord_density=0, register_spread=1, preserve_drums=None):
     """
     Ogni nota del brano originale viene sostituita da un accordo costruito
@@ -1918,6 +1988,7 @@ def midi_time_scrambler(original_midi, stretch_factor, quantization_strength, sw
     return new_midi
 
 @_preserves_meta
+@_keeps_tempo_map
 def midi_density_transformer(original_midi, add_note_probability, remove_note_probability, polyphony_mode, preserve_drums=None, seed=None):
     """
     Aggiunge o rimuove note per alterare la densita' MIDI.
@@ -2306,6 +2377,7 @@ def _split_type0_to_tracks(midi):
 
 
 @_preserves_meta
+@_keeps_tempo_map
 def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
     """
     Ricompone TRACCIA PER TRACCIA il MIDI originale.
