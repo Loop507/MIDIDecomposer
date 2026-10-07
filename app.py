@@ -295,6 +295,47 @@ def _keeps_tempo_map(func):
     return wrapper
 
 
+def _clamp_tail(midi, end_tick):
+    """Riporta a end_tick ogni evento che cade oltre (marker/end_of_track/tempi lontani):
+    la durata del file coincide con la fine della musica. Le tracce toccate vengono sostituite
+    da copie (mai modificate sul posto: possono essere condivise con il MIDI originale)."""
+    for i, track in enumerate(midi.tracks):
+        t = 0
+        over = False
+        for msg in track:
+            t += msg.time
+            if t > end_tick:
+                over = True
+                break
+        if not over:
+            continue
+        rebuilt = mido.MidiTrack()
+        t = 0
+        last = 0
+        for msg in track:
+            t += msg.time
+            at = min(t, end_tick)
+            rebuilt.append(_clone(msg, time=at - last))
+            last = at
+        midi.tracks[i] = rebuilt
+    return midi
+
+
+def _trims_tail(func):
+    """Decoratore (piu' esterno) per i metodi che generano la musica da zero: il risultato
+    finisce all'ultima nota, non a un end_of_track/marker lontano ereditato dal file originale."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+        out = result[0] if isinstance(result, tuple) and result else result
+        if isinstance(out, mido.MidiFile):
+            end = midi_last_note_tick(out)
+            if end > 0:
+                _clamp_tail(out, end)
+        return result
+    return wrapper
+
+
 def _free_channels(midi):
     """Canali MIDI non usati dal brano (batteria esclusa), per le tracce generate.
     Se il brano li usa tutti, ripiega sui 15 canali melodici."""
@@ -405,10 +446,24 @@ def estimate_key(midi, ignore_drums=True):
     return best
 
 
-def midi_length_seconds(midi):
+def midi_last_note_tick(midi):
+    """Tick assoluto dell'ultima nota (note_on/note_off) di tutto il file: la fine della MUSICA,
+    che puo' essere molto prima della fine 'grezza' del file (end_of_track o marker lontani)."""
+    last = 0
+    for track in midi.tracks:
+        t = 0
+        for msg in track:
+            t += msg.time
+            if t > last and msg.type in ('note_on', 'note_off'):
+                last = t
+    return last
+
+
+def midi_length_seconds(midi, end_tick=None):
     """Durata in secondi calcolata dai tempi assoluti (stesso risultato di mido.MidiFile.length,
     ma senza fondere e rileggere tutti i messaggi: ~15x piu' veloce sui file grandi).
-    None per i file di tipo 2 (tracce indipendenti: la durata non e' definita)."""
+    None per i file di tipo 2 (tracce indipendenti: la durata non e' definita).
+    end_tick: se indicato, misura fino a quel tick invece che alla fine grezza del file."""
     if midi.type == 2:
         return None
     tpb = midi.ticks_per_beat
@@ -422,6 +477,8 @@ def midi_length_seconds(midi):
                 tempi.append((t, msg.tempo))
         if t > end:
             end = t
+    if end_tick is not None:
+        end = end_tick
     tempi.sort(key=lambda x: x[0])  # stabile: a parita' di tick vale l'ultimo
     seconds = 0.0
     for i, (tick, tempo) in enumerate(tempi):
@@ -2376,6 +2433,7 @@ def _split_type0_to_tracks(midi):
     return new_midi
 
 
+@_trims_tail
 @_preserves_meta
 @_keeps_tempo_map
 def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
@@ -2400,11 +2458,13 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
 
     tpb = original_midi.ticks_per_beat
 
-    # Durata totale originale in ticks
-    total_ticks = 0
-    for track in original_midi.tracks:
-        t = sum(msg.time for msg in track)
-        total_ticks = max(total_ticks, t)
+    # Durata totale in ticks = fine della MUSICA (ultima nota), non la fine grezza del file:
+    # un end_of_track / marker molto oltre l'ultima nota allungherebbe l'output di minuti.
+    total_ticks = midi_last_note_tick(original_midi)
+    if total_ticks == 0:
+        for track in original_midi.tracks:
+            t = sum(msg.time for msg in track)
+            total_ticks = max(total_ticks, t)
     if total_ticks == 0:
         total_ticks = tpb * 4 * 32  # fallback 32 battute
 
@@ -3098,6 +3158,16 @@ if uploaded_midi_file is not None:
                         f"{len(midi_data.tracks)} tracce originali → "
                         f"{len(recomposed.tracks)} tracce ricomposte."
                     )
+                    _dur_out = midi_length_seconds(recomposed)
+                    _dur_music = midi_length_seconds(midi_data, end_tick=midi_last_note_tick(midi_data))
+                    if _orig_seconds is not None and _dur_out is not None:
+                        st.caption(f"⏱️ Durata: originale {_orig_seconds:.0f} s → ricomposto {_dur_out:.0f} s")
+                        if _dur_music and abs(_dur_music / _orig_seconds - 1) > 0.05:
+                            st.info(
+                                f"Il file originale dura {_orig_seconds:.0f} s ma l'ultima nota termina a "
+                                f"{_dur_music:.0f} s (il resto e' silenzio / eventi finali): "
+                                f"la ricomposizione segue la musica."
+                            )
 
         elif modalita == "🎼 Compositori":
             st.markdown("#### 🎼 Tecniche Compositive Algoritmiche")
