@@ -1,4 +1,4 @@
-# MidiDecomposer_5_1.py — MIDI Decomposer by loop507 (file unico)
+# MidiDecomposer_6_0.py — MIDI Decomposer by loop507 (file unico)
 # Struttura: [1] MOTORE (utilita' MIDI, seed, compositori, metodi, validazione, report)
 #            [2] INTERFACCIA Streamlit.
 
@@ -398,6 +398,14 @@ def track_to_midi_file(midi, index):
     single = mido.MidiFile(type=1, ticks_per_beat=midi.ticks_per_beat)
     single.tracks.append(_build_track(items))
     return single
+
+
+def get_track_display_name(track, index):
+    """Etichetta leggibile di una traccia per la UI (nome traccia o '(Senza Nome)')."""
+    track_name = next((msg.name for msg in track if msg.type == 'track_name'), None)
+    if not track_name and hasattr(track, 'name') and 'Ritmica:' in track.name:
+        return track.name
+    return f"Traccia {index}: {track_name if track_name else '(Senza Nome)'}"
 
 
 def daw_optimize(midi, split_channels=True):
@@ -3088,7 +3096,7 @@ def build_report(original_file, original_midi, output_midi, selected_methods, pa
     yn_en = "yes" if val['meta_ok'] else "NO"
 
     r = "[MIDI_DECOMPOSER] // VOL_01 // MIDI // STRUCTURAL_DECOMPOSITION\n"
-    r += ":: MOTORE / ENGINE: midi_decomposer [v1.2]\n"
+    r += ":: MOTORE / ENGINE: midi_decomposer [v6.0]\n"
     r += f":: FILE: {original_file}\n"
     if stile:
         r += f":: STILE / STYLE: {stile}\n"
@@ -4034,41 +4042,6 @@ if uploaded_midi_file is not None:
                             selected_methods_keys, parameters, midi_methods, stile=None,
                             suffix="Decomposed"
                         )
-
-                        def get_track_display_name(track, index):
-                            track_name = next((msg.name for msg in track if msg.type == 'track_name'), None)
-                            if not track_name and hasattr(track, 'name') and 'Ritmica:' in track.name:
-                                return track.name
-                            return f"Traccia {index}: {track_name if track_name else '(Senza Nome)'}"
-
-                        if len(decomposed_midi_file.tracks) > 0:
-                            st.markdown("---")
-                            st.subheader("Scarica Singole Tracce del MIDI Decomposto")
-                            track_options = [get_track_display_name(track, i) for i, track in enumerate(decomposed_midi_file.tracks)]
-                            selected_tracks_indices = st.multiselect(
-                                "Seleziona una o più tracce da scaricare singolarmente:",
-                                options=list(range(len(decomposed_midi_file.tracks))),
-                                format_func=lambda x: track_options[x],
-                                default=None,
-                                help="Seleziona le tracce che vuoi scaricare come file MIDI separati."
-                            )
-                            if selected_tracks_indices:
-                                for track_index in selected_tracks_indices:
-                                    single_track_midi = track_to_midi_file(decomposed_midi_file, track_index)
-                                    single_track_bytes = io.BytesIO()
-                                    single_track_midi.save(file=single_track_bytes)
-                                    single_track_bytes.seek(0)
-                                    original_file_base_name = os.path.splitext(os.path.basename(uploaded_midi_file.name))[0]
-                                    track_name_for_file = get_track_display_name(decomposed_midi_file.tracks[track_index], track_index).replace(' ', '_').replace(':', '')
-                                    st.download_button(
-                                        label=f"💾 Scarica {track_options[track_index]}",
-                                        data=single_track_bytes,
-                                        file_name=f"{original_file_base_name}_{track_name_for_file}.mid",
-                                        mime="audio/midi",
-                                        key=f"download_track_{track_index}"
-                                    )
-                        else:
-                            st.info("Il MIDI decomposto non contiene tracce valide da scaricare singolarmente.")
                     else:
                         st.error("Impossibile generare il MIDI decomposto. Controlla i messaggi di avviso.")
 
@@ -4143,6 +4116,37 @@ if st.session_state.midi_ready and st.session_state.midi_bytes:
             key="down_report"
         )
     st.text_area("📄 REPORT", st.session_state.midi_report, height=300)
+
+    # --- Download per singola traccia (persistente: vive fuori da qualsiasi st.button) ---
+    try:
+        _result_midi = mido.MidiFile(file=io.BytesIO(st.session_state.midi_bytes))
+    except Exception:
+        _result_midi = None
+    if _result_midi is not None and len(_result_midi.tracks) > 0:
+        st.markdown("---")
+        st.subheader("Scarica Singole Tracce del MIDI")
+        _track_labels = [get_track_display_name(t, i) for i, t in enumerate(_result_midi.tracks)]
+        _sel_tracks = st.multiselect(
+            "Seleziona una o più tracce da scaricare singolarmente:",
+            options=list(range(len(_result_midi.tracks))),
+            format_func=lambda x: _track_labels[x],
+            key="single_tracks_sel",
+            help="Ogni traccia viene scaricata come file MIDI separato, con tempo e metrica del brano."
+        )
+        _base = os.path.splitext(st.session_state.midi_filename or "midi")[0]
+        for _ti in _sel_tracks:
+            if _ti >= len(_result_midi.tracks):
+                continue
+            _buf = io.BytesIO()
+            track_to_midi_file(_result_midi, _ti).save(file=_buf)
+            _safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in _track_labels[_ti])
+            st.download_button(
+                label=f"💾 Scarica {_track_labels[_ti]}",
+                data=_buf.getvalue(),
+                file_name=f"{_base}_{_safe}.mid",
+                mime="audio/midi",
+                key=f"download_track_{_ti}"
+            )
 
 st.markdown("---")
 st.markdown("""
