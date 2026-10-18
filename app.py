@@ -1,4 +1,4 @@
-# MidiDecomposer_6_0.py — MIDI Decomposer by loop507 (file unico)
+# MidiDecomposer_12_0.py — MIDI Decomposer by loop507 (file unico)
 # Struttura: [1] MOTORE (utilita' MIDI, seed, compositori, metodi, validazione, report)
 #            [2] INTERFACCIA Streamlit.
 
@@ -7,12 +7,14 @@ import bisect
 import copy as _copy
 import functools
 import io
+import itertools
 import logging
+import math
 import os
 import random
 import threading
 import zlib
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 
 import mido
 import numpy as np
@@ -2100,6 +2102,1100 @@ def midi_reich_phasing(original_midi, cell_length_notes=8, num_cycles=32,
     return new_midi, current_phase_ticks
 
 
+# =====================================================================
+# --- MATEMATICA SPERIMENTALE ---
+# Strutture matematiche ispirate a "Godel, Escher, Bach" (D. Hofstadter, 1979) e a
+# "Blueprints" (M. du Sautoy, 2025): canone eterno ascendente, scala impossibile di
+# Shepard, metamorfosi, sistema formale MIU, simmetrie del fregio, cicli hamiltoniani e
+# serie infinita di Norgard. Pura combinatoria/DSP: nessuna rete neurale. Le tracce
+# originali restano intatte; il risultato si aggiunge come nuove tracce.
+# =====================================================================
+
+def _math_fold_pitch(p, lo=12, hi=115):
+    """Riporta un pitch in [lo, hi] spostandolo per ottave (mai clamp: niente note identiche accumulate)."""
+    p = int(p)
+    while p > hi:
+        p -= 12
+    while p < lo:
+        p += 12
+    return max(0, min(127, p))
+
+
+def _math_new_midi(original_midi):
+    new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
+    for track in original_midi.tracks:
+        new_midi.tracks.append(track)
+    return new_midi
+
+
+def _math_voice_channels(original_midi, count):
+    free = _free_channels(original_midi)
+    return [free[i % len(free)] for i in range(count)]
+
+
+def _math_pool_notes(original_midi):
+    """Tutte le note del brano (batteria esclusa se preservata)."""
+    notes = []
+    for tr in original_midi.tracks:
+        for n in extract_notes(tr, original_midi.ticks_per_beat):
+            if _drums_preserved() and n['channel'] == DRUM_CHANNEL:
+                continue
+            notes.append(n)
+    return notes
+
+
+def _math_subject(original_midi, max_notes):
+    """Prime max_notes note della prima traccia melodica, con il tempo azzerato sulla prima nota."""
+    subject = derive_bach_subject(original_midi, max_notes=max_notes)
+    if not subject:
+        return []
+    t0 = subject[0]['start']
+    return [{'pitch': n['pitch'], 'start': n['start'] - t0,
+             'end': max(n['end'] - t0, n['start'] - t0 + 1), 'velocity': n['velocity']} for n in subject]
+
+
+def _math_scale_pcs(pool, scale_source):
+    """Classi di altezza della scala: quelle del brano (se ce ne sono almeno 3) oppure cromatica."""
+    if scale_source == "Dal brano":
+        pcs = sorted({n['pitch'] % 12 for n in pool})
+        if len(pcs) >= 3:
+            return pcs, "Dal brano"
+        return list(range(12)), "Cromatica (il brano ha meno di 3 classi di altezza)"
+    return list(range(12)), "Cromatica"
+
+
+def _math_add_track(new_midi, name, notes, channel, program):
+    """Aggiunge una traccia da note [{'pitch','start','end','velocity'}] in tick assoluti.
+    Tronca ogni nota all'attacco successivo dello stesso pitch (evita note_off ambigui)."""
+    by_pitch = defaultdict(list)
+    for n in notes:
+        p = max(0, min(127, int(n['pitch'])))
+        s = max(0, int(n['start']))
+        by_pitch[p].append({'pitch': p, 'start': s, 'end': max(s + 1, int(n['end'])),
+                            'velocity': max(1, min(127, int(n['velocity'])))})
+    events = []
+    for p, lst in by_pitch.items():
+        lst.sort(key=lambda n: n['start'])
+        for i, n in enumerate(lst):
+            end = n['end']
+            if i + 1 < len(lst):
+                if lst[i + 1]['start'] <= n['start']:
+                    continue  # attacco doppio nello stesso tick: tengo l'ultimo
+                end = min(end, lst[i + 1]['start'])
+            end = max(n['start'] + 1, end)
+            events.append({'msg': mido.Message('note_on', note=p, velocity=n['velocity'], channel=channel, time=0), 'abs_time': n['start']})
+            events.append({'msg': mido.Message('note_off', note=p, velocity=0, channel=channel, time=0), 'abs_time': end})
+    track = mido.MidiTrack()
+    track.name = name
+    track.append(mido.Message('program_change', program=program, channel=channel, time=0))
+    append_events_to_track(track, events)
+    new_midi.tracks.append(track)
+    return track
+
+
+def math_melodic_tracks(midi):
+    """[(indice traccia, nome, numero note)] delle tracce con note (batteria esclusa se preservata)."""
+    out = []
+    for i, tr in enumerate(midi.tracks):
+        notes = [n for n in extract_notes(tr, midi.ticks_per_beat)
+                 if not (_drums_preserved() and n['channel'] == DRUM_CHANNEL)]
+        if notes:
+            name = tr.name if getattr(tr, 'name', '') else f"Traccia {i}"
+            out.append((i, name, len(notes)))
+    return out
+
+
+# --- 1. Canon per Tonos (Bach, Offerta Musicale, 1747; discusso da Hofstadter in GEB) ---
+# Il canone ricomincia a ogni giro un tono piu' in alto; dopo sei giri e' tornato nella
+# tonalita' d'origine, un'ottava sopra: sale per sempre senza uscire dalla tonalita'.
+
+@_preserves_meta
+def midi_canon_per_tonos(original_midi, num_voices=2, step_semitones=2, laps=1, delay_beats=2.0,
+                         voice_interval=7, subject_notes=12, close_on_octave=True):
+    subject = _math_subject(original_midi, subject_notes)
+    if not subject:
+        warn("Nessun soggetto melodico trovato. Il Canon per Tonos non verra' generato.")
+        return original_midi, {'ok': False}
+    tpb = original_midi.ticks_per_beat
+    step = min((1, 2, 3, 4, 6), key=lambda d: abs(d - int(step_semitones)))  # solo divisori di 12: il giro si chiude
+    cycles = (12 // step) * max(1, int(laps))
+    total_cycles = cycles + (1 if close_on_octave else 0)
+    cycle_ticks = max(tpb, int(math.ceil(max(n['end'] for n in subject) / tpb)) * tpb)
+    delay_ticks = int(float(delay_beats) * tpb)
+    num_voices = max(1, int(num_voices))
+
+    # Se il giro finale uscirebbe dal registro, abbassa tutto per ottave intere.
+    top = max(n['pitch'] for n in subject) + voice_interval * (num_voices - 1) + step * cycles
+    lower = 0
+    if top > 115:
+        lower = -12 * int(math.ceil((top - 115) / 12))
+
+    new_midi = _math_new_midi(original_midi)
+    channels = _math_voice_channels(original_midi, num_voices)
+    program = _generated_program(48)
+    for v in range(num_voices):
+        notes = []
+        for k in range(total_cycles):
+            shift = k * step + voice_interval * v + lower
+            for n in subject:
+                notes.append({'pitch': _math_fold_pitch(n['pitch'] + shift, 0, 127),
+                              'start': k * cycle_ticks + v * delay_ticks + n['start'],
+                              'end': k * cycle_ticks + v * delay_ticks + n['end'],
+                              'velocity': int(n['velocity'] * (1.0 if v == 0 else 0.85))})
+        _math_add_track(new_midi, f"Canon per Tonos Voce {v + 1} (+{step}st a giro, {total_cycles} giri)", notes, channels[v], program)
+    return new_midi, {'ok': True, 'cycles': total_cycles, 'step': step, 'voices': num_voices,
+                      'total_shift': cycles * step}
+
+
+# --- 2. Scala di Shepard-Penrose (Shepard 1964; "Salendo e scendendo" di Escher, 1960) ---
+# Strati di ottave con peso a campana sul registro: la scala sale (o scende) senza fine.
+
+@_preserves_meta
+def midi_shepard_penrose(original_midi, direction="Ascendente", num_steps=48, step_beats=0.5,
+                         layers=6, scale_source="Dal brano", peak_velocity=100):
+    pool = _math_pool_notes(original_midi)
+    pcs, scale_used = _math_scale_pcs(pool, scale_source)
+    order = list(pcs) if str(direction).startswith("Asc") else list(reversed(pcs))
+    layers = max(3, min(8, int(layers)))
+    span = 12 * layers
+    low = max(0, (60 - span // 2) // 12 * 12)
+    center, sigma = low + span / 2.0, span / 4.0
+    tpb = original_midi.ticks_per_beat
+    step_ticks = max(1, int(float(step_beats) * tpb))
+    notes = []
+    for s in range(max(1, int(num_steps))):
+        pc = order[s % len(order)]
+        for i in range(layers):
+            p = low + 12 * i + pc
+            w = math.exp(-0.5 * ((p - center) / sigma) ** 2)
+            if w < 0.03:
+                continue
+            notes.append({'pitch': p, 'start': s * step_ticks, 'end': (s + 1) * step_ticks,
+                          'velocity': max(1, int(round(peak_velocity * w)))})
+    new_midi = _math_new_midi(original_midi)
+    ch = _math_voice_channels(original_midi, 1)[0]
+    _math_add_track(new_midi, f"Shepard-Penrose {direction} ({layers} strati)", notes, ch, _generated_program(89))
+    return new_midi, {'ok': True, 'scale': scale_used, 'layers': layers, 'steps': int(num_steps), 'notes': len(notes)}
+
+
+# --- 3. Metamorfosi (Escher, serie "Metamorphosis", 1937-1968) ---
+# Una traccia si trasforma gradualmente in un'altra: altezza, attacco, durata e velocity
+# vengono interpolati nota per nota da A a B.
+
+@_preserves_meta
+def midi_escher_metamorphosis(original_midi, track_a=None, track_b=None, max_notes=128, snap_to_pool=True):
+    # File tipo 0 (una traccia, piu' canali): esplodi i canali in tracce, come fa il Recomposer.
+    if original_midi.type == 0 or (len(original_midi.tracks) == 1 and
+            len({m.channel for t in original_midi.tracks for m in t if hasattr(m, 'channel')}) > 1):
+        original_midi = _split_type0_to_tracks(original_midi)
+    tracks = math_melodic_tracks(original_midi)
+    if len(tracks) < 2:
+        warn("La Metamorfosi richiede almeno due tracce con note. Non verra' generata.")
+        return original_midi, {'ok': False}
+    valid = {i for i, _, _ in tracks}
+    if track_a not in valid or track_b not in valid or track_a == track_b:
+        track_a, track_b = tracks[0][0], tracks[1][0]
+    names = {i: nm for i, nm, _ in tracks}
+    tpb = original_midi.ticks_per_beat
+
+    def track_notes(idx):
+        ns = [n for n in extract_notes(original_midi.tracks[idx], tpb)
+              if not (_drums_preserved() and n['channel'] == DRUM_CHANNEL)]
+        ns.sort(key=lambda n: (n['start'], n['pitch']))
+        return ns
+    A, B = track_notes(track_a), track_notes(track_b)
+    n_out = max(2, min(max(len(A), len(B)), int(max_notes)))
+    union = sorted({n['pitch'] for n in A} | {n['pitch'] for n in B})
+
+    def snap(p):
+        k = bisect.bisect_left(union, p)
+        if k == 0:
+            return union[0]
+        if k == len(union):
+            return union[-1]
+        lo, hi = union[k - 1], union[k]
+        return lo if (p - lo) <= (hi - p) else hi
+
+    out = []
+    for i in range(n_out):
+        t = i / (n_out - 1)
+        a = A[min(len(A) - 1, int(i * len(A) / n_out))]
+        b = B[min(len(B) - 1, int(i * len(B) / n_out))]
+        mix = lambda x, y: (1 - t) * x + t * y
+        pitch = mix(a['pitch'], b['pitch'])
+        pitch = snap(pitch) if snap_to_pool else int(round(pitch))
+        start = int(round(mix(a['start'], b['start'])))
+        dur = max(1, int(round(mix(a['end'] - a['start'], b['end'] - b['start']))))
+        out.append({'pitch': pitch, 'start': start, 'end': start + dur,
+                    'velocity': int(round(mix(a['velocity'], b['velocity'])))})
+    new_midi = _math_new_midi(original_midi)
+    ch = _math_voice_channels(original_midi, 1)[0]
+    _math_add_track(new_midi, f"Escher Metamorfosi: {names[track_a]} -> {names[track_b]}", out, ch, _generated_program(0))
+    return new_midi, {'ok': True, 'a': track_a, 'b': track_b, 'a_name': names[track_a], 'b_name': names[track_b], 'notes': n_out}
+
+
+# --- 4. Sistema formale MIU (Hofstadter, "Godel, Escher, Bach", cap. 1) ---
+# Alfabeto {M,I,U}, assioma MI, quattro regole: (1) xI -> xIU; (2) Mx -> Mxx;
+# (3) III -> U; (4) UU -> (nulla). Ogni passo applica una regola scelta a caso (seed) fra
+# quelle applicabili. Invariante: il numero di I non e' mai multiplo di 3, quindi MU non
+# e' derivabile. Ogni stringa diventa una sezione: I = cellula, U = cellula invertita, M = pedale.
+
+def _miu_applications(s, allow_grow):
+    """Elenco [(regola, posizione)] delle regole applicabili a s."""
+    apps = []
+    if s.endswith("I") and allow_grow:
+        apps.append((1, len(s) - 1))
+    if allow_grow:
+        apps.append((2, 0))
+    for j in range(len(s) - 2):
+        if s[j:j + 3] == "III":
+            apps.append((3, j))
+    for j in range(len(s) - 1):
+        if s[j:j + 2] == "UU":
+            apps.append((4, j))
+    return apps
+
+
+def _miu_apply(s, rule, pos):
+    if rule == 1:
+        return s + "U"
+    if rule == 2:
+        return s + s[1:]
+    if rule == 3:
+        return s[:pos] + "U" + s[pos + 3:]
+    return s[:pos] + s[pos + 2:]
+
+
+def miu_derive(rng, steps, max_len, budget=20000):
+    """Derivazione MIU: lista di stringhe da 'MI'. Ricerca casuale con ritorno indietro: le regole che
+    allungano rispettano max_len e, se una derivazione finisce in un vicolo cieco (nessuna regola piu'
+    applicabile), si torna indietro e si prova un'altra mossa, cosi' si raggiunge il numero di passi
+    richiesto quando esiste un percorso. Entro il budget; altrimenti la derivazione piu' lunga trovata."""
+    def legal(s):
+        grow_ok = {1: len(s) + 1 <= max_len, 2: 1 + 2 * (len(s) - 1) <= max_len}
+        return [(r, p) for (r, p) in _miu_applications(s, True) if grow_ok.get(r, True)]
+
+    steps = max(0, int(steps))
+    state = {'best': ["MI"], 'nodes': 0}
+    hist = ["MI"]
+
+    def dfs(s):
+        if len(hist) > len(state['best']):
+            state['best'] = hist[:]
+        if len(hist) - 1 >= steps:
+            return True
+        state['nodes'] += 1
+        if state['nodes'] > budget:
+            return False
+        by_kind = defaultdict(list)
+        for r, p in legal(s):
+            by_kind[r].append(p)
+        kinds = sorted(by_kind)
+        rng.shuffle(kinds)  # il primo tipo di regola e' scelto uniformemente fra quelli applicabili
+        for r in kinds:
+            positions = by_kind[r]
+            rng.shuffle(positions)
+            for p in positions:
+                t = _miu_apply(s, r, p)
+                hist.append(t)
+                if dfs(t):
+                    return True
+                hist.pop()
+                if state['nodes'] > budget:
+                    return False
+        return False
+
+    dfs("MI")
+    return state['best']
+
+
+@_preserves_meta
+def midi_miu_system(original_midi, steps=8, max_len=16, cell_notes=3, cell_beats=2.0, seed=None):
+    cell = _math_subject(original_midi, max(2, int(cell_notes)))
+    if len(cell) < 2:
+        warn("Servono almeno 2 note per la cellula del sistema MIU. Non verra' generato.")
+        return original_midi, {'ok': False}
+    rng = _rng(seed, "miu")
+    history = miu_derive(rng, steps, max(4, int(max_len)))
+    tpb = original_midi.ticks_per_beat
+    cell_ticks = max(2, int(float(cell_beats) * tpb))
+    p0 = cell[0]['pitch']
+    pitches_i = [n['pitch'] for n in cell]
+    pitches_u = [2 * p0 - p for p in pitches_i]
+    vels = [n['velocity'] for n in cell]
+    k = len(cell)
+    notes, t = [], 0
+    for s in history:
+        for sym in s:
+            if sym == "M":
+                notes.append({'pitch': _math_fold_pitch(p0 - 12, 0, 127), 'start': t, 'end': t + cell_ticks, 'velocity': 80})
+            else:
+                src = pitches_i if sym == "I" else pitches_u
+                for j in range(k):
+                    a = t + (j * cell_ticks) // k
+                    b = t + ((j + 1) * cell_ticks) // k
+                    notes.append({'pitch': _math_fold_pitch(src[j], 0, 127), 'start': a,
+                                  'end': max(a + 1, a + int((b - a) * 0.9)), 'velocity': vels[j]})
+            t += cell_ticks
+        t += cell_ticks  # pausa fra una derivazione e la successiva
+    new_midi = _math_new_midi(original_midi)
+    ch = _math_voice_channels(original_midi, 1)[0]
+    _math_add_track(new_midi, f"MIU {len(history) - 1} passi (da MI a {history[-1][:24]})", notes, ch, _generated_program(0))
+    return new_midi, {'ok': True, 'history': history, 'final': history[-1], 'cells': sum(len(s) + 1 for s in history)}
+
+
+# --- 5. Simmetrie del fregio (Escher, divisione regolare del piano) ---
+# Le isometrie del piano tempo-altezza applicate a un motivo: e = identita',
+# I = riflessione dell'altezza (inversione), R = riflessione del tempo (retrogrado),
+# RI = rotazione di 180 gradi (retrogrado-inversione). Le celle del fregio si susseguono
+# secondo lo schema scelto; le voci impilate in una cella vanno su tracce separate.
+
+FRIEZE_PATTERNS = {
+    "Traslazione (p1)":           [["e"]],
+    "Riflessione con scorrimento (p11g)": [["e"], ["I"]],
+    "Specchio verticale (p1m1)":  [["e"], ["R"]],
+    "Rotazione di 180° (p2)":     [["e"], ["RI"]],
+    "Specchio orizzontale (p11m)": [["e", "I"]],
+    "Doppio specchio (p2mm)":     [["e", "I"], ["R", "RI"]],
+}
+
+
+def _frieze_transform(notes, op, pmin, pmax, D):
+    out = []
+    for n in notes:
+        p, s, e = n['pitch'], n['start'], n['end']
+        if op in ("I", "RI"):
+            p = (pmin + pmax) - p
+        if op in ("R", "RI"):
+            s, e = D - n['end'], D - n['start']
+        out.append({'pitch': p, 'start': s, 'end': e, 'velocity': n['velocity']})
+    return out
+
+
+@_preserves_meta
+def midi_escher_symmetry(original_midi, pattern="Traslazione (p1)", motif_notes=8, cells=16):
+    motif = _math_subject(original_midi, max(2, int(motif_notes)))
+    if len(motif) < 2:
+        warn("Servono almeno 2 note per il motivo del fregio. Non verra' generato.")
+        return original_midi, {'ok': False}
+    spec = FRIEZE_PATTERNS.get(pattern, FRIEZE_PATTERNS["Traslazione (p1)"])
+    tpb = original_midi.ticks_per_beat
+    D = max(tpb, int(math.ceil(max(n['end'] for n in motif) / tpb)) * tpb)
+    pmin, pmax = min(n['pitch'] for n in motif), max(n['pitch'] for n in motif)
+    slots = max(len(c) for c in spec)
+    slot_notes = [[] for _ in range(slots)]
+    for c in range(max(1, int(cells))):
+        cell = spec[c % len(spec)]
+        for j, op in enumerate(cell):
+            for n in _frieze_transform(motif, op, pmin, pmax, D):
+                slot_notes[j].append({'pitch': n['pitch'], 'start': n['start'] + c * D,
+                                      'end': n['end'] + c * D, 'velocity': n['velocity']})
+    new_midi = _math_new_midi(original_midi)
+    channels = _math_voice_channels(original_midi, slots)
+    for j in range(slots):
+        _math_add_track(new_midi, f"Escher Fregio {pattern} - voce {j + 1}", slot_notes[j], channels[j], _generated_program(0))
+    return new_midi, {'ok': True, 'cells': int(cells), 'cell_ticks': D, 'slots': slots}
+
+
+# --- 6. Ciclo hamiltoniano (W. R. Hamilton, Icosian game, 1857; du Sautoy, "Blueprints") ---
+# Grafo: nodi = pitch del brano, archi fra pitch a distanza <= max_interval semitoni.
+# Un ciclo hamiltoniano visita ogni nodo una sola volta e richiude il cerchio: una
+# melodia senza ripetizioni che riparte da capo senza salti. Ricerca con backtracking
+# (euristica di Warnsdorff, parita' risolte dal seed) e budget massimo di passi.
+
+def hamiltonian_search(adj, rng, budget=200000):
+    """Ritorna (percorso, e_un_ciclo_hamiltoniano_completo, espansioni). Lavora sulla componente connessa piu' grande.
+    Se il ciclo non esiste (o non si trova nel budget) il percorso e' il piu' lungo trovato; se la
+    componente ha un nodo di grado < 2 un ciclo e' impossibile e ci si ferma al primo percorso completo."""
+    # componente connessa piu' grande (a parita' vince quella con l'indice minimo)
+    seen, comps = set(), []
+    for i in range(len(adj)):
+        if i in seen:
+            continue
+        comp, stack = [], [i]
+        seen.add(i)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        comps.append(sorted(comp))
+    comp = max(comps, key=lambda c: (len(c), -c[0]))
+    if len(comp) < 2:
+        return [comp[0]], False, 0
+    local = {g: i for i, g in enumerate(comp)}
+    ladj = [[local[v] for v in adj[g]] for g in comp]
+    n = len(ladj)
+    # Un ciclo hamiltoniano richiede un grafo 2-connesso: senza nodi di articolazione e con grado >= 2.
+    def _connected_without(skip):
+        rest = [i for i in range(n) if i != skip]
+        seen_r, stack_r = {rest[0]}, [rest[0]]
+        while stack_r:
+            u = stack_r.pop()
+            for v in ladj[u]:
+                if v != skip and v not in seen_r:
+                    seen_r.add(v)
+                    stack_r.append(v)
+        return len(seen_r) == len(rest)
+    cycle_possible = n >= 3 and min(len(a) for a in ladj) >= 2 and all(_connected_without(v) for v in range(n))
+    start = min(range(n), key=lambda i: (len(ladj[i]), i))
+    state = {'exp': 0, 'best': [start], 'cycle': None}
+    path, visited = [start], {start}
+
+    def dfs(u):
+        if len(path) > len(state['best']):
+            state['best'] = path[:]
+        if len(path) == n:
+            if start in ladj[u]:
+                state['cycle'] = path[:]
+                return True
+            return not cycle_possible  # percorso completo ma ciclo impossibile: basta cosi'
+        state['exp'] += 1
+        if state['exp'] > budget:
+            return False
+        cands = [v for v in ladj[u] if v not in visited]
+        cands.sort(key=lambda v: (sum(1 for w in ladj[v] if w not in visited), rng.random()))
+        for v in cands:
+            path.append(v)
+            visited.add(v)
+            if dfs(v):
+                return True
+            path.pop()
+            visited.discard(v)
+            if state['exp'] > budget:
+                return False
+        return False
+
+    dfs(start)
+    if state['cycle'] is not None:
+        # True solo se il ciclo copre TUTTO il grafo; su una componente piu' piccola resta un anello parziale
+        return [comp[i] for i in state['cycle']], len(comp) == len(adj), state['exp']
+    return [comp[i] for i in state['best']], False, state['exp']
+
+
+@_preserves_meta
+def midi_hamiltonian_cycle(original_midi, max_interval=7, max_nodes=16, repeats=4, seed=None):
+    pool = _math_pool_notes(original_midi)
+    stats = defaultdict(list)
+    for n in pool:
+        stats[n['pitch']].append(n)
+    ranked = sorted(stats, key=lambda p: (-len(stats[p]), p))[:max(3, int(max_nodes))]
+    nodes = sorted(ranked)
+    if len(nodes) < 3:
+        warn("Servono almeno 3 pitch distinti per il grafo. Il ciclo hamiltoniano non verra' generato.")
+        return original_midi, {'ok': False}
+    rng = _rng(seed, "hamiltonian")
+    maxi = max(1, int(max_interval))
+    adj = [[j for j in range(len(nodes)) if j != i and abs(nodes[i] - nodes[j]) <= maxi] for i in range(len(nodes))]
+    path, is_cycle, expansions = hamiltonian_search(adj, rng)
+    closed = len(path) >= 3 and path[0] in adj[path[-1]]
+    status = 'full' if is_cycle else ('partial' if closed else 'path')
+    tpb = original_midi.ticks_per_beat
+
+    def node_note(idx):
+        ns = stats[nodes[idx]]
+        durs = sorted(n['end'] - n['start'] for n in ns)
+        dur = max(tpb // 8, durs[len(durs) // 2])
+        vel = int(sum(n['velocity'] for n in ns) / len(ns))
+        return nodes[idx], dur, vel
+
+    notes, t = [], 0
+    for _ in range(max(1, int(repeats))):
+        for idx in path:
+            p, dur, vel = node_note(idx)
+            notes.append({'pitch': p, 'start': t, 'end': t + dur, 'velocity': vel})
+            t += dur
+    new_midi = _math_new_midi(original_midi)
+    ch = _math_voice_channels(original_midi, 1)[0]
+    kind = {'full': "ciclo", 'partial': "ciclo parziale", 'path': "percorso piu' lungo"}[status]
+    _math_add_track(new_midi, f"Hamilton {kind} su {len(path)}/{len(nodes)} pitch (salto max {maxi}st)", notes, ch, _generated_program(0))
+    return new_midi, {'ok': True, 'nodes': len(nodes), 'status': status, 'covered': len(path),
+                      'expansions': expansions, 'pitches': [nodes[i] for i in path]}
+
+
+# --- 7. Serie infinita di Norgard (Per Norgard, anni '60) ---
+# a(0)=0, a(2n) = -a(n), a(2n+1) = a(n)+1: 0, 1, -1, 2, 1, 0, -2, 3, ...
+# E' autosimile: prendendo un elemento ogni 2^k si riottiene la serie (invertita se k e'
+# dispari). Gli strati lenti sono quindi lo "scheletro" dello strato veloce.
+
+def norgard_value(n):
+    n = int(n)
+    if n == 0:
+        return 0
+    return -norgard_value(n >> 1) if n % 2 == 0 else norgard_value(n >> 1) + 1
+
+
+@_preserves_meta
+def midi_norgard_infinity(original_midi, num_notes=64, step_beats=0.5, layers=3, scale_source="Dal brano"):
+    pool = _math_pool_notes(original_midi)
+    if not pool:
+        warn("Nessuna nota trovata per la serie di Norgard. Non verra' generata.")
+        return original_midi, {'ok': False}
+    pcs, scale_used = _math_scale_pcs(pool, scale_source)
+    n_deg = len(pcs)
+
+    def step_pitch(k):
+        octave, deg = divmod(k, n_deg)
+        return 12 * octave + pcs[deg]
+
+    median = sorted(n['pitch'] for n in pool)[len(pool) // 2]
+    k_guess = (median // 12) * n_deg
+    k0 = min(range(k_guess - 2 * n_deg, k_guess + 3 * n_deg), key=lambda k: (abs(step_pitch(k) - median), k))
+    tpb = original_midi.ticks_per_beat
+    step_ticks = max(1, int(float(step_beats) * tpb))
+    total_ticks = max(1, int(num_notes)) * step_ticks
+    layers = max(1, min(4, int(layers)))
+    new_midi = _math_new_midi(original_midi)
+    channels = _math_voice_channels(original_midi, layers)
+    for k in range(layers):
+        notes, j = [], 0
+        stride = 2 ** k
+        while j * stride * step_ticks < total_ticks:
+            p = step_pitch(k0 + norgard_value(j * stride)) - 12 * k
+            notes.append({'pitch': _math_fold_pitch(p), 'start': j * stride * step_ticks,
+                          'end': (j + 1) * stride * step_ticks, 'velocity': min(120, 85 + 10 * k)})
+            j += 1
+        _math_add_track(new_midi, f"Norgard Strato {k + 1} (1 nota ogni {stride} passi)", notes, channels[k], _generated_program(0))
+    return new_midi, {'ok': True, 'scale': scale_used, 'layers': layers,
+                      'series_head': [norgard_value(i) for i in range(16)]}
+
+
+
+# =====================================================================
+# --- TEORIA MATEMATICA DELLA MUSICA (Mathematical Music Theory) ---
+# Cinque metodi dal filone di ricerca della Society for Mathematics and Computation in Music:
+# ritmi euclidei (Toussaint), trasformazioni neo-riemanniane (Lewin) con voice leading
+# geometrico (Tymoczko), Spiral Array (Chew), insiemi massimamente uniformi (Clough-Douthett)
+# e DFT degli insiemi di altezze (Lewin, Quinn, Amiot). Stesso schema dei metodi precedenti: pura
+# matematica/numpy, nessuna rete neurale; le tracce originali restano intatte.
+# =====================================================================
+
+# --- 8. Ritmi euclidei (G. Toussaint, "The Euclidean Algorithm Generates Traditional Musical Rhythms", 2005) ---
+# L'algoritmo di Bjorklund (1999) distribuisce k attacchi su n passi nel modo piu' uniforme
+# possibile, con la stessa ricorsione dell'algoritmo di Euclide sul massimo comun divisore.
+# E(3,8) = x..x..x.   E(5,8) = x.xx.xx.   E(7,12) = x.xx.x.xx.x.
+# Le altezze sono quelle del soggetto del brano, ciclate sugli attacchi.
+
+def bjorklund(pulses, steps):
+    """Pattern euclideo E(pulses, steps) come lista di 0/1 (1 = attacco)."""
+    steps = max(1, int(steps))
+    pulses = max(0, min(int(pulses), steps))
+    if pulses == 0:
+        return [0] * steps
+    head = [[1] for _ in range(pulses)]
+    tail = [[0] for _ in range(steps - pulses)]
+    while len(tail) > 1:
+        n = min(len(head), len(tail))
+        merged = [head[i] + tail[i] for i in range(n)]
+        left = head[n:] if len(head) > len(tail) else tail[n:]
+        head, tail = merged, left
+    return [x for group in head + tail for x in group]
+
+
+def _pattern_string(pattern):
+    return "".join("x" if v else "." for v in pattern)
+
+
+@_preserves_meta
+def midi_euclidean_rhythm(original_midi, steps=16, pulses=5, rotation=0, step_beats=0.25,
+                          layers=1, cycles=4, subject_notes=8):
+    subject = _math_subject(original_midi, max(1, int(subject_notes)))
+    if not subject:
+        warn("Nessun soggetto melodico trovato. Il ritmo euclideo non verra' generato.")
+        return original_midi, {'ok': False}
+    tpb = original_midi.ticks_per_beat
+    steps = max(2, int(steps))
+    step_ticks = max(1, int(float(step_beats) * tpb))
+    layers = max(1, min(3, int(layers)))
+    cycles = max(1, int(cycles))
+    rot = int(rotation) % steps
+    pitches = [n['pitch'] for n in subject]
+    vels = [n['velocity'] for n in subject]
+    new_midi = _math_new_midi(original_midi)
+    channels = _math_voice_channels(original_midi, layers)
+    program = _generated_program(0)
+    patterns = []
+    for j in range(layers):
+        k = max(1, min(steps, int(pulses) - 2 * j))  # ogni strato successivo ha 2 attacchi in meno
+        pat = bjorklund(k, steps)
+        pat = pat[rot:] + pat[:rot]
+        patterns.append((k, _pattern_string(pat)))
+        notes, hit = [], 0
+        for c in range(cycles):
+            first = True
+            for i, on in enumerate(pat):
+                if not on:
+                    continue
+                idx = hit % len(pitches)
+                start = (c * steps + i) * step_ticks
+                vel = vels[idx] + (12 if first else 0)
+                notes.append({'pitch': _math_fold_pitch(pitches[idx] - 12 * j),
+                              'start': start, 'end': start + max(1, int(step_ticks * 0.9)),
+                              'velocity': min(127, vel)})
+                first = False
+                hit += 1
+        _math_add_track(new_midi, f"Euclideo E({k},{steps}) strato {j + 1}", notes, channels[j], program)
+    return new_midi, {'ok': True, 'steps': steps, 'layers': layers, 'patterns': patterns, 'rotation': rot}
+
+
+# --- 9. Trasformazioni neo-riemanniane (D. Lewin, "Generalized Musical Intervals and Transformations", 1987) ---
+# Una triade e' un oggetto (fondamentale, modo); P, L, R sono funzioni che la trasformano:
+#   P (parallela):        Do maggiore <-> Do minore
+#   L (nota sensibile):   Do maggiore <-> Mi minore
+#   R (relativa):         Do maggiore <-> La minore
+# Sono involuzioni e muovono una sola voce (di 1 o 2 semitoni). Le sequenze alternate danno cicli
+# chiusi: P-L = ciclo esatonico (6 accordi), P-R = ottatonico (8), L-R = tutte le 24 triadi.
+# Il voicing e' scelto con il voice leading a distanza minima (D. Tymoczko, Science, 2006):
+# gli accordi sono punti di uno spazio, il voice leading e' la distanza fra due punti.
+
+NR_PATTERNS = {
+    "Ciclo esatonico (P-L)": ('P', 'L'),
+    "Ciclo ottatonico (P-R)": ('P', 'R'),
+    "Ciclo diatonico (L-R)": ('L', 'R'),
+    "Passeggiata casuale (seed)": None,
+}
+
+
+def nr_transform(triad, op):
+    """Applica P, L o R a una triade (fondamentale 0-11, 'M'|'m')."""
+    root, q = triad
+    if q == 'M':
+        return {'P': (root, 'm'), 'L': ((root + 4) % 12, 'm'), 'R': ((root + 9) % 12, 'm')}[op]
+    return {'P': (root, 'M'), 'L': ((root + 8) % 12, 'M'), 'R': ((root + 3) % 12, 'M')}[op]
+
+
+def _nr_pcs(triad):
+    root, q = triad
+    return [root % 12, (root + (4 if q == 'M' else 3)) % 12, (root + 7) % 12]
+
+
+def _nr_name(triad):
+    return _NOTE_NAMES[triad[0] % 12] + ('' if triad[1] == 'M' else 'm')
+
+
+def _vl_next(prev, pcs):
+    """Voice leading di distanza minima da `prev` (lista di pitch, una per voce) alle classi di
+    altezza `pcs`: prova ogni assegnazione voce -> classe e prende, per ciascuna voce, il pitch piu'
+    vicino. Ritorna (distanza totale in semitoni, nuovi pitch)."""
+    best = None
+    for perm in itertools.permutations(pcs):
+        cand, total = [], 0
+        for p, pc in zip(prev, perm):
+            d = (pc - p) % 12
+            if d > 6:
+                d -= 12
+            cand.append(p + d)
+            total += abs(d)
+        if len(set(cand)) < len(cand):
+            continue  # due voci sullo stesso pitch: scartata
+        if best is None or total < best[0]:
+            best = (total, cand)
+    if best is None:  # impossibile con 3 classi distinte, ma per sicurezza
+        best = (0, list(prev))
+    total, cand = best
+    while min(cand) < 40:
+        cand = [p + 12 for p in cand]
+    while max(cand) > 88:
+        cand = [p - 12 for p in cand]
+    return total, cand
+
+
+def _vl_first(triad, base=52):
+    """Voicing iniziale in posizione fondamentale, fondamentale in [base, base+11]."""
+    root = triad[0]
+    r0 = base + (root - base) % 12
+    return [r0, r0 + (4 if triad[1] == 'M' else 3), r0 + 7]
+
+
+@_preserves_meta
+def midi_neo_riemannian(original_midi, pattern="Ciclo esatonico (P-L)", steps=12, chord_beats=2.0,
+                        start="Dal brano", tie_common_tones=True, seed=None):
+    if not isinstance(start, str) or start == "Dal brano" or not start:
+        est = estimate_key(original_midi)
+        triad = (est[0] % 12, 'M' if est[1] == "Maggiore" else 'm') if est else (0, 'M')
+    else:
+        triad = (get_key_offset(start) % 12, 'm' if start.endswith('m') else 'M')
+    steps = max(2, int(steps))
+    if pattern in NR_PATTERNS and NR_PATTERNS[pattern] is not None:
+        cycle = NR_PATTERNS[pattern]
+        ops = [cycle[i % len(cycle)] for i in range(steps - 1)]
+    else:
+        rng = _rng(seed, "neo-riemannian")
+        ops, last = [], None
+        for _ in range(steps - 1):
+            op = rng.choice([o for o in "PLR" if o != last])  # P, L, R sono involuzioni: evita di annullarsi
+            ops.append(op)
+            last = op
+    triads = [triad]
+    for op in ops:
+        triads.append(nr_transform(triads[-1], op))
+    period = next((i for i in range(1, len(triads)) if triads[i] == triads[0]), None)
+
+    voicings = [_vl_first(triads[0])]
+    distances = []
+    for t in triads[1:]:
+        d, v = _vl_next(voicings[-1], _nr_pcs(t))
+        voicings.append(v)
+        distances.append(d)
+
+    tpb = original_midi.ticks_per_beat
+    chord_ticks = max(2, int(float(chord_beats) * tpb))
+    notes = []
+    for voice in range(3):
+        i = 0
+        while i < len(voicings):
+            j = i
+            if tie_common_tones:
+                while j + 1 < len(voicings) and voicings[j + 1][voice] == voicings[i][voice]:
+                    j += 1
+            notes.append({'pitch': voicings[i][voice], 'start': i * chord_ticks,
+                          'end': (j + 1) * chord_ticks - (0 if tie_common_tones else max(1, chord_ticks // 16)),
+                          'velocity': 80})
+            i = j + 1
+    new_midi = _math_new_midi(original_midi)
+    ch = _math_voice_channels(original_midi, 1)[0]
+    _math_add_track(new_midi, f"Neo-Riemanniano {pattern} ({steps} accordi da {_nr_name(triads[0])})",
+                    notes, ch, _generated_program(48))
+    return new_midi, {'ok': True, 'start': _nr_name(triads[0]), 'chords': [_nr_name(t) for t in triads],
+                      'ops': ops, 'period': period, 'vl_total': sum(distances), 'vl_steps': distances}
+
+
+# --- 10. Spiral Array (E. Chew, "Towards a Mathematical Model of Tonality", 2000) ---
+# Le altezze stanno su un'elica 3D lungo la linea delle quinte: P(k) = (r sin(k*pi/2), r cos(k*pi/2), k*h).
+# Con h = r*sqrt(2/15) la distanza di quinta (k, k+1) e quella di terza maggiore (k, k+4) coincidono.
+# Un accordo e' il baricentro pesato delle sue note, una tonalita' quello dei suoi accordi I, V, IV.
+# Il "centro d'effetto" (CE) di un frammento di musica e' il baricentro delle sue note, pesato
+# sulle durate: l'accordo piu' vicino al CE e' l'armonia del frammento; la distanza del CE dal centro
+# della tonalita' e' una misura di tensione. I pesi sono parametri liberi del modello: qui valori
+# semplici che rispettano w1 >= w2 >= w3 con somma 1.
+
+_SP_H = math.sqrt(2.0 / 15.0)
+_SP_W = (0.6, 0.3, 0.1)      # pesi: fondamentale, quinta, terza (accordo); I, V, IV (tonalita')
+_SP_ALPHA = 0.75             # terza minore: armonica (k-3) contro melodica (k+3)
+_SP_BETA = 0.75              # tonalita' minore: V maggiore contro v minore
+
+
+def _sp_pos(k):
+    a = k * math.pi / 2.0
+    return np.array([math.sin(a), math.cos(a), k * _SP_H])
+
+
+def _sp_k(pc, c):
+    """Indice sulla linea delle quinte della classe di altezza pc, riportato in [c-5, c+6].
+    Il MIDI non distingue Do# da Reb: la finestra centrata sulla tonalita' sceglie l'ortografia piu' vicina."""
+    k = (7 * pc) % 12
+    while k < c - 5:
+        k += 12
+    while k > c + 6:
+        k -= 12
+    return k
+
+
+def _sp_chord(k, q):
+    w1, w2, w3 = _SP_W
+    if q == 'M':
+        return w1 * _sp_pos(k) + w2 * _sp_pos(k + 1) + w3 * _sp_pos(k + 4)
+    third = _SP_ALPHA * _sp_pos(k - 3) + (1 - _SP_ALPHA) * _sp_pos(k + 3)
+    return w1 * _sp_pos(k) + w2 * _sp_pos(k + 1) + w3 * third
+
+
+def _sp_key(k, q):
+    v1, v2, v3 = _SP_W
+    if q == 'M':
+        return v1 * _sp_chord(k, 'M') + v2 * _sp_chord(k + 1, 'M') + v3 * _sp_chord(k - 1, 'M')
+    dom = _SP_BETA * _sp_chord(k + 1, 'M') + (1 - _SP_BETA) * _sp_chord(k + 1, 'm')
+    sub = _SP_ALPHA * _sp_chord(k - 1, 'm') + (1 - _SP_ALPHA) * _sp_chord(k - 1, 'M')
+    return v1 * _sp_chord(k, 'm') + v2 * dom + v3 * sub
+
+
+def _sp_ce(hist, c):
+    tot = float(sum(hist))
+    if tot <= 0:
+        return None
+    v = np.zeros(3)
+    for pc in range(12):
+        if hist[pc] > 0:
+            v += hist[pc] * _sp_pos(_sp_k(pc, c))
+    return v / tot
+
+
+def _sp_spelling_center(hist):
+    """Centro cs della finestra [cs-5, cs+6] sulla linea delle quinte che rende l'insieme di note piu'
+    compatto (varianza pesata minima): la stessa ortografia vale per CE, accordi e tonalita'."""
+    best = None
+    for cs in range(12):
+        ks = [(_sp_k(pc, cs), hist[pc]) for pc in range(12) if hist[pc] > 0]
+        tot = sum(w for _, w in ks)
+        if tot <= 0:
+            return 0
+        mean = sum(k * w for k, w in ks) / tot
+        var = sum(w * (k - mean) ** 2 for k, w in ks) / tot
+        if best is None or var < best[0] - 1e-12:
+            best = (var, cs)
+    return best[1]
+
+
+def spiral_best_key(hist):
+    """(tonica 0-11, 'M'|'m', distanza CE-tonalita', cs) della tonalita' il cui centro e' piu' vicino al
+    CE dell'istogramma; cs e' il centro dell'ortografia usata (vedi _sp_spelling_center)."""
+    cs = _sp_spelling_center(hist)
+    ce = _sp_ce(hist, cs)
+    if ce is None:
+        return None
+    best = None
+    for t in range(12):
+        kt = _sp_k(t, cs)
+        for q in ('M', 'm'):
+            d = float(np.linalg.norm(ce - _sp_key(kt, q)))
+            if best is None or d < best[2] - 1e-12:
+                best = (t, q, d, cs)
+    return best
+
+
+@_preserves_meta
+def midi_spiral_array(original_midi, window_beats=4.0, add_bass=True):
+    pool = _math_pool_notes(original_midi)
+    if not pool:
+        warn("Nessuna nota trovata per lo Spiral Array. L'analisi non verra' generata.")
+        return original_midi, {'ok': False}
+    tpb = original_midi.ticks_per_beat
+    win = max(1, int(float(window_beats) * tpb))
+    total = max(n['end'] for n in pool)
+    n_win = max(1, int(math.ceil(total / win)))
+    hists = [[0.0] * 12 for _ in range(n_win)]
+    for n in pool:
+        w0, w1 = n['start'] // win, max(n['start'], n['end'] - 1) // win
+        for w in range(w0, min(w1, n_win - 1) + 1):
+            ov = min(n['end'], (w + 1) * win) - max(n['start'], w * win)
+            if ov > 0:
+                hists[w][n['pitch'] % 12] += ov
+    global_hist = [sum(h[pc] for h in hists) for pc in range(12)]
+    key = spiral_best_key(global_hist)
+    if key is None:
+        return original_midi, {'ok': False}
+    tonic, kq, _, c = key
+    key_center = _sp_key(_sp_k(tonic, c), kq)
+    key_name = f"{_NOTE_NAMES[tonic]} {'maggiore' if kq == 'M' else 'minore'}"
+
+    chord_centers = {(r, q): _sp_chord(_sp_k(r, c), q) for r in range(12) for q in ('M', 'm')}
+    segs, tensions = [], []   # segs: [chord, start_win, end_win, tension]
+    for w in range(n_win):
+        ce = _sp_ce(hists[w], c)
+        if ce is None:
+            continue
+        chord = min(chord_centers, key=lambda ch_: (float(np.linalg.norm(ce - chord_centers[ch_])), ch_))
+        tension = float(np.linalg.norm(ce - key_center))
+        tensions.append(tension)
+        if segs and segs[-1][0] == chord and segs[-1][2] == w - 1:
+            segs[-1][2] = w
+            segs[-1][3] = max(segs[-1][3], tension)
+        else:
+            segs.append([chord, w, w, tension])
+    max_t = max(tensions) if tensions else 0.0
+
+    voicing = None
+    notes, bass = [], []
+    for chord, w0, w1, tension in segs:
+        if voicing is None:
+            voicing = _vl_first(chord)
+        else:
+            _, voicing = _vl_next(voicing, _nr_pcs(chord))
+        vel = 55 + int(round(60 * tension / max_t)) if max_t > 0 else 80
+        start, end = w0 * win, (w1 + 1) * win
+        for p in voicing:
+            notes.append({'pitch': p, 'start': start, 'end': end, 'velocity': vel})
+        bass.append({'pitch': 36 + chord[0] % 12, 'start': start, 'end': end, 'velocity': min(127, vel + 10)})
+    new_midi = _math_new_midi(original_midi)
+    channels = _math_voice_channels(original_midi, 2)
+    _math_add_track(new_midi, f"Spiral Array accordi ({key_name}, finestra {window_beats} beat)",
+                    notes, channels[0], _generated_program(48))
+    if add_bass:
+        _math_add_track(new_midi, "Spiral Array basso", bass, channels[1], _generated_program(32))
+    prog = [_nr_name(s[0]) for s in segs]
+    return new_midi, {'ok': True, 'key': key_name, 'windows': n_win, 'progression': prog,
+                      'mean_tension': (sum(tensions) / len(tensions)) if tensions else 0.0,
+                      'max_tension': max_t}
+
+
+# --- 11. Insiemi massimamente uniformi (J. Clough, J. Douthett, "Maximally Even Sets", Journal of Music Theory, 1991) ---
+# I c elementi dell'insieme ME(c, d) sono J(k) = floor(k*d/c), k = 0..c-1: i c punti piu' regolari
+# possibili sul cerchio delle d altezze. Con d = 12: c=7 scala diatonica, c=5 pentatonica, c=6 scala
+# per toni interi, c=4 settima diminuita, c=3 triade aumentata. Le rotazioni sono i modi.
+# Sono gli stessi oggetti dei ritmi euclidei, sul cerchio delle altezze invece che dei passi.
+# La struttura e' annidata: un insieme ME dentro un insieme ME (triade ME(3,7) dentro la scala ME(7,12)
+# = terze diatoniche). Il brano viene quantizzato sull'insieme e armonizzato con il sotto-insieme.
+
+def me_set(c, d=12):
+    """Insieme massimamente uniforme ME(c, d) in forma nativa: lista ordinata di c interi in [0, d)."""
+    d = max(1, int(d))
+    c = max(1, min(int(c), d))
+    return [(k * d) // c for k in range(c)]
+
+
+def _me_mode(elems, mode, d=12):
+    """Rotazione: il modo che parte dall'elemento `mode`, con lo 0 come tonica."""
+    c = len(elems)
+    m = int(mode) % c
+    rot = elems[m:] + elems[:m]
+    return sorted((e - rot[0]) % d for e in rot)
+
+
+def _intervals(pcs, d=12):
+    return [(pcs[(i + 1) % len(pcs)] - pcs[i]) % d or d for i in range(len(pcs))]
+
+
+def _snap_to_pcs(p, pcs_set):
+    """Pitch piu' vicino a p con classe di altezza in pcs_set (a parita' vince il piu' basso)."""
+    for d in range(0, 7):
+        for cand in (p - d, p + d):
+            if 0 <= cand <= 127 and cand % 12 in pcs_set:
+                return cand
+    return int(p)
+
+
+@_preserves_meta
+def midi_maximally_even(original_midi, cardinality=7, mode=1, tonic="Dal brano", sub_cardinality=3,
+                        chord_beats=4.0, subject_notes=32):
+    subject = _math_subject(original_midi, max(2, int(subject_notes)))
+    if not subject:
+        warn("Nessun soggetto melodico trovato. L'insieme massimamente uniforme non verra' generato.")
+        return original_midi, {'ok': False}
+    if not isinstance(tonic, str) or tonic == "Dal brano" or not tonic:
+        est = estimate_key(original_midi)
+        tonic_pc = est[0] % 12 if est else 0
+    else:
+        tonic_pc = get_key_offset(tonic) % 12
+    c = max(2, min(11, int(cardinality)))
+    native = me_set(c, 12)
+    offsets = _me_mode(native, mode, 12)
+    scale = [(tonic_pc + e) % 12 for e in offsets]          # classi di altezza in ordine di grado
+    scale_set = set(scale)
+    # equivalenza con il ritmo euclideo E(c,12): verificata, non assunta
+    ind = [1 if n in set(native) else 0 for n in range(12)]
+    euc = bjorklund(c, 12)
+    euclid_equiv = any(euc[r:] + euc[:r] == ind for r in range(12))
+
+    tpb = original_midi.ticks_per_beat
+    quant, moved = [], 0
+    for n in subject:
+        p = _snap_to_pcs(n['pitch'], scale_set)
+        moved += int(p != n['pitch'])
+        quant.append({'pitch': p, 'start': n['start'], 'end': n['end'], 'velocity': n['velocity']})
+    new_midi = _math_new_midi(original_midi)
+    channels = _math_voice_channels(original_midi, 2)
+    _math_add_track(new_midi, f"ME({c},12) melodia ({_NOTE_NAMES[tonic_pc]}, modo {int(mode) % c})",
+                    quant, channels[0], _generated_program(0))
+
+    sub = int(sub_cardinality)
+    sub_idx = []
+    if 2 <= sub < c:
+        sub_idx = [(j * c) // sub for j in range(sub)]       # ME(sub, c) dentro la scala
+        win = max(1, int(float(chord_beats) * tpb))
+        total = max(n['end'] for n in quant)
+        chords = []
+        for w in range(max(1, int(math.ceil(total / win)))):
+            weight = defaultdict(float)
+            for n in quant:
+                ov = min(n['end'], (w + 1) * win) - max(n['start'], w * win)
+                if ov > 0 and n['pitch'] % 12 in scale_set:
+                    weight[n['pitch'] % 12] += ov
+            if not weight:
+                continue
+            top_pc = max(sorted(weight), key=lambda pc: (weight[pc], -scale.index(pc)))
+            deg = scale.index(top_pc)
+            pcs = [scale[(deg + i) % c] for i in sub_idx]
+            pitches = [48 + (pcs[0] - 48) % 12]
+            for pc in pcs[1:]:
+                step = (pc - pitches[-1]) % 12
+                pitches.append(pitches[-1] + (step if step else 12))
+            chords.append((w, pitches))
+        chord_notes = [{'pitch': p, 'start': w * win, 'end': (w + 1) * win, 'velocity': 70}
+                       for w, pitches in chords for p in pitches]
+        if chord_notes:
+            _math_add_track(new_midi, f"ME({sub},{c}) accordi", chord_notes, channels[1], _generated_program(48))
+    return new_midi, {'ok': True, 'tonic': _NOTE_NAMES[tonic_pc], 'pcs': scale,
+                      'names': [_NOTE_NAMES[pc] for pc in scale], 'intervals': _intervals(offsets),
+                      'sub_idx': sub_idx, 'moved': moved, 'notes': len(subject),
+                      'euclid_equiv': euclid_equiv, 'cardinality': c, 'mode': int(mode) % c}
+
+
+# --- 12. DFT degli insiemi di altezze (D. Lewin 1959; J. Quinn 2006; E. Amiot, "Music through Fourier Space", 2016) ---
+# Un insieme di altezze e' un segnale sui 12 punti del cerchio: F_k = sum_n x(n) exp(-2*pi*i*k*n/12).
+# |F_k| misura quanto l'insieme somiglia alla divisione regolare dell'ottava in k parti:
+# k=1 cluster cromatico, k=2 tritoni, k=3 triadi aumentate, k=4 settime diminuite (ottatonico),
+# k=5 diatonico (5 e' il moltiplicatore che scambia cromatico e quinte), k=6 toni interi.
+# La fase di F_k dice dove sta l'insieme sul cerchio: sfasare tutte le componenti = trasporre.
+# Il metodo filtra l'istogramma del brano tenendo solo le componenti scelte, prende le c classi di
+# altezza piu' forti del profilo ricostruito e quantizza il soggetto su quell'insieme. Opzionale:
+# moltiplicazione M5/M7 dell'insieme (F'_k = F_{5k}): il diatonico diventa un cluster.
+
+def pc_dft(hist):
+    """Coefficienti F_0..F_11 di un istogramma/indicatore di classi di altezza."""
+    return np.fft.fft(np.asarray(hist, dtype=float))
+
+
+def pc_dft_magnitudes(hist):
+    """|F_1|..|F_6| normalizzati su F_0 (peso totale): 1 = insieme perfettamente regolare di quel tipo."""
+    F = pc_dft(hist)
+    f0 = float(abs(F[0]))
+    if f0 <= 0:
+        return [0.0] * 6
+    return [float(abs(F[k])) / f0 for k in range(1, 7)]
+
+
+DFT_COMPONENT_LABELS = {1: "1 · cluster cromatico", 2: "2 · tritoni", 3: "3 · triadi aumentate",
+                        4: "4 · settime diminuite (ottatonico)", 5: "5 · diatonico", 6: "6 · toni interi"}
+
+
+@_preserves_meta
+def midi_pc_dft_filter(original_midi, components=(5,), cardinality=7, shift=0, multiplier="Nessuno",
+                       subject_notes=32):
+    pool = _math_pool_notes(original_midi)
+    hist = [0.0] * 12
+    for n in pool:
+        hist[n['pitch'] % 12] += max(1, n['end'] - n['start'])
+    if sum(hist) <= 0:
+        warn("Nessuna nota trovata per la DFT dei pc-set. Il filtro non verra' generato.")
+        return original_midi, {'ok': False}
+    subject = _math_subject(original_midi, max(2, int(subject_notes)))
+    if not subject:
+        warn("Nessun soggetto melodico trovato. Il filtro DFT non verra' generato.")
+        return original_midi, {'ok': False}
+    comps = sorted({int(k) for k in components if 1 <= int(k) <= 6}) or [5]
+    F = pc_dft(hist)
+    G = np.zeros(12, dtype=complex)
+    G[0] = F[0]
+    for k in comps:
+        G[k] = F[k]
+        if k != 6:
+            G[12 - k] = F[12 - k]
+    profile = np.roll(np.fft.ifft(G).real, int(shift) % 12)   # sfasamento uguale per tutte le componenti = trasposizione
+    c = max(2, min(11, int(cardinality)))
+    order = sorted(range(12), key=lambda n: (-round(float(profile[n]), 9), n))
+    pcs = sorted(order[:c])
+    mult = {"M5": 5, "M7": 7}.get(multiplier, 1)
+    if mult != 1:
+        pcs = sorted({(mult * n) % 12 for n in pcs})
+    pcs_set = set(pcs)
+
+    quant, moved = [], 0
+    for n in subject:
+        p = _snap_to_pcs(n['pitch'], pcs_set)
+        moved += int(p != n['pitch'])
+        quant.append({'pitch': p, 'start': n['start'], 'end': n['end'], 'velocity': n['velocity']})
+    new_midi = _math_new_midi(original_midi)
+    ch = _math_voice_channels(original_midi, 1)[0]
+    tag = "M5" if mult == 5 else ("M7" if mult == 7 else "")
+    _math_add_track(new_midi, f"DFT k={'+'.join(map(str, comps))} -> {len(pcs)} pc{(' ' + tag) if tag else ''}",
+                    quant, ch, _generated_program(0))
+    ind = [1.0 if n in pcs_set else 0.0 for n in range(12)]
+    return new_midi, {'ok': True, 'components': comps, 'pcs': pcs, 'names': [_NOTE_NAMES[pc] for pc in pcs],
+                      'mags_piece': pc_dft_magnitudes(hist), 'mags_set': pc_dft_magnitudes(ind),
+                      'moved': moved, 'notes': len(subject), 'multiplier': tag or "Nessuno",
+                      'shift': int(shift) % 12, 'cardinality': len(pcs)}
+
 # --- Funzioni di Decomposizione ---
 
 @_preserves_meta
@@ -2462,6 +3558,140 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength, preserve
     return new_midi
 
 
+_RB_DRUM_MAP = {"kick": 36, "snare": 38, "hihat_closed": 42}
+_RB_INSTRUMENT_NAMES = {"kick": "Cassa", "snare": "Rullante", "hihat_closed": "Hi-hat"}
+
+
+def _rb_hit(start_tick, duration_ticks, velocity):
+    return {'start_tick': start_tick, 'duration_ticks': duration_ticks, 'velocity': velocity}
+
+
+def _rb_parse_time_signature(time_signature):
+    try:
+        beats, note_value = map(int, time_signature.split('/'))
+        if beats <= 0 or note_value <= 0:
+            raise ValueError
+        return beats, note_value
+    except (ValueError, IndexError):
+        warn(f"Metrica non valida: '{time_signature}'. Verrà usata la metrica 4/4.")
+        return 4, 4
+
+
+def _rb_pattern_fixed(kick, snare, hihat, beats_per_measure, tpb):
+    """Pattern Fisso (Pop/Rock): cassa su 1 e 3, rullante su 2 e 4, hi-hat in ottavi."""
+    pat = {"kick": [], "snare": [], "hihat_closed": []}
+    if kick:
+        pat["kick"].append(_rb_hit(0, tpb // 8, 100))
+        if beats_per_measure >= 3:
+            pat["kick"].append(_rb_hit(tpb * 2, tpb // 8, 100))
+    if snare:
+        if beats_per_measure >= 2:
+            pat["snare"].append(_rb_hit(tpb, tpb // 8, 100))
+        if beats_per_measure >= 4:
+            pat["snare"].append(_rb_hit(tpb * 3, tpb // 8, 100))
+    if hihat:
+        for i in range(beats_per_measure * 2):
+            pat["hihat_closed"].append(_rb_hit(i * tpb // 2, tpb // 8, 80))
+    return pat
+
+
+def _rb_pattern_random(rng, kick, snare, hihat, beats_per_measure, tpb):
+    """Pattern Casuale: ogni sedicesimo ha una probabilita' per strumento (ordine delle estrazioni RNG invariato)."""
+    pat = {"kick": [], "snare": [], "hihat_closed": []}
+    kick_prob, snare_prob, hihat_prob = 0.2, 0.1, 0.4
+    sub = tpb // 4
+    for i in range(beats_per_measure * 4):
+        start_tick = i * sub
+        duration = sub // 2
+        if kick and rng.random() < kick_prob:
+            pat["kick"].append(_rb_hit(start_tick, duration, rng.randint(80, 110)))
+        if snare and rng.random() < snare_prob:
+            pat["snare"].append(_rb_hit(start_tick, duration, rng.randint(80, 110)))
+        if hihat and rng.random() < hihat_prob:
+            pat["hihat_closed"].append(_rb_hit(start_tick, duration, rng.randint(60, 90)))
+    return pat
+
+
+def _rb_pattern_adaptive(rng, original_midi, kick, snare, hihat, beats_per_measure, ticks_per_measure, tpb):
+    """Pattern Adattivo: cassa/rullante sui tick (snappati al sedicesimo) dove il brano suona di piu'."""
+    pat = {"kick": [], "snare": [], "hihat_closed": []}
+    note_on_counts = defaultdict(int)
+    for track in original_midi.tracks:
+        abs_time = 0
+        for msg in track:
+            abs_time += msg.time
+            if msg.type == 'note_on' and msg.velocity > 0 and msg.channel != 9:
+                tick_in_measure = abs_time % ticks_per_measure
+                subdivision_ticks = tpb // 4
+                note_on_counts[round(tick_in_measure / subdivision_ticks) * subdivision_ticks] += 1
+
+    if not note_on_counts:
+        warn("Nessuna nota trovata per un pattern adattivo. Verrà usato un pattern fisso.")
+        if kick:  pat["kick"].append(_rb_hit(0, tpb // 8, 100))
+        if snare: pat["snare"].append(_rb_hit(tpb, tpb // 8, 100))
+        if hihat: pat["hihat_closed"].append(_rb_hit(0, tpb // 2, 80))
+        return pat
+
+    most_common_ticks = sorted(note_on_counts, key=note_on_counts.get, reverse=True)
+
+    kick_ticks = []
+    if kick:
+        for tick in most_common_ticks:
+            if len(kick_ticks) >= 3:
+                break
+            if (beats_per_measure == 4 and (tick == 0 or tick == tpb * 2)) or (len(kick_ticks) < 2 and note_on_counts[tick] > 1):
+                kick_ticks.append(tick)
+        if not kick_ticks:
+            kick_ticks.extend([0, tpb * 2] if beats_per_measure >= 4 else [0])
+        for tick in kick_ticks:
+            pat["kick"].append(_rb_hit(tick, tpb // 8, 100))
+
+    snare_ticks = []
+    if snare:
+        for tick in most_common_ticks:
+            is_kick_tick = any(abs(tick - kt) < tpb / 4 for kt in kick_ticks)
+            if not is_kick_tick and len(snare_ticks) < 2:
+                snare_ticks.append(tick)
+        if not snare_ticks:
+            snare_ticks.extend([tpb, tpb * 3] if beats_per_measure >= 4 else [tpb])
+        for tick in snare_ticks:
+            pat["snare"].append(_rb_hit(tick, tpb // 8, 100))
+
+    if hihat:
+        ticks_per_eighth = tpb // 2
+        for i in range(int(ticks_per_measure / ticks_per_eighth)):
+            pat["hihat_closed"].append(_rb_hit(i * ticks_per_eighth, ticks_per_eighth // 2, rng.randint(60, 90)))
+    return pat
+
+
+def _rb_render_track(drum_name, hits, num_measures, ticks_per_measure, total_ticks):
+    """Replica il pattern di una misura per tutto il brano e lo scrive come traccia di batteria (canale 10)."""
+    track = mido.MidiTrack()
+    track.name = f"Ritmica: {_RB_INSTRUMENT_NAMES[drum_name]}"
+    track.append(mido.Message('program_change', program=0, channel=9, time=0))
+
+    note = _RB_DRUM_MAP[drum_name]
+    events = []
+    for i in range(num_measures):
+        measure_start = i * ticks_per_measure
+        for hit in hits:
+            start = measure_start + hit['start_tick']
+            if start < total_ticks:  # solo eventi che rientrano nella durata del brano
+                end = start + hit['duration_ticks']
+                events.append({'msg': mido.Message('note_on', note=note, velocity=hit['velocity'], channel=9), 'abs_time': start})
+                events.append({'msg': mido.Message('note_off', note=note, velocity=0, channel=9), 'abs_time': min(end, total_ticks)})
+
+    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+    last_abs_time = 0
+    for ev in events:
+        track.append(_clone(ev['msg'], time=max(0, ev['abs_time'] - last_abs_time)))
+        last_abs_time = ev['abs_time']
+
+    # Messaggio finale: garantisce la lunghezza corretta della traccia
+    track.append(mido.MetaMessage('end_of_track', time=max(0, total_ticks - last_abs_time)))
+    return track
+
+
 @_preserves_meta
 def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rhythmic_pattern_style, seed=None):
     """
@@ -2471,153 +3701,36 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
     for track in original_midi.tracks:
         new_midi.tracks.append(track)
-    
-    DRUM_MAP = {
-        "kick": 36,     
-        "snare": 38,    
-        "hihat_closed": 42,
-    }
-    
-    try:
-        beats_per_measure, note_value = map(int, time_signature.split('/'))
-        if beats_per_measure <= 0 or note_value <= 0:
-            raise ValueError
-    except (ValueError, IndexError):
-        warn(f"Metrica non valida: '{time_signature}'. Verrà usata la metrica 4/4.")
-        beats_per_measure, note_value = 4, 4
-    
-    ticks_per_beat = new_midi.ticks_per_beat
-    ticks_per_measure = int(ticks_per_beat * beats_per_measure * 4 / note_value)
 
+    beats_per_measure, note_value = _rb_parse_time_signature(time_signature)
+    tpb = new_midi.ticks_per_beat
+    ticks_per_measure = int(tpb * beats_per_measure * 4 / note_value)
     if ticks_per_measure == 0:
         warn("Ticks per misura è zero. Non è possibile aggiungere la base ritmica.")
         return new_midi
 
-    # Calcolo della durata totale del brano originale in ticks
+    # Durata totale del brano originale in ticks
     total_ticks = 0
     for track in original_midi.tracks:
-        current_time = 0
-        for msg in track:
-            current_time += msg.time
-        total_ticks = max(total_ticks, current_time)
-
+        total_ticks = max(total_ticks, sum(msg.time for msg in track))
     if total_ticks == 0:
         warn("Il brano originale non contiene eventi validi per calcolare la lunghezza. La base ritmica non verrà aggiunta.")
         return new_midi
 
-    rhythmic_patterns_in_measure = {
-        "kick": [],
-        "snare": [],
-        "hihat_closed": []
-    }
-    
+    patterns = {"kick": [], "snare": [], "hihat_closed": []}
     if rhythmic_pattern_style == "Pattern Fisso (Pop/Rock)":
-        if kick:
-            rhythmic_patterns_in_measure["kick"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-            if beats_per_measure >= 3:
-                rhythmic_patterns_in_measure["kick"].append({'start_tick': ticks_per_beat * 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-        if snare:
-            if beats_per_measure >= 2:
-                rhythmic_patterns_in_measure["snare"].append({'start_tick': ticks_per_beat, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-            if beats_per_measure >= 4:
-                rhythmic_patterns_in_measure["snare"].append({'start_tick': ticks_per_beat * 3, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-        if hihat:
-            for i in range(beats_per_measure * 2):
-                rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': i * ticks_per_beat // 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 80})
-
+        patterns = _rb_pattern_fixed(kick, snare, hihat, beats_per_measure, tpb)
     elif rhythmic_pattern_style == "Pattern Casuale":
-        kick_prob, snare_prob, hihat_prob = 0.2, 0.1, 0.4
-        ticks_per_subdivision = ticks_per_beat // 4
-        total_subdivisions_in_measure = beats_per_measure * 4
-        
-        for i in range(total_subdivisions_in_measure):
-            start_tick = i * ticks_per_subdivision
-            duration = ticks_per_subdivision // 2 
-            if kick and rng.random() < kick_prob: rhythmic_patterns_in_measure["kick"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': rng.randint(80, 110)})
-            if snare and rng.random() < snare_prob: rhythmic_patterns_in_measure["snare"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': rng.randint(80, 110)})
-            if hihat and rng.random() < hihat_prob: rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': rng.randint(60, 90)})
-
+        patterns = _rb_pattern_random(rng, kick, snare, hihat, beats_per_measure, tpb)
     elif rhythmic_pattern_style == "Pattern Adattivo":
-        note_on_counts = defaultdict(int)
-        for track in original_midi.tracks:
-            abs_time = 0
-            for msg in track:
-                abs_time += msg.time
-                if msg.type == 'note_on' and msg.velocity > 0 and msg.channel != 9:
-                    tick_in_measure = abs_time % ticks_per_measure
-                    subdivision_ticks = ticks_per_beat // 4
-                    snapped_tick = round(tick_in_measure / subdivision_ticks) * subdivision_ticks
-                    note_on_counts[snapped_tick] += 1
-        
-        if note_on_counts:
-            most_common_ticks = sorted(note_on_counts, key=note_on_counts.get, reverse=True)
-            
-            kick_ticks = []
-            if kick:
-                for tick in most_common_ticks:
-                    if len(kick_ticks) >= 3: break
-                    if (beats_per_measure == 4 and (tick == 0 or tick == ticks_per_beat * 2)) or (len(kick_ticks) < 2 and note_on_counts[tick] > 1):
-                         kick_ticks.append(tick)
-                if not kick_ticks: kick_ticks.extend([0, ticks_per_beat*2] if beats_per_measure >= 4 else [0])
-                for tick in kick_ticks: rhythmic_patterns_in_measure["kick"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-            
-            snare_ticks = []
-            if snare:
-                for tick in most_common_ticks:
-                    is_kick_tick = any(abs(tick - kt) < ticks_per_beat / 4 for kt in kick_ticks)
-                    if not is_kick_tick and len(snare_ticks) < 2: snare_ticks.append(tick)
-                if not snare_ticks: snare_ticks.extend([ticks_per_beat, ticks_per_beat*3] if beats_per_measure >= 4 else [ticks_per_beat])
-                for tick in snare_ticks: rhythmic_patterns_in_measure["snare"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+        patterns = _rb_pattern_adaptive(rng, original_midi, kick, snare, hihat,
+                                        beats_per_measure, ticks_per_measure, tpb)
 
-            if hihat:
-                ticks_per_eighth = ticks_per_beat // 2
-                for i in range(int(ticks_per_measure / ticks_per_eighth)):
-                    rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': i * ticks_per_eighth, 'duration_ticks': ticks_per_eighth // 2, 'velocity': rng.randint(60, 90)})
-        else:
-            warn("Nessuna nota trovata per un pattern adattivo. Verrà usato un pattern fisso.")
-            if kick: rhythmic_patterns_in_measure["kick"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-            if snare: rhythmic_patterns_in_measure["snare"].append({'start_tick': ticks_per_beat, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
-            if hihat: rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 2, 'velocity': 80})
-
-    instrument_names = {"kick": "Cassa", "snare": "Rullante", "hihat_closed": "Hi-hat"}
-
-    # Calcola il numero di misure necessarie per coprire l'intera durata del brano
     num_measures = int(np.ceil(total_ticks / ticks_per_measure))
-    
-    for drum_note_name, patterns_in_measure in rhythmic_patterns_in_measure.items():
-        if not patterns_in_measure: continue
-        
-        new_drum_track = mido.MidiTrack()
-        new_drum_track.name = f"Ritmica: {instrument_names[drum_note_name]}"
-        new_drum_track.append(mido.Message('program_change', program=0, channel=9, time=0))
-        
-        all_drum_events = []
-        for i in range(num_measures):
-            current_measure_start_tick = i * ticks_per_measure
-            for event in patterns_in_measure:
-                start_abs_time = current_measure_start_tick + event['start_tick']
-                end_abs_time = start_abs_time + event['duration_ticks']
-                
-                # Aggiungi solo eventi che rientrano nella durata totale del brano
-                if start_abs_time < total_ticks:
-                    all_drum_events.append({'msg': mido.Message('note_on', note=DRUM_MAP[drum_note_name], velocity=event['velocity'], channel=9), 'abs_time': start_abs_time})
-                    all_drum_events.append({'msg': mido.Message('note_off', note=DRUM_MAP[drum_note_name], velocity=0, channel=9), 'abs_time': min(end_abs_time, total_ticks)})
-
-        all_drum_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-        last_abs_time = 0
-        for event in all_drum_events:
-            delta_time = max(0, event['abs_time'] - last_abs_time)
-            new_msg = _clone(event['msg'], time=delta_time)
-            new_drum_track.append(new_msg)
-            last_abs_time = event['abs_time']
-        
-        # Aggiungi un messaggio finale per garantire che la traccia abbia la lunghezza corretta
-        new_drum_track.append(mido.MetaMessage('end_of_track', time=max(0, total_ticks - last_abs_time)))
-        
-        new_midi.tracks.append(new_drum_track)
-
+    for drum_name, hits in patterns.items():
+        if hits:
+            new_midi.tracks.append(_rb_render_track(drum_name, hits, num_measures, ticks_per_measure, total_ticks))
     return new_midi
-
 
 
 # Mappatura General MIDI: numero programma → nome famiglia strumentale
@@ -2717,6 +3830,152 @@ def _split_type0_to_tracks(midi):
 
 @_trims_tail
 @_preserves_meta
+def _recomposer_style_config(style, tpb):
+    """Parametri del `style` del Recomposer (durate/pause in ticks, fattore velocity, passo di pitch)."""
+    style_configs = {
+        "ambient":             {"note_dur_range": (tpb * 2, tpb * 6),  "gap_range": (tpb // 2, tpb * 2),
+                                "vel_factor": 0.6,  "pitch_step": 4},
+        "drone":               {"note_dur_range": (tpb * 4, tpb * 8),  "gap_range": (tpb, tpb * 3),
+                                "vel_factor": 0.5,  "pitch_step": 7},
+        "minimal":             {"note_dur_range": (tpb // 2, tpb * 2), "gap_range": (tpb // 4, tpb),
+                                "vel_factor": 0.7,  "pitch_step": 2},
+        "armonico":            {"note_dur_range": (tpb // 2, tpb),     "gap_range": (tpb // 8, tpb // 4),
+                                "vel_factor": 0.85, "pitch_step": 3},
+        "elettronico":         {"note_dur_range": (tpb // 4, tpb // 2), "gap_range": (tpb // 8, tpb // 4),
+                                "vel_factor": 0.9,  "pitch_step": 0},
+        "minimalismo_ritmico": {"note_dur_range": (tpb // 4, tpb // 2), "gap_range": (tpb // 2, tpb * 2),
+                                "vel_factor": 0.8,  "pitch_step": 5},
+        "sperimentale":        {"note_dur_range": (tpb // 8, tpb * 3), "gap_range": (0, tpb * 2),
+                                "vel_factor": 1.0,  "pitch_step": 0},
+    }
+    return style_configs.get(style, style_configs["minimal"])
+
+
+def _recomposer_total_ticks(midi, tpb):
+    """Durata in ticks = fine della MUSICA (ultima nota), non la fine grezza del file:
+    un end_of_track / marker molto oltre l'ultima nota allungherebbe l'output di minuti."""
+    total_ticks = midi_last_note_tick(midi)
+    if total_ticks == 0:
+        for track in midi.tracks:
+            total_ticks = max(total_ticks, sum(msg.time for msg in track))
+    if total_ticks == 0:
+        total_ticks = tpb * 4 * 32  # fallback 32 battute
+    return total_ticks
+
+
+def _recomposer_pitch_picker(rng, cfg, weighted_pool):
+    """Ritorna pick_pitch(base): sceglie il prossimo pitch dal pool (vocabolario della traccia)."""
+    # Indice per il "pitch piu' vicino": valori unici ordinati + prima posizione nel pool,
+    # cosi' la parita' si risolve come min() (vince il primo del pool) ma in O(log n).
+    uniq = sorted(set(weighted_pool))
+    first_pos = {}
+    for i, p in enumerate(weighted_pool):
+        first_pos.setdefault(p, i)
+
+    def nearest_in_pool(candidate):
+        k = bisect.bisect_left(uniq, candidate)
+        if k == 0:
+            return uniq[0]
+        if k == len(uniq):
+            return uniq[-1]
+        lo, hi = uniq[k - 1], uniq[k]
+        d_lo, d_hi = candidate - lo, hi - candidate
+        if d_lo < d_hi:
+            return lo
+        if d_hi < d_lo:
+            return hi
+        return lo if first_pos[lo] < first_pos[hi] else hi
+
+    def pick_pitch(base=None):
+        if base is None or cfg["pitch_step"] == 0:
+            return rng.choice(weighted_pool)
+        direction = rng.choice([-1, 1])
+        return nearest_in_pool(base + direction * cfg["pitch_step"])
+
+    return pick_pitch
+
+
+def _recomposer_build_track(rng, cfg, style, tpb, total_ticks, weighted_pool,
+                            vel_min, vel_max, channel, track_name, instrument_header=None):
+    """Costruisce una nuova traccia dal pool di pitch di una traccia originale."""
+    if not weighted_pool:
+        return None
+    pick_pitch = _recomposer_pitch_picker(rng, cfg, weighted_pool)
+
+    new_track = mido.MidiTrack()
+    new_track.name = track_name
+    for h in (instrument_header or []):
+        new_track.append(h)
+
+    events = []
+    current_tick = 0
+    last_pitch = rng.choice(weighted_pool)
+
+    while current_tick < total_ticks:
+        pitch = max(0, min(127, pick_pitch(last_pitch)))
+        vel   = max(1, min(127, int(rng.randint(vel_min, vel_max) * cfg["vel_factor"])))
+        dur   = rng.randint(*cfg["note_dur_range"])
+        gap   = rng.randint(*cfg["gap_range"])
+
+        # Per elettronico: snappa sulla griglia
+        if style == "elettronico":
+            grid = tpb // 4
+            current_tick = (current_tick // grid) * grid
+            dur = (dur // grid) * grid or grid
+
+        note_end = min(current_tick + dur, total_ticks)
+        events.append(("on",  current_tick, pitch, vel, channel))
+        events.append(("off", note_end,      pitch, 0,  channel))
+
+        last_pitch = pitch
+        current_tick += dur + gap
+
+    # Ordina: note_off prima di note_on allo stesso tick
+    events.sort(key=lambda e: (e[1], 0 if e[0] == "off" else 1))
+
+    last_t = 0
+    for kind, tick, p, v2, ch in events:
+        delta = max(0, tick - last_t)
+        if kind == "on":
+            new_track.append(mido.Message("note_on",  note=p, velocity=v2, channel=ch, time=delta))
+        else:
+            new_track.append(mido.Message("note_off", note=p, velocity=0,  channel=ch, time=delta))
+        last_t = tick
+    return new_track
+
+
+def _recomposer_vocabulary(orig_track):
+    """(pitch, velocity, canale) di tutte le note_on della traccia."""
+    pitches, velocities, channels = [], [], []
+    for msg in orig_track:
+        if msg.type == 'note_on' and msg.velocity > 0:
+            pitches.append(msg.note)
+            velocities.append(msg.velocity)
+            channels.append(msg.channel)
+    return pitches, velocities, channels
+
+
+def _recomposer_velocity_range(velocities):
+    vel_min, vel_max = min(velocities), max(velocities)
+    if vel_min > vel_max:
+        vel_min, vel_max = vel_max, vel_min
+    vel_min = max(1, vel_min)
+    vel_max = min(127, vel_max)
+    if vel_min == vel_max:
+        vel_min = max(1, vel_max - 10)
+    return vel_min, vel_max
+
+
+def _copy_track(track, name=None):
+    """Copia integrale di una traccia (opzionalmente rinominata)."""
+    out = mido.MidiTrack()
+    if name is not None:
+        out.name = name
+    for msg in track:
+        out.append(_clone(msg))
+    return out
+
+
 @_keeps_tempo_map
 def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
     """
@@ -2731,227 +3990,53 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
     """
     rng = _rng(seed, "recomposer")
     preserve = _drums_preserved(preserve_drums)
-    from collections import Counter
 
     # File tipo 0: esplodi canali in tracce separate prima di ricomporre
     if original_midi.type == 0 or (len(original_midi.tracks) == 1 and
-            len({m.channel for t in original_midi.tracks for m in t if hasattr(m,'channel')}) > 1):
+            len({m.channel for t in original_midi.tracks for m in t if hasattr(m, 'channel')}) > 1):
         original_midi = _split_type0_to_tracks(original_midi)
 
     tpb = original_midi.ticks_per_beat
-
-    # Durata totale in ticks = fine della MUSICA (ultima nota), non la fine grezza del file:
-    # un end_of_track / marker molto oltre l'ultima nota allungherebbe l'output di minuti.
-    total_ticks = midi_last_note_tick(original_midi)
-    if total_ticks == 0:
-        for track in original_midi.tracks:
-            t = sum(msg.time for msg in track)
-            total_ticks = max(total_ticks, t)
-    if total_ticks == 0:
-        total_ticks = tpb * 4 * 32  # fallback 32 battute
-
-    # --- DEFINIZIONE STILI ---
-    style_configs = {
-        "ambient": {
-            "note_dur_range": (tpb * 2, tpb * 6),
-            "gap_range":      (tpb // 2, tpb * 2),
-            "vel_factor":     0.6,
-            "pitch_step":     4,
-        },
-        "drone": {
-            "note_dur_range": (tpb * 4, tpb * 8),
-            "gap_range":      (tpb, tpb * 3),
-            "vel_factor":     0.5,
-            "pitch_step":     7,
-        },
-        "minimal": {
-            "note_dur_range": (tpb // 2, tpb * 2),
-            "gap_range":      (tpb // 4, tpb),
-            "vel_factor":     0.7,
-            "pitch_step":     2,
-        },
-        "armonico": {
-            "note_dur_range": (tpb // 2, tpb),
-            "gap_range":      (tpb // 8, tpb // 4),
-            "vel_factor":     0.85,
-            "pitch_step":     3,
-        },
-        "elettronico": {
-            "note_dur_range": (tpb // 4, tpb // 2),
-            "gap_range":      (tpb // 8, tpb // 4),
-            "vel_factor":     0.9,
-            "pitch_step":     0,
-        },
-        "minimalismo_ritmico": {
-            "note_dur_range": (tpb // 4, tpb // 2),
-            "gap_range":      (tpb // 2, tpb * 2),
-            "vel_factor":     0.8,
-            "pitch_step":     5,
-        },
-        "sperimentale": {
-            "note_dur_range": (tpb // 8, tpb * 3),
-            "gap_range":      (0, tpb * 2),
-            "vel_factor":     1.0,
-            "pitch_step":     0,
-        },
-    }
-
-    cfg = style_configs.get(style, style_configs["minimal"])
-
-    def build_track_from_pool(weighted_pool, vel_min, vel_max, channel, track_name, instrument_header=None):
-        """Costruisce una nuova traccia dal pool di pitch di una traccia originale."""
-        if not weighted_pool:
-            return None
-
-        # Indice per il "pitch piu' vicino": valori unici ordinati + prima posizione nel pool,
-        # cosi' la parita' si risolve come min() (vince il primo del pool) ma in O(log n).
-        _uniq = sorted(set(weighted_pool))
-        _first_pos = {}
-        for _i, _p in enumerate(weighted_pool):
-            _first_pos.setdefault(_p, _i)
-
-        def _nearest_in_pool(candidate):
-            k = bisect.bisect_left(_uniq, candidate)
-            if k == 0:
-                return _uniq[0]
-            if k == len(_uniq):
-                return _uniq[-1]
-            lo, hi = _uniq[k - 1], _uniq[k]
-            d_lo, d_hi = candidate - lo, hi - candidate
-            if d_lo < d_hi:
-                return lo
-            if d_hi < d_lo:
-                return hi
-            return lo if _first_pos[lo] < _first_pos[hi] else hi
-
-        def pick_pitch(base=None):
-            if base is None or cfg["pitch_step"] == 0:
-                return rng.choice(weighted_pool)
-            direction = rng.choice([-1, 1])
-            candidate = base + direction * cfg["pitch_step"]
-            return _nearest_in_pool(candidate)
-
-        def pick_vel():
-            v = rng.randint(vel_min, vel_max)
-            return max(1, min(127, int(v * cfg["vel_factor"])))
-
-        new_track = mido.MidiTrack()
-        new_track.name = track_name
-        for _h in (instrument_header or []):
-            new_track.append(_h)
-
-        events = []
-        current_tick = 0
-        last_pitch = rng.choice(weighted_pool)
-
-        while current_tick < total_ticks:
-            pitch = pick_pitch(last_pitch)
-            pitch = max(0, min(127, pitch))
-            vel   = pick_vel()
-            dur   = rng.randint(*cfg["note_dur_range"])
-            gap   = rng.randint(*cfg["gap_range"])
-
-            # Per elettronico: snappa sulla griglia
-            if style == "elettronico":
-                grid = tpb // 4
-                current_tick = (current_tick // grid) * grid
-                dur = (dur // grid) * grid or grid
-
-            note_end = min(current_tick + dur, total_ticks)
-            events.append(("on",  current_tick, pitch, vel, channel))
-            events.append(("off", note_end,      pitch, 0,  channel))
-
-            last_pitch = pitch
-            current_tick += dur + gap
-
-        # Ordina: note_off prima di note_on allo stesso tick
-        events.sort(key=lambda e: (e[1], 0 if e[0] == "off" else 1))
-
-        last_t = 0
-        for ev in events:
-            kind, tick, p, v2, ch = ev
-            delta = max(0, tick - last_t)
-            if kind == "on":
-                new_track.append(mido.Message("note_on",  note=p, velocity=v2, channel=ch, time=delta))
-            else:
-                new_track.append(mido.Message("note_off", note=p, velocity=0,  channel=ch, time=delta))
-            last_t = tick
-
-        return new_track
+    total_ticks = _recomposer_total_ticks(original_midi, tpb)
+    cfg = _recomposer_style_config(style, tpb)
 
     new_midi = mido.MidiFile(ticks_per_beat=tpb)
-
     for track_idx, orig_track in enumerate(original_midi.tracks):
-        # --- Estrai nome traccia originale ---
         track_name = orig_track.name if hasattr(orig_track, 'name') and orig_track.name else f"Track {track_idx}"
-
-        # --- Estrai pitches, velocities, canale dominante ---
-        pitches    = []
-        velocities = []
-        channels   = []
-        has_meta_only = True
-
-        for msg in orig_track:
-            if msg.type == 'note_on' and msg.velocity > 0:
-                pitches.append(msg.note)
-                velocities.append(msg.velocity)
-                channels.append(msg.channel)
-                has_meta_only = False
-            elif msg.type not in ('note_on', 'note_off'):
-                pass  # meta / control — non nota
+        pitches, velocities, channels = _recomposer_vocabulary(orig_track)
 
         # Traccia senza note (es. traccia metadati/tempo) → copiala intatta
-        if has_meta_only or not pitches:
-            meta_track = mido.MidiTrack()
-            meta_track.name = track_name
-            for msg in orig_track:
-                meta_track.append(_clone(msg))
-            new_midi.tracks.append(meta_track)
+        if not pitches:
+            new_midi.tracks.append(_copy_track(orig_track, name=track_name))
             continue
 
-        # --- Canale dominante della traccia ---
-        channel_counts = Counter(channels)
-        dominant_channel = channel_counts.most_common(1)[0][0]
+        dominant_channel = Counter(channels).most_common(1)[0][0]
 
         # Batteria: traccia copiata intatta
         if preserve and dominant_channel == DRUM_CHANNEL:
-            kept = mido.MidiTrack()
-            for msg in orig_track:
-                kept.append(_clone(msg))
-            new_midi.tracks.append(kept)
+            new_midi.tracks.append(_copy_track(orig_track))
             continue
 
-        # --- Header strumento (program_change/bank select) da preservare ---
-        _recomp_header = _extract_instrument_header(orig_track)
+        # Header strumento (program_change/bank select) da preservare
+        header = _extract_instrument_header(orig_track)
 
-        # --- Pool di pitch pesato ---
-        pitch_counts = Counter(pitches)
+        # Pool di pitch pesato
         weighted_pool = []
-        for pitch, count in pitch_counts.items():
+        for pitch, count in Counter(pitches).items():
             weighted_pool.extend([pitch] * max(1, count))
 
-        vel_min = min(velocities)
-        vel_max = max(velocities)
-        if vel_min > vel_max: vel_min, vel_max = vel_max, vel_min
-        vel_min = max(1, vel_min)
-        vel_max = min(127, vel_max)
-        if vel_min == vel_max: vel_min = max(1, vel_max - 10)
+        vel_min, vel_max = _recomposer_velocity_range(velocities)
+        new_track = _recomposer_build_track(
+            rng, cfg, style, tpb, total_ticks, weighted_pool, vel_min, vel_max,
+            dominant_channel, track_name, instrument_header=header)
 
-        # --- Costruisci nuova traccia ---
-        new_track = build_track_from_pool(
-            weighted_pool, vel_min, vel_max,
-            dominant_channel, track_name, instrument_header=_recomp_header
-        )
-
-        if new_track is not None:
-            new_midi.tracks.append(new_track)
-        else:
+        if new_track is None:
             # Fallback: traccia vuota con nome originale (e strumento preservato)
-            empty = mido.MidiTrack()
-            empty.name = track_name
-            for _h in _recomp_header:
-                empty.append(_h)
-            new_midi.tracks.append(empty)
+            new_track = mido.MidiTrack()
+            new_track.name = track_name
+            for h in header:
+                new_track.append(h)
+        new_midi.tracks.append(new_track)
 
     return new_midi
 
@@ -2976,6 +4061,18 @@ _METHOD_LABELS_EN = {
     "MIDI Messiaen Modes": "🕊️ Olivier Messiaen — Modes of Limited Transposition",
     "MIDI Part Tintinnabuli": "🔔 Arvo Pärt — Tintinnabuli",
     "MIDI Reich Phasing": "🌀 Steve Reich — Phasing",
+    "MIDI Canon per Tonos": "🔺 Bach/Hofstadter — Canon per Tonos (endlessly rising canon)",
+    "MIDI Shepard Penrose": "🪜 Escher/Shepard — Impossible Scale (Shepard-Penrose)",
+    "MIDI Escher Metamorphosis": "🦎 Escher — Metamorphosis (one track into another)",
+    "MIDI MIU System": "🧩 Hofstadter — MIU Formal System",
+    "MIDI Escher Symmetry": "🔳 Escher — Frieze Symmetries",
+    "MIDI Hamiltonian Cycle": "🕸️ Graph Theory — Hamiltonian Cycle",
+    "MIDI Norgard Infinity": "♾️ Per Nørgård — Infinity Series (musical fractal)",
+    "MIDI Euclidean Rhythm": "🥁 Toussaint — Euclidean Rhythms",
+    "MIDI Neo Riemannian": "🔁 Lewin/Tymoczko — Neo-Riemannian PLR Transformations",
+    "MIDI Spiral Array": "🌀 Chew — Spiral Array (harmony and tension)",
+    "MIDI Maximally Even": "⭕ Clough/Douthett — Maximally Even Sets",
+    "MIDI PC DFT": "📈 Lewin/Quinn/Amiot — Fourier Transform of Pitch-Class Sets",
 }
 
 
@@ -3065,6 +4162,100 @@ def _describe_method(lang, key, p):
             out.append(L(f"   * Lunghezza cellula: {cell_len} note | Cicli: {cycles}", f"   * Cell length: {cell_len} notes | Cycles: {cycles}"))
             out.append(L(f"   * Sfasamento: +{shift_units} unità ogni {shift_every} cicli", f"   * Phase shift: +{shift_units} units every {shift_every} cycles"))
             out.append(L("   * Phasing processuale (Reich, 'Piano Phase'/'Clapping Music')", "   * Process phasing (Reich, 'Piano Phase'/'Clapping Music')"))
+        elif key == "MIDI Canon per Tonos":
+            n_v, step, laps, delay, v_int, subj, close = p
+            out.append(L(f"   * Voci: {n_v} (intervallo {v_int} st, ritardo {delay} beat) | Modulazione: +{step} st a giro | Ottave: {laps}",
+                         f"   * Voices: {n_v} (interval {v_int} st, delay {delay} beats) | Modulation: +{step} st per lap | Octaves: {laps}"))
+            out.append(L(f"   * Soggetto: {subj} note | Giro finale di arrivo in tonalita': {yes if close else no}",
+                         f"   * Subject: {subj} notes | Closing arrival lap in the home key: {yes if close else no}"))
+            out.append(L("   * Canon per Tonos (Bach, Offerta Musicale, 1747; Hofstadter, GEB)", "   * Canon per Tonos (Bach, Musical Offering, 1747; Hofstadter, GEB)"))
+        elif key == "MIDI Shepard Penrose":
+            direction, steps, step_b, layers, scale = p
+            out.append(L(f"   * Direzione: {direction} | Passi: {steps} | Durata passo: {step_b} beat | Strati: {layers}",
+                         f"   * Direction: {direction} | Steps: {steps} | Step length: {step_b} beats | Layers: {layers}"))
+            out.append(L(f"   * Scala: {scale}", f"   * Scale: {scale}"))
+            out.append(L("   * Scala di Shepard (1964) / scala impossibile di Penrose, cfr. Escher 'Salendo e scendendo' (1960)",
+                         "   * Shepard scale (1964) / Penrose impossible staircase, cf. Escher 'Ascending and Descending' (1960)"))
+        elif key == "MIDI Escher Metamorphosis":
+            a_name, b_name, n_notes, snap = p
+            out.append(L(f"   * Da: {a_name} → A: {b_name} | Note generate: {n_notes}", f"   * From: {a_name} → To: {b_name} | Notes generated: {n_notes}"))
+            out.append(L(f"   * Quantizzazione sul pool di pitch A∪B: {yes if snap else no}", f"   * Snap to the A∪B pitch pool: {yes if snap else no}"))
+            out.append(L("   * Interpolazione di altezza, attacco, durata e velocity (Escher, serie 'Metamorphosis')", "   * Interpolation of pitch, onset, duration and velocity (Escher, 'Metamorphosis' series)"))
+        elif key == "MIDI MIU System":
+            steps, max_len, cell_n, cell_b, final = p
+            out.append(L(f"   * Passi di derivazione: {steps} | Lunghezza massima: {max_len} | Cellula: {cell_n} note, {cell_b} beat",
+                         f"   * Derivation steps: {steps} | Max length: {max_len} | Cell: {cell_n} notes, {cell_b} beats"))
+            out.append(L(f"   * Stringa finale: {final}", f"   * Final string: {final}"))
+            out.append(L("   * Sistema MIU (Hofstadter, GEB, 1979): I = cellula, U = cellula invertita, M = pedale; MU non e' derivabile",
+                         "   * MIU system (Hofstadter, GEB, 1979): I = cell, U = inverted cell, M = pedal; MU is not derivable"))
+        elif key == "MIDI Escher Symmetry":
+            pattern, motif_n, cells = p
+            out.append(L(f"   * Fregio: {pattern} | Motivo: {motif_n} note | Celle: {cells}", f"   * Frieze: {pattern} | Motif: {motif_n} notes | Cells: {cells}"))
+            out.append(L("   * Isometrie tempo-altezza: identita', inversione, retrogrado, rotazione di 180° (Escher; du Sautoy, Blueprints)",
+                         "   * Time-pitch isometries: identity, inversion, retrograde, 180° rotation (Escher; du Sautoy, Blueprints)"))
+        elif key == "MIDI Hamiltonian Cycle":
+            max_int, max_nodes, repeats, nodes, status, covered, expansions = p
+            out.append(L(f"   * Salto massimo: {max_int} st | Nodi: {nodes} (max {max_nodes}) | Ripetizioni: {repeats}",
+                         f"   * Max leap: {max_int} st | Nodes: {nodes} (max {max_nodes}) | Repetitions: {repeats}"))
+            res_it = {'full': "ciclo hamiltoniano completo", 'partial': f"ciclo sulla componente principale ({covered}/{nodes} nodi)",
+                      'path': f"nessun ciclo: usato il percorso piu' lungo ({covered}/{nodes} nodi)"}.get(status, status)
+            res_en = {'full': "complete Hamiltonian cycle", 'partial': f"cycle on the main component ({covered}/{nodes} nodes)",
+                      'path': f"no cycle: longest path used ({covered}/{nodes} nodes)"}.get(status, status)
+            out.append(L(f"   * Esito: {res_it} ({expansions} espansioni)", f"   * Result: {res_en} ({expansions} expansions)"))
+            out.append(L("   * Ciclo hamiltoniano (W. R. Hamilton, Icosian game, 1857; du Sautoy, Blueprints)", "   * Hamiltonian cycle (W. R. Hamilton, Icosian game, 1857; du Sautoy, Blueprints)"))
+        elif key == "MIDI Norgard Infinity":
+            n_notes, step_b, layers, scale = p
+            out.append(L(f"   * Note per lo strato veloce: {n_notes} | Passo: {step_b} beat | Strati: {layers} | Scala: {scale}",
+                         f"   * Notes in the fast layer: {n_notes} | Step: {step_b} beats | Layers: {layers} | Scale: {scale}"))
+            out.append(L("   * Serie infinita di Nørgård: a(2n) = -a(n), a(2n+1) = a(n)+1 (autosimile)", "   * Nørgård infinity series: a(2n) = -a(n), a(2n+1) = a(n)+1 (self-similar)"))
+        elif key == "MIDI Euclidean Rhythm":
+            steps, pulses, rot, step_b, layers, cycles, subj, pats = p
+            out.append(L(f"   * Passi: {steps} | Attacchi: {pulses} | Rotazione: {rot} | Passo: {step_b} beat | Strati: {layers} | Cicli: {cycles} | Soggetto: {subj} note",
+                         f"   * Steps: {steps} | Pulses: {pulses} | Rotation: {rot} | Step: {step_b} beats | Layers: {layers} | Cycles: {cycles} | Subject: {subj} notes"))
+            out.append(L(f"   * Pattern: {pats}", f"   * Patterns: {pats}"))
+            out.append(L("   * Ritmi euclidei (G. Toussaint, 2005): algoritmo di Bjorklund, attacchi distribuiti nel modo piu' uniforme possibile",
+                         "   * Euclidean rhythms (G. Toussaint, 2005): Bjorklund algorithm, onsets spread as evenly as possible"))
+        elif key == "MIDI Neo Riemannian":
+            pattern, steps, chord_b, start, tie, period, vl_total, chords = p
+            out.append(L(f"   * Schema: {pattern} | Accordi: {steps} | Durata: {chord_b} beat | Partenza: {start} | Note comuni legate: {yes if tie else no}",
+                         f"   * Pattern: {pattern} | Chords: {steps} | Length: {chord_b} beats | Start: {start} | Common tones tied: {yes if tie else no}"))
+            out.append(L(f"   * Sequenza: {chords}", f"   * Sequence: {chords}"))
+            period_it = f"si richiude dopo {period} accordi" if period else "non si richiude entro la sequenza"
+            period_en = f"closes after {period} chords" if period else "does not close within the sequence"
+            out.append(L(f"   * Ciclo: {period_it} | Voice leading totale: {vl_total} semitoni",
+                         f"   * Cycle: {period_en} | Total voice leading: {vl_total} semitones"))
+            out.append(L("   * P, L, R (D. Lewin, 1987) con voice leading di distanza minima (D. Tymoczko, Science, 2006)",
+                         "   * P, L, R (D. Lewin, 1987) with minimal-distance voice leading (D. Tymoczko, Science, 2006)"))
+        elif key == "MIDI Spiral Array":
+            win_b, bass, key_name, n_win, mean_t, prog = p
+            out.append(L(f"   * Finestra: {win_b} beat ({n_win} finestre) | Basso: {yes if bass else no} | Tonalita': {key_name}",
+                         f"   * Window: {win_b} beats ({n_win} windows) | Bass: {yes if bass else no} | Key: {key_name}"))
+            out.append(L(f"   * Progressione: {prog}", f"   * Progression: {prog}"))
+            out.append(L(f"   * Tensione media (distanza CE-tonalita'): {mean_t:.3f} | velocity proporzionale alla tensione",
+                         f"   * Mean tension (CE-to-key distance): {mean_t:.3f} | velocity proportional to tension"))
+            out.append(L("   * Spiral Array (E. Chew, 2000): altezze su un'elica lungo la linea delle quinte, centro d'effetto pesato sulle durate",
+                         "   * Spiral Array (E. Chew, 2000): pitches on a helix along the line of fifths, duration-weighted center of effect"))
+        elif key == "MIDI Maximally Even":
+            c, mode, tonic, sub, chord_b, subj, names, ivs, euclid, moved, n_notes = p
+            out.append(L(f"   * Cardinalita': {c} su 12 | Modo: {mode} | Tonica: {tonic} | Sotto-insieme: {('ME(%d,%d)' % (sub, c)) if sub else 'nessuno'} | Accordi: {chord_b} beat | Soggetto: {subj} note",
+                         f"   * Cardinality: {c} of 12 | Mode: {mode} | Tonic: {tonic} | Subset: {('ME(%d,%d)' % (sub, c)) if sub else 'none'} | Chords: {chord_b} beats | Subject: {subj} notes"))
+            out.append(L(f"   * Insieme: {names} | Intervalli: {ivs} | Note spostate: {moved}/{n_notes}",
+                         f"   * Set: {names} | Intervals: {ivs} | Notes moved: {moved}/{n_notes}"))
+            if euclid:
+                out.append(L(f"   * Verificato: ME({c},12) e' una rotazione del ritmo euclideo E({c},12)",
+                             f"   * Verified: ME({c},12) is a rotation of the Euclidean rhythm E({c},12)"))
+            out.append(L("   * Insiemi massimamente uniformi (J. Clough, J. Douthett, 1991): ME(c,d) = { floor(k*d/c) }, k = 0..c-1",
+                         "   * Maximally even sets (J. Clough, J. Douthett, 1991): ME(c,d) = { floor(k*d/c) }, k = 0..c-1"))
+        elif key == "MIDI PC DFT":
+            comps, c, shift, mult, names, mags_p, mags_s, moved, n_notes = p
+            out.append(L(f"   * Componenti: {comps} | Cardinalita': {c} | Sfasamento: {shift} semitoni | Moltiplicazione: {mult}",
+                         f"   * Components: {comps} | Cardinality: {c} | Phase shift: {shift} semitones | Multiplication: {mult}"))
+            out.append(L(f"   * Insieme risultante: {names} | Note spostate: {moved}/{n_notes}",
+                         f"   * Resulting set: {names} | Notes moved: {moved}/{n_notes}"))
+            out.append(L(f"   * |F1..F6| del brano: {mags_p}", f"   * |F1..F6| of the piece: {mags_p}"))
+            out.append(L(f"   * |F1..F6| dell'insieme: {mags_s}", f"   * |F1..F6| of the set: {mags_s}"))
+            out.append(L("   * DFT dei pc-set (D. Lewin; J. Quinn, 2006; E. Amiot, 2016): F_k = somma di exp(-2*pi*i*k*n/12); k=5 diatonico, k=3 triadico, k=4 ottatonico, k=6 toni interi",
+                         "   * Pitch-class set DFT (D. Lewin; J. Quinn, 2006; E. Amiot, 2016): F_k = sum of exp(-2*pi*i*k*n/12); k=5 diatonic, k=3 triadic, k=4 octatonic, k=6 whole-tone"))
     except (IndexError, ValueError, TypeError):
         out.append(L("   * (parametri non disponibili)", "   * (parameters unavailable)"))
     return out
@@ -3367,6 +4558,34 @@ if uploaded_midi_file is not None:
             "MIDI Messiaen Modes": "🕊️ Olivier Messiaen — Modi a Trasposizione Limitata",
             "MIDI Part Tintinnabuli": "🔔 Arvo Pärt — Tintinnabuli",
             "MIDI Reich Phasing": "🌀 Steve Reich — Phasing",
+            # --- Matematica Sperimentale (vedi modalita' dedicata "🧪 Matematica Sperimentale") ---
+            "MIDI Canon per Tonos": "🔺 Bach/Hofstadter — Canon per Tonos (canone eterno ascendente)",
+            "MIDI Shepard Penrose": "🪜 Escher/Shepard — Scala Impossibile (Shepard-Penrose)",
+            "MIDI Escher Metamorphosis": "🦎 Escher — Metamorfosi (da una traccia all'altra)",
+            "MIDI MIU System": "🧩 Hofstadter — Sistema Formale MIU",
+            "MIDI Escher Symmetry": "🔳 Escher — Simmetrie del Fregio",
+            "MIDI Hamiltonian Cycle": "🕸️ Teoria dei Grafi — Ciclo Hamiltoniano",
+            "MIDI Norgard Infinity": "♾️ Per Nørgård — Serie Infinita (frattale musicale)",
+            "MIDI Euclidean Rhythm": "🥁 Toussaint — Ritmi Euclidei",
+            "MIDI Neo Riemannian": "🔁 Lewin/Tymoczko — Trasformazioni Neo-Riemanniane PLR",
+            "MIDI Spiral Array": "🌀 Chew — Spiral Array (armonia e tensione)",
+            "MIDI Maximally Even": "⭕ Clough/Douthett — Insiemi Massimamente Uniformi",
+            "MIDI PC DFT": "📈 Lewin/Quinn/Amiot — Trasformata di Fourier dei Pc-set",
+        }
+        MATH_METHODS = {
+            "🔺 Canon per Tonos — canone eterno ascendente": "MIDI Canon per Tonos",
+            "🪜 Scala impossibile — Shepard-Penrose": "MIDI Shepard Penrose",
+            "🦎 Metamorfosi — da una traccia all'altra": "MIDI Escher Metamorphosis",
+            "🔳 Simmetrie del fregio (Escher)": "MIDI Escher Symmetry",
+            "🕸️ Ciclo hamiltoniano": "MIDI Hamiltonian Cycle",
+            "♾️ Serie infinita di Nørgård": "MIDI Norgard Infinity",
+            "🧩 Sistema formale MIU (Hofstadter)": "MIDI MIU System",
+            "🥁 Ritmi euclidei (Toussaint)": "MIDI Euclidean Rhythm",
+            "🔁 Trasformazioni neo-riemanniane PLR (Lewin, Tymoczko)": "MIDI Neo Riemannian",
+            "🌀 Spiral Array (Chew) — armonia e tensione": "MIDI Spiral Array",
+            "⭕ Insiemi massimamente uniformi (Clough-Douthett)": "MIDI Maximally Even",
+            "📈 DFT dei pc-set (Fourier sulle altezze)": "MIDI PC DFT",
+            "🧮 Scott Rickard — Costas Sequencer": "MIDI Costas Sequencer",
         }
         # Metodi disponibili nella modalita' "🔧 Avanzato" (i Compositori hanno la loro modalita' dedicata)
         ADVANCED_METHODS_KEYS = [
@@ -3380,7 +4599,6 @@ if uploaded_midi_file is not None:
             "☁️ Iannis Xenakis — Musica Stocastica": "MIDI Xenakis Stochastic",
             "☯️ John Cage — Operazioni di Caso (I Ching)": "MIDI Cage Chance",
             "🌫️ Brian Eno — Musica Generativa": "MIDI Eno Generative",
-            "🧮 Scott Rickard — Costas Sequencer": "MIDI Costas Sequencer",
             "🎻 Johann Sebastian Bach — Canone Rigoroso": "MIDI Bach Canon",
             "➕ Philip Glass — Processo Additivo": "MIDI Glass Additive",
             "🕊️ Olivier Messiaen — Modi a Trasposizione Limitata": "MIDI Messiaen Modes",
@@ -3449,7 +4667,38 @@ if uploaded_midi_file is not None:
         }
 
         # Modalita' Preset / Avanzato
-        modalita = st.radio("Modalita':", ["🎨 Stile", "🎼 Compositori", "🔧 Avanzato"], horizontal=True)
+        def _chain_controls(upload_name, base_midi):
+            """Controlli comuni a Compositori e Matematica Sperimentale: concatenazione sul risultato
+            precedente e strumento delle tracce generate. Ritorna (midi sorgente, concatenazione attiva)."""
+            chain_available = bool(
+                st.session_state.midi_ready and st.session_state.midi_bytes
+                and st.session_state.get('chain_source') == upload_name
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                chain_checked = st.checkbox(
+                    "🔗 Concatena sul risultato precedente", value=False, key="chain_composers",
+                    help="Applica la tecnica scelta al risultato dell'ultima elaborazione invece che al file caricato "
+                         "(es. Messiaen → Boulez → Reich). Il report elenca tutta la catena. "
+                         "Ha effetto dopo aver generato un primo risultato.",
+                )
+            with c2:
+                st.selectbox(
+                    "🎹 Strumento delle tracce generate", GM_PROGRAM_OPTIONS, key="gen_program_label",
+                    help="Programma General MIDI per le tracce nuove create dai compositori e dai metodi di "
+                         "Matematica Sperimentale. 'Predefinito' mantiene la scelta originale di ogni metodo.",
+                )
+            active = bool(chain_checked and chain_available)
+            if chain_checked and not chain_available:
+                st.caption("🔗 Nessun risultato precedente per questo file: il primo passo parte dal file caricato.")
+            source = base_midi
+            if active:
+                source = mido.MidiFile(file=io.BytesIO(st.session_state.midi_bytes))
+                steps_txt = " → ".join(dict.fromkeys(h["suffix"] for h in st.session_state.get("chain_history", [])))
+                st.caption(f"🔗 Input: risultato precedente ({steps_txt}). Il nuovo passo verrà aggiunto alla catena.")
+            return source, active
+
+        modalita = st.radio("Modalita':", ["🎨 Stile", "🎼 Compositori", "🧪 Matematica Sperimentale", "🔧 Avanzato"], horizontal=True)
 
         decomposed_midi_file = midi_data
         parameters = {}
@@ -3503,33 +4752,7 @@ if uploaded_midi_file is not None:
             compositore_label = st.selectbox("Scegli compositore/tecnica:", list(COMPOSITORI.keys()), key="compositore_select")
             compositore_key = COMPOSITORI[compositore_label]
 
-            _chain_available = bool(
-                st.session_state.midi_ready and st.session_state.midi_bytes
-                and st.session_state.get('chain_source') == uploaded_midi_file.name
-            )
-            _cc1, _cc2 = st.columns(2)
-            with _cc1:
-                _chain_checked = st.checkbox(
-                    "🔗 Concatena sul risultato precedente", value=False, key="chain_composers",
-                    help="Applica la tecnica scelta al risultato dell'ultima elaborazione invece che al file caricato "
-                         "(es. Messiaen → Boulez → Reich). Il report elenca tutta la catena. "
-                         "Ha effetto dopo aver generato un primo risultato.",
-                )
-            with _cc2:
-                st.selectbox(
-                    "🎹 Strumento delle tracce generate", GM_PROGRAM_OPTIONS, key="gen_program_label",
-                    help="Programma General MIDI per le tracce nuove create dai compositori "
-                         "(Xenakis, Eno, Glass, Reich, Bach, Costas, voce T di Pärt). "
-                         "'Predefinito' mantiene la scelta originale di ogni metodo.",
-                )
-            chain_active = bool(_chain_checked and _chain_available)
-            if _chain_checked and not _chain_available:
-                st.caption("🔗 Nessun risultato precedente per questo file: il primo passo parte dal file caricato.")
-            source_midi = midi_data
-            if chain_active:
-                source_midi = mido.MidiFile(file=io.BytesIO(st.session_state.midi_bytes))
-                _steps = " → ".join(dict.fromkeys(h["suffix"] for h in st.session_state.get("chain_history", [])))
-                st.caption(f"🔗 Input: risultato precedente ({_steps}). Il nuovo passo verrà aggiunto alla catena.")
+            source_midi, chain_active = _chain_controls(uploaded_midi_file.name, midi_data)
 
             if compositore_key == "MIDI Stockhausen Punktuelle":
                 st.info(
@@ -3891,7 +5114,340 @@ if uploaded_midi_file is not None:
                         )
                         st.success(f"✅ Phasing applicato! Sfasamento finale: {final_phase} tick.")
 
-            else:  # Costas Sequencer
+        elif modalita == "🧪 Matematica Sperimentale":
+            st.markdown("#### 🧪 Matematica Sperimentale")
+            st.markdown(
+                "Strutture matematiche trasformate in musica, ispirate a *Gödel, Escher, Bach* (Hofstadter), a "
+                "*Blueprints* (du Sautoy) e alla teoria matematica della musica (Toussaint, Lewin, Tymoczko, Chew, Clough-Douthett, Amiot). Le tracce originali restano intatte: il risultato si aggiunge come nuove "
+                "tracce. Nessuna rete neurale, solo algoritmo puro."
+            )
+            math_label = st.selectbox("Scegli la struttura:", list(MATH_METHODS.keys()), key="math_select")
+            math_key = MATH_METHODS[math_label]
+            source_midi, chain_active = _chain_controls(uploaded_midi_file.name, midi_data)
+
+            if math_key == "MIDI Canon per Tonos":
+                st.info(
+                    "**Canon per Tonos** (*Offerta Musicale*, Bach, 1747) — il canone ricomincia a ogni giro "
+                    "un tono più in alto; dopo sei giri è tornato nella tonalità d'origine, un'ottava sopra: "
+                    "sale all'infinito senza mai uscire di tonalità. Il soggetto è preso dalle prime note del brano."
+                )
+                col_t1, col_t2 = st.columns(2)
+                with col_t1:
+                    tonos_voices = st.slider("Voci:", 1, 4, 2, key="tonos_voices")
+                    tonos_step = st.select_slider("Modulazione per giro (semitoni):", options=[1, 2, 3, 4, 6], value=2, key="tonos_step",
+                                                  help="Solo divisori di 12, così il giro si chiude. 2 = il canone di Bach (6 giri).")
+                    tonos_laps = st.slider("Ottave da salire:", 1, 3, 1, key="tonos_laps")
+                with col_t2:
+                    tonos_delay = st.slider("Ritardo fra le voci (beat):", 0.0, 8.0, 2.0, 0.5, key="tonos_delay")
+                    tonos_interval = st.slider("Intervallo fra le voci (semitoni):", -12, 12, 7, key="tonos_interval")
+                    tonos_subject = st.slider("Lunghezza soggetto (note):", 4, 24, 12, key="tonos_subject")
+                tonos_close = st.checkbox("Giro finale d'arrivo nella tonalità d'origine", value=True, key="tonos_close")
+                if st.button("🔺 Applica Canon per Tonos", type="primary", use_container_width=True, key="btn_tonos"):
+                    with st.spinner("Costruendo il canone ascendente..."):
+                        result_midi, info = midi_canon_per_tonos(
+                            source_midi, tonos_voices, tonos_step, tonos_laps, tonos_delay, tonos_interval, tonos_subject, tonos_close)
+                        if info.get('ok'):
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI Canon per Tonos"],
+                                {"MIDI Canon per Tonos": (tonos_voices, info['step'], tonos_laps, tonos_delay, tonos_interval, tonos_subject, tonos_close)},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="Tonos")
+                            st.success(f"✅ Canon per Tonos creato! {info['cycles']} giri, salita totale {info['total_shift']} semitoni, {info['voices']} voci.")
+
+            elif math_key == "MIDI Shepard Penrose":
+                st.info(
+                    "**Scala di Shepard-Penrose** (Shepard 1964; *Salendo e scendendo*, Escher 1960) — più strati di "
+                    "ottave con un'intensità a campana sul registro: la scala sale (o scende) per sempre senza arrivare "
+                    "mai in cima. Funziona meglio con suoni sostenuti (pad, archi, organo). La scala può essere quella del brano."
+                )
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    shep_dir = st.selectbox("Direzione:", ["Ascendente", "Discendente"], key="shep_dir")
+                    shep_steps = st.slider("Passi:", 12, 240, 48, key="shep_steps")
+                    shep_scale = st.selectbox("Scala:", ["Dal brano", "Cromatica"], key="shep_scale")
+                with col_s2:
+                    shep_beats = st.slider("Durata del passo (beat):", 0.125, 2.0, 0.5, 0.125, key="shep_beats")
+                    shep_layers = st.slider("Strati di ottave:", 3, 8, 6, key="shep_layers")
+                    shep_vel = st.slider("Velocity massima:", 30, 127, 100, key="shep_vel")
+                if st.button("🪜 Applica Shepard-Penrose", type="primary", use_container_width=True, key="btn_shepard"):
+                    with st.spinner("Costruendo la scala impossibile..."):
+                        result_midi, info = midi_shepard_penrose(source_midi, shep_dir, shep_steps, shep_beats, shep_layers, shep_scale, shep_vel)
+                        finalize_result(
+                            uploaded_midi_file.name, midi_data, result_midi, ["MIDI Shepard Penrose"],
+                            {"MIDI Shepard Penrose": (shep_dir, shep_steps, shep_beats, info['layers'], info['scale'])},
+                            midi_methods, stile=math_label, chain=chain_active, suffix="Shepard")
+                        st.success(f"✅ Scala di Shepard-Penrose creata! {info['steps']} passi, {info['layers']} strati, scala: {info['scale']}.")
+
+            elif math_key == "MIDI Escher Metamorphosis":
+                st.info(
+                    "**Metamorfosi** (Escher, serie *Metamorphosis*) — una traccia si trasforma gradualmente in un'altra: "
+                    "altezza, attacco, durata e velocity vengono interpolati nota per nota da A a B, come i pesci che "
+                    "diventano uccelli. Servono almeno due tracce con note."
+                )
+                _src_for_tracks = source_midi
+                if source_midi.type == 0 or (len(source_midi.tracks) == 1 and
+                        len({m.channel for t in source_midi.tracks for m in t if hasattr(m, 'channel')}) > 1):
+                    _src_for_tracks = _split_type0_to_tracks(source_midi)  # tipo 0: i canali diventano tracce
+                _mel = math_melodic_tracks(_src_for_tracks)
+                if len(_mel) < 2:
+                    st.warning("Questo MIDI ha meno di due tracce con note: la Metamorfosi non è applicabile.")
+                else:
+                    _labels = {i: f"{i}: {nm} ({cnt} note)" for i, nm, cnt in _mel}
+                    col_m1, col_m2 = st.columns(2)
+                    with col_m1:
+                        meta_a = st.selectbox("Traccia di partenza (A):", list(_labels), format_func=lambda x: _labels[x], index=0, key="meta_a")
+                    with col_m2:
+                        meta_b = st.selectbox("Traccia di arrivo (B):", list(_labels), format_func=lambda x: _labels[x], index=1, key="meta_b")
+                    meta_max = st.slider("Note massime generate:", 16, 256, 128, key="meta_max")
+                    meta_snap = st.checkbox("Quantizza sui pitch di A e B (resta nel vocabolario del brano)", value=True, key="meta_snap")
+                    if meta_a == meta_b:
+                        st.caption("A e B coincidono: verranno usate le prime due tracce.")
+                    if st.button("🦎 Applica Metamorfosi", type="primary", use_container_width=True, key="btn_meta"):
+                        with st.spinner("Trasformando una traccia nell'altra..."):
+                            result_midi, info = midi_escher_metamorphosis(_src_for_tracks, meta_a, meta_b, meta_max, meta_snap)
+                            if info.get('ok'):
+                                finalize_result(
+                                    uploaded_midi_file.name, midi_data, result_midi, ["MIDI Escher Metamorphosis"],
+                                    {"MIDI Escher Metamorphosis": (info['a_name'], info['b_name'], info['notes'], meta_snap)},
+                                    midi_methods, stile=math_label, chain=chain_active, suffix="Metamorfosi")
+                                st.success(f"✅ Metamorfosi creata! {info['notes']} note da «{info['a_name']}» a «{info['b_name']}».")
+
+            elif math_key == "MIDI Escher Symmetry":
+                st.info(
+                    "**Simmetrie del fregio** (Escher; du Sautoy, *Blueprints*) — un motivo del brano viene ripetuto "
+                    "applicando le isometrie del piano tempo-altezza: **inversione** (riflessione dell'altezza), "
+                    "**retrogrado** (riflessione del tempo) e **rotazione di 180°** (retrogrado-inversione). "
+                    "Gli schemi a due voci usano due tracce."
+                )
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    sym_pattern = st.selectbox("Schema del fregio:", list(FRIEZE_PATTERNS.keys()), key="sym_pattern")
+                with col_e2:
+                    sym_motif = st.slider("Lunghezza del motivo (note):", 3, 16, 8, key="sym_motif")
+                    sym_cells = st.slider("Celle del fregio:", 2, 48, 16, key="sym_cells")
+                if st.button("🔳 Applica Simmetrie", type="primary", use_container_width=True, key="btn_symmetry"):
+                    with st.spinner("Costruendo il fregio..."):
+                        result_midi, info = midi_escher_symmetry(source_midi, sym_pattern, sym_motif, sym_cells)
+                        if info.get('ok'):
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI Escher Symmetry"],
+                                {"MIDI Escher Symmetry": (sym_pattern, sym_motif, sym_cells)},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="Fregio")
+                            st.success(f"✅ Fregio creato! {info['cells']} celle, {info['slots']} voce/i.")
+
+            elif math_key == "MIDI Hamiltonian Cycle":
+                st.info(
+                    "**Ciclo hamiltoniano** (W. R. Hamilton, 1857; du Sautoy, *Blueprints*) — ogni pitch del brano è un "
+                    "nodo; due pitch sono collegati se distano al massimo N semitoni. Un ciclo hamiltoniano visita ogni "
+                    "nodo una sola volta e richiude il cerchio: una melodia senza ripetizioni che riparte da capo senza salti. "
+                    "Durata e velocity di ogni nota sono quelle tipiche del pitch nel brano. Se il ciclo non esiste, "
+                    "viene usato il percorso più lungo trovato (alza il salto massimo per ottenerlo)."
+                )
+                col_h1, col_h2 = st.columns(2)
+                with col_h1:
+                    ham_interval = st.slider("Salto massimo fra note collegate (semitoni):", 1, 12, 7, key="ham_interval")
+                    ham_nodes = st.slider("Pitch massimi (nodi):", 4, 24, 16, key="ham_nodes")
+                with col_h2:
+                    ham_repeats = st.slider("Ripetizioni del ciclo:", 1, 16, 4, key="ham_repeats")
+                if st.button("🕸️ Applica Ciclo Hamiltoniano", type="primary", use_container_width=True, key="btn_ham"):
+                    with st.spinner("Cercando il ciclo hamiltoniano..."):
+                        result_midi, info = midi_hamiltonian_cycle(source_midi, ham_interval, ham_nodes, ham_repeats)
+                        if info.get('ok'):
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI Hamiltonian Cycle"],
+                                {"MIDI Hamiltonian Cycle": (ham_interval, ham_nodes, ham_repeats, info['nodes'], info['status'], info['covered'], info['expansions'])},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="Hamilton")
+                            if info['status'] == 'full':
+                                st.success(f"✅ Ciclo hamiltoniano trovato su {info['nodes']} pitch!")
+                            elif info['status'] == 'partial':
+                                st.warning(f"Ciclo solo sulla componente principale ({info['covered']}/{info['nodes']} pitch): alza il salto massimo per collegare tutti i pitch.")
+                            else:
+                                st.warning(f"Nessun ciclo: usato il percorso più lungo ({info['covered']}/{info['nodes']} pitch). Prova ad alzare il salto massimo.")
+
+            elif math_key == "MIDI Norgard Infinity":
+                st.info(
+                    "**Serie infinita di Nørgård** — a(0)=0, a(2n) = −a(n), a(2n+1) = a(n)+1: 0, 1, −1, 2, 1, 0, −2, 3… "
+                    "È autosimile: prendendo un elemento ogni 2, 4, 8… si riottiene la serie (invertita a ogni raddoppio). "
+                    "Gli strati lenti sono quindi lo scheletro dello strato veloce. La serie è proiettata sulla scala del brano."
+                )
+                col_n1, col_n2 = st.columns(2)
+                with col_n1:
+                    nor_notes = st.slider("Note dello strato veloce:", 16, 512, 64, key="nor_notes")
+                    nor_layers = st.slider("Strati (scale temporali):", 1, 4, 3, key="nor_layers")
+                with col_n2:
+                    nor_beats = st.slider("Durata del passo (beat):", 0.125, 2.0, 0.5, 0.125, key="nor_beats")
+                    nor_scale = st.selectbox("Scala:", ["Dal brano", "Cromatica"], key="nor_scale")
+                if st.button("♾️ Applica Serie di Nørgård", type="primary", use_container_width=True, key="btn_norgard"):
+                    with st.spinner("Generando la serie infinita..."):
+                        result_midi, info = midi_norgard_infinity(source_midi, nor_notes, nor_beats, nor_layers, nor_scale)
+                        if info.get('ok'):
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI Norgard Infinity"],
+                                {"MIDI Norgard Infinity": (nor_notes, nor_beats, info['layers'], info['scale'])},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="Norgard")
+                            st.success(f"✅ Serie di Nørgård creata! {info['layers']} strati, scala: {info['scale']}. Inizio serie: {info['series_head'][:8]}")
+
+            elif math_key == "MIDI Euclidean Rhythm":
+                st.info(
+                    "**Ritmi euclidei** (G. Toussaint, 2005) — l'algoritmo di Euclide, nella forma di Bjorklund, distribuisce "
+                    "*k* attacchi su *n* passi nel modo più uniforme possibile. Molti ritmi tradizionali del mondo sono di questo tipo: "
+                    "E(3,8) = x..x..x. · E(5,8) = x.xx.xx. · E(7,12) = x.xx.x.xx.x. Le altezze sono quelle del soggetto del brano, "
+                    "ciclate sugli attacchi."
+                )
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    euc_steps = st.slider("Passi (n):", 4, 32, 16, key="euc_steps")
+                    euc_pulses = st.slider("Attacchi (k):", 1, 32, 5, key="euc_pulses",
+                                           help="Se k supera n viene ridotto a n.")
+                    euc_rot = st.slider("Rotazione (passi):", 0, 31, 0, key="euc_rot")
+                    euc_subject = st.slider("Note del soggetto:", 1, 16, 8, key="euc_subject")
+                with col_e2:
+                    euc_beats = st.slider("Durata del passo (beat):", 0.125, 1.0, 0.25, 0.125, key="euc_beats")
+                    euc_layers = st.slider("Strati:", 1, 3, 1, key="euc_layers",
+                                           help="Ogni strato successivo ha 2 attacchi in meno e suona un'ottava sotto: poliritmia euclidea.")
+                    euc_cycles = st.slider("Cicli:", 1, 32, 4, key="euc_cycles")
+                if st.button("🥁 Applica Ritmi Euclidei", type="primary", use_container_width=True, key="btn_euclid"):
+                    with st.spinner("Calcolando i ritmi euclidei..."):
+                        result_midi, info = midi_euclidean_rhythm(
+                            source_midi, euc_steps, euc_pulses, euc_rot, euc_beats, euc_layers, euc_cycles, euc_subject)
+                        if info.get('ok'):
+                            pats_txt = " · ".join(f"E({k},{info['steps']}) = {ps}" for k, ps in info['patterns'])
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI Euclidean Rhythm"],
+                                {"MIDI Euclidean Rhythm": (info['steps'], euc_pulses, info['rotation'], euc_beats, info['layers'], euc_cycles, euc_subject, pats_txt)},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="Euclideo")
+                            st.success(f"✅ Ritmi euclidei creati! {info['layers']} strati.")
+                            st.code("\n".join(f"E({k},{info['steps']})  {ps}" for k, ps in info['patterns']), language=None)
+
+            elif math_key == "MIDI Neo Riemannian":
+                st.info(
+                    "**Trasformazioni neo-riemanniane** (D. Lewin, *Generalized Musical Intervals and Transformations*, 1987) — "
+                    "una triade è un oggetto e **P** (parallela: Do↔Do min), **L** (nota sensibile: Do↔Mi min), **R** (relativa: "
+                    "Do↔La min) sono le funzioni che la trasformano; ognuna muove una sola voce. P-L alternate danno il ciclo esatonico "
+                    "(6 accordi), P-R l'ottatonico (8), L-R tutte le 24 triadi. Il voicing usa il voice leading di distanza minima "
+                    "(D. Tymoczko, *Science*, 2006): l'accordo è un punto, il voice leading una distanza."
+                )
+                _nr_starts = ["Dal brano"] + [n for n in _NOTE_NAMES] + [n + "m" for n in _NOTE_NAMES]
+                col_n1, col_n2 = st.columns(2)
+                with col_n1:
+                    nr_pattern = st.selectbox("Schema:", list(NR_PATTERNS.keys()), key="nr_pattern")
+                    nr_steps = st.slider("Accordi:", 4, 48, 12, key="nr_steps")
+                with col_n2:
+                    nr_start = st.selectbox("Triade di partenza:", _nr_starts, key="nr_start",
+                                            help="'Dal brano' usa la tonalità stimata (Krumhansl-Schmuckler). Il suffisso 'm' indica una triade minore.")
+                    nr_beats = st.slider("Durata dell'accordo (beat):", 0.5, 8.0, 2.0, 0.5, key="nr_beats")
+                nr_tie = st.checkbox("Lega le note comuni fra accordi vicini", value=True, key="nr_tie",
+                                     help="Le note che restano ferme (due su tre) non vengono riattaccate: si sente la voce che si muove.")
+                if st.button("🔁 Applica Trasformazioni PLR", type="primary", use_container_width=True, key="btn_nr"):
+                    with st.spinner("Percorrendo lo spazio delle triadi..."):
+                        result_midi, info = midi_neo_riemannian(source_midi, nr_pattern, nr_steps, nr_beats, nr_start, nr_tie)
+                        if info.get('ok'):
+                            chords_txt = " – ".join(info['chords'][:24]) + (" …" if len(info['chords']) > 24 else "")
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI Neo Riemannian"],
+                                {"MIDI Neo Riemannian": (nr_pattern, nr_steps, nr_beats, info['start'], nr_tie, info['period'], info['vl_total'], chords_txt)},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="PLR")
+                            st.success(f"✅ Trasformazioni PLR create! Partenza: {info['start']}, voice leading totale {info['vl_total']} semitoni.")
+                            if info['period']:
+                                st.caption(f"Il ciclo si richiude dopo {info['period']} accordi.")
+                            st.caption("Sequenza: " + chords_txt)
+
+            elif math_key == "MIDI Spiral Array":
+                st.info(
+                    "**Spiral Array** (E. Chew, 2000) — le altezze stanno su un'elica lungo la linea delle quinte; un accordo è il "
+                    "baricentro delle sue note, una tonalità quello dei suoi accordi I, V, IV. Il **centro d'effetto** di ogni finestra "
+                    "del brano (baricentro delle note pesato sulle durate) indica l'accordo più vicino; la distanza del centro "
+                    "d'effetto dalla tonalità è la **tensione** e governa la velocity. Il risultato è una riduzione armonica del brano "
+                    "(accordi + basso) con voice leading a distanza minima."
+                )
+                col_p1, col_p2 = st.columns(2)
+                with col_p1:
+                    sp_window = st.select_slider("Finestra d'analisi (beat):", options=[1.0, 2.0, 4.0, 8.0], value=4.0, key="sp_window",
+                                                 help="Finestre brevi con poche note danno accordi poco affidabili: 4 beat (una battuta in 4/4) è un buon punto di partenza.")
+                with col_p2:
+                    sp_bass = st.checkbox("Aggiungi basso sulla fondamentale", value=True, key="sp_bass")
+                if st.button("🌀 Applica Spiral Array", type="primary", use_container_width=True, key="btn_spiral"):
+                    with st.spinner("Analizzando l'armonia sull'elica..."):
+                        result_midi, info = midi_spiral_array(source_midi, sp_window, sp_bass)
+                        if info.get('ok'):
+                            prog_txt = " – ".join(info['progression'][:24]) + (" …" if len(info['progression']) > 24 else "")
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI Spiral Array"],
+                                {"MIDI Spiral Array": (sp_window, sp_bass, info['key'], info['windows'], info['mean_tension'], prog_txt)},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="Spiral")
+                            st.success(f"✅ Spiral Array applicato! Tonalità: {info['key']}, tensione media {info['mean_tension']:.3f}.")
+                            st.caption("Progressione: " + prog_txt)
+
+            elif math_key == "MIDI Maximally Even":
+                st.info(
+                    "**Insiemi massimamente uniformi** (J. Clough e J. Douthett, 1991) — i *c* punti più regolari possibili sul cerchio "
+                    "delle 12 altezze: ME(c,12) = { floor(12·k / c) }. c=7 è la scala diatonica, c=5 la pentatonica, c=6 i toni interi, "
+                    "c=4 la settima diminuita, c=3 la triade aumentata; le rotazioni sono i modi (con c=7 il modo 1 è l'Ionio). "
+                    "È lo stesso oggetto dei ritmi euclidei, sul cerchio delle altezze. Il soggetto del brano viene quantizzato "
+                    "sull'insieme e armonizzato con un sotto-insieme annidato: ME(3,7) dentro ME(7,12) = le terze diatoniche."
+                )
+                _me_tonics = ["Dal brano"] + list(_NOTE_NAMES)
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    me_c = st.slider("Elementi dell'insieme (c):", 2, 11, 7, key="me_c")
+                    me_mode = st.slider("Modo (rotazione):", 0, 10, 1, key="me_mode",
+                                        help="Viene ridotto modulo c. Con c=7: 0 Locrio, 1 Ionio, 2 Dorico, 3 Frigio, 4 Lidio, 5 Misolidio, 6 Eolio.")
+                    me_tonic = st.selectbox("Tonica:", _me_tonics, key="me_tonic",
+                                            help="'Dal brano' usa la tonica stimata (Krumhansl-Schmuckler).")
+                with col_m2:
+                    me_sub = st.slider("Sotto-insieme per gli accordi (0 = nessuno):", 0, 10, 3, key="me_sub",
+                                       help="Deve essere minore di c: gli accordi sono ME(s,c) costruito su ogni grado.")
+                    me_chord_beats = st.select_slider("Durata degli accordi (beat):", options=[1.0, 2.0, 4.0, 8.0], value=4.0, key="me_chord_beats")
+                    me_subject = st.slider("Note del soggetto:", 8, 128, 32, key="me_subject")
+                if st.button("⭕ Applica Insiemi Massimamente Uniformi", type="primary", use_container_width=True, key="btn_me"):
+                    with st.spinner("Calcolando l'insieme massimamente uniforme..."):
+                        result_midi, info = midi_maximally_even(source_midi, me_c, me_mode, me_tonic, me_sub, me_chord_beats, me_subject)
+                        if info.get('ok'):
+                            names_txt = " ".join(info['names'])
+                            ivs_txt = "-".join(str(i) for i in info['intervals'])
+                            sub_used = len(info['sub_idx'])
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI Maximally Even"],
+                                {"MIDI Maximally Even": (info['cardinality'], info['mode'], info['tonic'], sub_used, me_chord_beats, me_subject,
+                                                         names_txt, ivs_txt, info['euclid_equiv'], info['moved'], info['notes'])},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="ME")
+                            st.success(f"✅ Insieme ME({info['cardinality']},12) creato! {names_txt} — intervalli {ivs_txt}.")
+                            st.caption(f"Note del soggetto spostate sull'insieme: {info['moved']}/{info['notes']}.")
+
+            elif math_key == "MIDI PC DFT":
+                st.info(
+                    "**DFT dei pc-set** (D. Lewin; J. Quinn, 2006; E. Amiot, 2016) — un insieme di altezze è un segnale sui 12 punti del "
+                    "cerchio e la sua trasformata di Fourier F_k dice quanto somiglia alla divisione regolare dell'ottava in k parti "
+                    "(k=5 diatonico, k=3 triadico, k=4 ottatonico, k=6 toni interi). Il metodo calcola la DFT dell'istogramma del brano, "
+                    "tiene solo le componenti scelte, prende le c altezze più forti del profilo ricostruito e quantizza il soggetto su quell'insieme. "
+                    "La moltiplicazione M5/M7 scambia le componenti (F'_k = F_5k): il diatonico diventa un cluster."
+                )
+                col_d1, col_d2 = st.columns(2)
+                with col_d1:
+                    dft_comps = st.multiselect("Componenti di Fourier da tenere:", [1, 2, 3, 4, 5, 6], default=[5], key="dft_comps",
+                                               format_func=lambda k: DFT_COMPONENT_LABELS[k],
+                                               help="Se non ne scegli nessuna viene usata la 5.")
+                    dft_card = st.slider("Altezze dell'insieme (c):", 3, 11, 7, key="dft_card")
+                with col_d2:
+                    dft_shift = st.slider("Sfasamento (semitoni):", 0, 11, 0, key="dft_shift",
+                                          help="Sfasare le componenti di 2*pi*k*t/12 equivale a traspore il profilo di t semitoni.")
+                    dft_mult = st.selectbox("Moltiplicazione dell'insieme:", ["Nessuno", "M5", "M7"], key="dft_mult")
+                    dft_subject = st.slider("Note del soggetto:", 8, 128, 32, key="dft_subject")
+                if st.button("📈 Applica Filtro DFT", type="primary", use_container_width=True, key="btn_dft"):
+                    with st.spinner("Filtrando nello spazio di Fourier..."):
+                        result_midi, info = midi_pc_dft_filter(source_midi, dft_comps, dft_card, dft_shift, dft_mult, dft_subject)
+                        if info.get('ok'):
+                            names_txt = " ".join(info['names'])
+                            mags_p = " ".join(f"{x:.2f}" for x in info['mags_piece'])
+                            mags_s = " ".join(f"{x:.2f}" for x in info['mags_set'])
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI PC DFT"],
+                                {"MIDI PC DFT": ("+".join(str(k) for k in info['components']), info['cardinality'], info['shift'], info['multiplier'],
+                                                 names_txt, mags_p, mags_s, info['moved'], info['notes'])},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="DFT")
+                            st.success(f"✅ Filtro DFT applicato! Insieme: {names_txt}.")
+                            st.caption(f"|F1..F6| del brano: {mags_p}  ·  dell'insieme: {mags_s}  ·  note spostate: {info['moved']}/{info['notes']}")
+
+            elif math_key == "MIDI Costas Sequencer":
                 st.caption(
                     "Basato sulla costruzione di Welch (Scott Rickard / J.P. Costas): "
                     "una permutazione algoritmica in cui nessun vettore-differenza tra "
@@ -3900,30 +5456,30 @@ if uploaded_midi_file is not None:
                 costas_mode = st.selectbox(
                     "Modalità Costas:",
                     ["Permutazione Pitch (Cromatica)", "Griglia Ritmica Costas", "Generatore Costas (Nuova Melodia)"],
-                    key="costas_mode_compositori"
+                    key="costas_mode_math"
                 )
 
                 if costas_mode == "Permutazione Pitch (Cromatica)":
                     st.info("Usa una matrice di Costas di ordine 12 (p=13) come cifrario di sostituzione fisso per le 12 classi di altezza. Ritmo invariato.")
-                    transpose_octave = st.slider("Trasposizione (ottave):", -2, 2, 0, key="costas_transpose_compositori")
+                    transpose_octave = st.slider("Trasposizione (ottave):", -2, 2, 0, key="costas_transpose_math")
                     costas_params = (costas_mode, 12, transpose_octave, 0, 1.0)
 
                 elif costas_mode == "Griglia Ritmica Costas":
-                    costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 8, key="costas_order_grid_compositori")
+                    costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 8, key="costas_order_grid_math")
                     _p_preview = _costas_find_prime(costas_order_req)
                     st.caption(f"Ordine effettivo: n = {_p_preview - 1} (primo p = {_p_preview})")
                     costas_params = (costas_mode, costas_order_req, 0, 0, 1.0)
 
                 else:  # Generatore Costas (Nuova Melodia)
-                    costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 12, key="costas_order_gen_compositori")
+                    costas_order_req = st.slider("Ordine minimo della matrice (n):", 3, 24, 12, key="costas_order_gen_math")
                     _p_preview = _costas_find_prime(costas_order_req)
                     st.caption(f"Ordine effettivo: n = {_p_preview - 1} (primo p = {_p_preview})")
                     col_c1, col_c2 = st.columns(2)
                     with col_c1:
-                        base_pitch = st.slider("Pitch base (MIDI):", 24, 96, 60, key="costas_base_pitch_compositori")
+                        base_pitch = st.slider("Pitch base (MIDI):", 24, 96, 60, key="costas_base_pitch_math")
                     with col_c2:
-                        pitch_range_semitones = st.slider("Estensione (semitoni):", 6, 48, 24, key="costas_pitch_range_compositori")
-                    step_beats = st.slider("Durata di ogni passo (in battute/beat):", 0.125, 2.0, 0.25, 0.125, key="costas_step_beats_compositori")
+                        pitch_range_semitones = st.slider("Estensione (semitoni):", 6, 48, 24, key="costas_pitch_range_math")
+                    step_beats = st.slider("Durata di ogni passo (in battute/beat):", 0.125, 2.0, 0.25, 0.125, key="costas_step_beats_math")
                     costas_params = (costas_mode, costas_order_req, base_pitch, pitch_range_semitones, step_beats)
 
                 if st.button("🧮 Applica Costas Sequencer", type="primary", use_container_width=True, key="btn_costas"):
@@ -3939,12 +5495,40 @@ if uploaded_midi_file is not None:
                         finalize_result(
                             uploaded_midi_file.name, midi_data, result_midi,
                             ["MIDI Costas Sequencer"], {"MIDI Costas Sequencer": costas_params},
-                            midi_methods, stile=compositore_label,
+                            midi_methods, stile=math_label,
                             chain=chain_active,
                             suffix="Costas"
                         )
                         n_costas, p_costas, g_costas = costas_info
                         st.success(f"✅ Costas Sequencer applicato! Ordine effettivo n={n_costas} (p={p_costas}, g={g_costas})")
+
+            else:  # Sistema formale MIU
+                st.info(
+                    "**Sistema formale MIU** (Hofstadter, *Gödel, Escher, Bach*, cap. 1) — alfabeto {M, I, U}, assioma MI e "
+                    "quattro regole di riscrittura: xI→xIU · Mx→Mxx · III→U · UU→(nulla). A ogni passo viene applicata una "
+                    "regola applicabile scelta a caso (seed). Ogni stringa diventa una sezione: **I** = cellula del brano, "
+                    "**U** = cellula invertita, **M** = pedale. Curiosità: MU non è mai derivabile (il numero di I non è mai un multiplo di 3)."
+                )
+                col_u1, col_u2 = st.columns(2)
+                with col_u1:
+                    miu_steps = st.slider("Passi di derivazione:", 2, 16, 8, key="miu_steps")
+                    miu_maxlen = st.slider("Lunghezza massima della stringa:", 6, 32, 16, key="miu_maxlen")
+                with col_u2:
+                    miu_cell = st.slider("Note della cellula:", 2, 6, 3, key="miu_cell")
+                    miu_beats = st.slider("Durata di ogni simbolo (beat):", 0.5, 4.0, 2.0, 0.5, key="miu_beats")
+                if st.button("🧩 Applica Sistema MIU", type="primary", use_container_width=True, key="btn_miu"):
+                    with st.spinner("Derivando stringhe MIU..."):
+                        result_midi, info = midi_miu_system(source_midi, miu_steps, miu_maxlen, miu_cell, miu_beats)
+                        if info.get('ok'):
+                            finalize_result(
+                                uploaded_midi_file.name, midi_data, result_midi, ["MIDI MIU System"],
+                                {"MIDI MIU System": (miu_steps, miu_maxlen, miu_cell, miu_beats, info['final'])},
+                                midi_methods, stile=math_label, chain=chain_active, suffix="MIU")
+                            st.success(f"✅ Sistema MIU applicato! {len(info['history']) - 1} passi, stringa finale: {info['final']}")
+                            if len(info['history']) - 1 < miu_steps:
+                                st.info(f"La derivazione si è fermata dopo {len(info['history']) - 1} passi su {miu_steps}: "
+                                        "nessuna regola era più applicabile entro la lunghezza massima. Alza il limite per proseguire.")
+                            st.caption("Derivazione: " + " → ".join(info['history'][:8]) + (" …" if len(info['history']) > 8 else ""))
 
         else:  # 🔧 Avanzato
             st.markdown("#### Metodi di Decomposizione")
@@ -4070,7 +5654,9 @@ else:
         * **🥁 Aggiungi Base Ritmica**: Aggiunge una nuova traccia di batteria al tuo brano per creare un sound dance o pop!
         * **🔁 MIDI Recomposer**: Ricompone ogni traccia in un nuovo brano usando solo le sue note come vocabolario (7 stili).
 
-        **🎼 Compositori:** Stockhausen (Punktuelle), Boulez (moltiplicazione d'accordi), Xenakis (nuvole stocastiche), Cage (I Ching), Eno (cicli asincroni), Rickard (Costas), Bach (canone), Glass (processo additivo), Messiaen (modi a trasposizione limitata), Pärt (tintinnabuli), Reich (phasing).
+        **🎼 Compositori:** Stockhausen (Punktuelle), Boulez (moltiplicazione d'accordi), Xenakis (nuvole stocastiche), Cage (I Ching), Eno (cicli asincroni), Bach (canone), Glass (processo additivo), Messiaen (modi a trasposizione limitata), Pärt (tintinnabuli), Reich (phasing).
+
+        **🧪 Matematica Sperimentale:** Canon per Tonos (canone eterno ascendente), scala di Shepard-Penrose, Metamorfosi di Escher fra due tracce, simmetrie del fregio, ciclo hamiltoniano, serie infinita di Nørgård e sistema formale MIU di Hofstadter (ispirati a *Gödel, Escher, Bach* e a *Blueprints*); ritmi euclidei (Toussaint), trasformazioni neo-riemanniane PLR con voice leading minimo (Lewin, Tymoczko) Spiral Array (Chew), insiemi massimamente uniformi (Clough-Douthett) e DFT dei pc-set (Lewin, Quinn, Amiot), dalla *mathematical music theory*; Costas Sequencer di Scott Rickard (permutazioni di Costas, costruzione di Welch).
 
         **🥁 Batteria:** con *Preserva la batteria* (attivo di default) il canale MIDI 10 resta intatto nei metodi che alterano altezza o struttura.
 
