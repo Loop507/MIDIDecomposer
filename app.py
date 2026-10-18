@@ -12,7 +12,7 @@ import os
 import random
 import threading
 import zlib
-from collections import Counter, defaultdict, deque
+from collections import defaultdict, deque
 
 import mido
 import numpy as np
@@ -2462,140 +2462,6 @@ def midi_random_pitch_transformer(original_midi, random_pitch_strength, preserve
     return new_midi
 
 
-_RB_DRUM_MAP = {"kick": 36, "snare": 38, "hihat_closed": 42}
-_RB_INSTRUMENT_NAMES = {"kick": "Cassa", "snare": "Rullante", "hihat_closed": "Hi-hat"}
-
-
-def _rb_hit(start_tick, duration_ticks, velocity):
-    return {'start_tick': start_tick, 'duration_ticks': duration_ticks, 'velocity': velocity}
-
-
-def _rb_parse_time_signature(time_signature):
-    try:
-        beats, note_value = map(int, time_signature.split('/'))
-        if beats <= 0 or note_value <= 0:
-            raise ValueError
-        return beats, note_value
-    except (ValueError, IndexError):
-        warn(f"Metrica non valida: '{time_signature}'. Verrà usata la metrica 4/4.")
-        return 4, 4
-
-
-def _rb_pattern_fixed(kick, snare, hihat, beats_per_measure, tpb):
-    """Pattern Fisso (Pop/Rock): cassa su 1 e 3, rullante su 2 e 4, hi-hat in ottavi."""
-    pat = {"kick": [], "snare": [], "hihat_closed": []}
-    if kick:
-        pat["kick"].append(_rb_hit(0, tpb // 8, 100))
-        if beats_per_measure >= 3:
-            pat["kick"].append(_rb_hit(tpb * 2, tpb // 8, 100))
-    if snare:
-        if beats_per_measure >= 2:
-            pat["snare"].append(_rb_hit(tpb, tpb // 8, 100))
-        if beats_per_measure >= 4:
-            pat["snare"].append(_rb_hit(tpb * 3, tpb // 8, 100))
-    if hihat:
-        for i in range(beats_per_measure * 2):
-            pat["hihat_closed"].append(_rb_hit(i * tpb // 2, tpb // 8, 80))
-    return pat
-
-
-def _rb_pattern_random(rng, kick, snare, hihat, beats_per_measure, tpb):
-    """Pattern Casuale: ogni sedicesimo ha una probabilita' per strumento (ordine delle estrazioni RNG invariato)."""
-    pat = {"kick": [], "snare": [], "hihat_closed": []}
-    kick_prob, snare_prob, hihat_prob = 0.2, 0.1, 0.4
-    sub = tpb // 4
-    for i in range(beats_per_measure * 4):
-        start_tick = i * sub
-        duration = sub // 2
-        if kick and rng.random() < kick_prob:
-            pat["kick"].append(_rb_hit(start_tick, duration, rng.randint(80, 110)))
-        if snare and rng.random() < snare_prob:
-            pat["snare"].append(_rb_hit(start_tick, duration, rng.randint(80, 110)))
-        if hihat and rng.random() < hihat_prob:
-            pat["hihat_closed"].append(_rb_hit(start_tick, duration, rng.randint(60, 90)))
-    return pat
-
-
-def _rb_pattern_adaptive(rng, original_midi, kick, snare, hihat, beats_per_measure, ticks_per_measure, tpb):
-    """Pattern Adattivo: cassa/rullante sui tick (snappati al sedicesimo) dove il brano suona di piu'."""
-    pat = {"kick": [], "snare": [], "hihat_closed": []}
-    note_on_counts = defaultdict(int)
-    for track in original_midi.tracks:
-        abs_time = 0
-        for msg in track:
-            abs_time += msg.time
-            if msg.type == 'note_on' and msg.velocity > 0 and msg.channel != 9:
-                tick_in_measure = abs_time % ticks_per_measure
-                subdivision_ticks = tpb // 4
-                note_on_counts[round(tick_in_measure / subdivision_ticks) * subdivision_ticks] += 1
-
-    if not note_on_counts:
-        warn("Nessuna nota trovata per un pattern adattivo. Verrà usato un pattern fisso.")
-        if kick:  pat["kick"].append(_rb_hit(0, tpb // 8, 100))
-        if snare: pat["snare"].append(_rb_hit(tpb, tpb // 8, 100))
-        if hihat: pat["hihat_closed"].append(_rb_hit(0, tpb // 2, 80))
-        return pat
-
-    most_common_ticks = sorted(note_on_counts, key=note_on_counts.get, reverse=True)
-
-    kick_ticks = []
-    if kick:
-        for tick in most_common_ticks:
-            if len(kick_ticks) >= 3:
-                break
-            if (beats_per_measure == 4 and (tick == 0 or tick == tpb * 2)) or (len(kick_ticks) < 2 and note_on_counts[tick] > 1):
-                kick_ticks.append(tick)
-        if not kick_ticks:
-            kick_ticks.extend([0, tpb * 2] if beats_per_measure >= 4 else [0])
-        for tick in kick_ticks:
-            pat["kick"].append(_rb_hit(tick, tpb // 8, 100))
-
-    snare_ticks = []
-    if snare:
-        for tick in most_common_ticks:
-            is_kick_tick = any(abs(tick - kt) < tpb / 4 for kt in kick_ticks)
-            if not is_kick_tick and len(snare_ticks) < 2:
-                snare_ticks.append(tick)
-        if not snare_ticks:
-            snare_ticks.extend([tpb, tpb * 3] if beats_per_measure >= 4 else [tpb])
-        for tick in snare_ticks:
-            pat["snare"].append(_rb_hit(tick, tpb // 8, 100))
-
-    if hihat:
-        ticks_per_eighth = tpb // 2
-        for i in range(int(ticks_per_measure / ticks_per_eighth)):
-            pat["hihat_closed"].append(_rb_hit(i * ticks_per_eighth, ticks_per_eighth // 2, rng.randint(60, 90)))
-    return pat
-
-
-def _rb_render_track(drum_name, hits, num_measures, ticks_per_measure, total_ticks):
-    """Replica il pattern di una misura per tutto il brano e lo scrive come traccia di batteria (canale 10)."""
-    track = mido.MidiTrack()
-    track.name = f"Ritmica: {_RB_INSTRUMENT_NAMES[drum_name]}"
-    track.append(mido.Message('program_change', program=0, channel=9, time=0))
-
-    note = _RB_DRUM_MAP[drum_name]
-    events = []
-    for i in range(num_measures):
-        measure_start = i * ticks_per_measure
-        for hit in hits:
-            start = measure_start + hit['start_tick']
-            if start < total_ticks:  # solo eventi che rientrano nella durata del brano
-                end = start + hit['duration_ticks']
-                events.append({'msg': mido.Message('note_on', note=note, velocity=hit['velocity'], channel=9), 'abs_time': start})
-                events.append({'msg': mido.Message('note_off', note=note, velocity=0, channel=9), 'abs_time': min(end, total_ticks)})
-
-    events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
-    last_abs_time = 0
-    for ev in events:
-        track.append(_clone(ev['msg'], time=max(0, ev['abs_time'] - last_abs_time)))
-        last_abs_time = ev['abs_time']
-
-    # Messaggio finale: garantisce la lunghezza corretta della traccia
-    track.append(mido.MetaMessage('end_of_track', time=max(0, total_ticks - last_abs_time)))
-    return track
-
-
 @_preserves_meta
 def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rhythmic_pattern_style, seed=None):
     """
@@ -2605,36 +2471,153 @@ def midi_add_rhythmic_base(original_midi, kick, snare, hihat, time_signature, rh
     new_midi = mido.MidiFile(ticks_per_beat=original_midi.ticks_per_beat)
     for track in original_midi.tracks:
         new_midi.tracks.append(track)
+    
+    DRUM_MAP = {
+        "kick": 36,     
+        "snare": 38,    
+        "hihat_closed": 42,
+    }
+    
+    try:
+        beats_per_measure, note_value = map(int, time_signature.split('/'))
+        if beats_per_measure <= 0 or note_value <= 0:
+            raise ValueError
+    except (ValueError, IndexError):
+        warn(f"Metrica non valida: '{time_signature}'. Verrà usata la metrica 4/4.")
+        beats_per_measure, note_value = 4, 4
+    
+    ticks_per_beat = new_midi.ticks_per_beat
+    ticks_per_measure = int(ticks_per_beat * beats_per_measure * 4 / note_value)
 
-    beats_per_measure, note_value = _rb_parse_time_signature(time_signature)
-    tpb = new_midi.ticks_per_beat
-    ticks_per_measure = int(tpb * beats_per_measure * 4 / note_value)
     if ticks_per_measure == 0:
         warn("Ticks per misura è zero. Non è possibile aggiungere la base ritmica.")
         return new_midi
 
-    # Durata totale del brano originale in ticks
+    # Calcolo della durata totale del brano originale in ticks
     total_ticks = 0
     for track in original_midi.tracks:
-        total_ticks = max(total_ticks, sum(msg.time for msg in track))
+        current_time = 0
+        for msg in track:
+            current_time += msg.time
+        total_ticks = max(total_ticks, current_time)
+
     if total_ticks == 0:
         warn("Il brano originale non contiene eventi validi per calcolare la lunghezza. La base ritmica non verrà aggiunta.")
         return new_midi
 
-    patterns = {"kick": [], "snare": [], "hihat_closed": []}
+    rhythmic_patterns_in_measure = {
+        "kick": [],
+        "snare": [],
+        "hihat_closed": []
+    }
+    
     if rhythmic_pattern_style == "Pattern Fisso (Pop/Rock)":
-        patterns = _rb_pattern_fixed(kick, snare, hihat, beats_per_measure, tpb)
-    elif rhythmic_pattern_style == "Pattern Casuale":
-        patterns = _rb_pattern_random(rng, kick, snare, hihat, beats_per_measure, tpb)
-    elif rhythmic_pattern_style == "Pattern Adattivo":
-        patterns = _rb_pattern_adaptive(rng, original_midi, kick, snare, hihat,
-                                        beats_per_measure, ticks_per_measure, tpb)
+        if kick:
+            rhythmic_patterns_in_measure["kick"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+            if beats_per_measure >= 3:
+                rhythmic_patterns_in_measure["kick"].append({'start_tick': ticks_per_beat * 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+        if snare:
+            if beats_per_measure >= 2:
+                rhythmic_patterns_in_measure["snare"].append({'start_tick': ticks_per_beat, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+            if beats_per_measure >= 4:
+                rhythmic_patterns_in_measure["snare"].append({'start_tick': ticks_per_beat * 3, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+        if hihat:
+            for i in range(beats_per_measure * 2):
+                rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': i * ticks_per_beat // 2, 'duration_ticks': ticks_per_beat // 8, 'velocity': 80})
 
+    elif rhythmic_pattern_style == "Pattern Casuale":
+        kick_prob, snare_prob, hihat_prob = 0.2, 0.1, 0.4
+        ticks_per_subdivision = ticks_per_beat // 4
+        total_subdivisions_in_measure = beats_per_measure * 4
+        
+        for i in range(total_subdivisions_in_measure):
+            start_tick = i * ticks_per_subdivision
+            duration = ticks_per_subdivision // 2 
+            if kick and rng.random() < kick_prob: rhythmic_patterns_in_measure["kick"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': rng.randint(80, 110)})
+            if snare and rng.random() < snare_prob: rhythmic_patterns_in_measure["snare"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': rng.randint(80, 110)})
+            if hihat and rng.random() < hihat_prob: rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': start_tick, 'duration_ticks': duration, 'velocity': rng.randint(60, 90)})
+
+    elif rhythmic_pattern_style == "Pattern Adattivo":
+        note_on_counts = defaultdict(int)
+        for track in original_midi.tracks:
+            abs_time = 0
+            for msg in track:
+                abs_time += msg.time
+                if msg.type == 'note_on' and msg.velocity > 0 and msg.channel != 9:
+                    tick_in_measure = abs_time % ticks_per_measure
+                    subdivision_ticks = ticks_per_beat // 4
+                    snapped_tick = round(tick_in_measure / subdivision_ticks) * subdivision_ticks
+                    note_on_counts[snapped_tick] += 1
+        
+        if note_on_counts:
+            most_common_ticks = sorted(note_on_counts, key=note_on_counts.get, reverse=True)
+            
+            kick_ticks = []
+            if kick:
+                for tick in most_common_ticks:
+                    if len(kick_ticks) >= 3: break
+                    if (beats_per_measure == 4 and (tick == 0 or tick == ticks_per_beat * 2)) or (len(kick_ticks) < 2 and note_on_counts[tick] > 1):
+                         kick_ticks.append(tick)
+                if not kick_ticks: kick_ticks.extend([0, ticks_per_beat*2] if beats_per_measure >= 4 else [0])
+                for tick in kick_ticks: rhythmic_patterns_in_measure["kick"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+            
+            snare_ticks = []
+            if snare:
+                for tick in most_common_ticks:
+                    is_kick_tick = any(abs(tick - kt) < ticks_per_beat / 4 for kt in kick_ticks)
+                    if not is_kick_tick and len(snare_ticks) < 2: snare_ticks.append(tick)
+                if not snare_ticks: snare_ticks.extend([ticks_per_beat, ticks_per_beat*3] if beats_per_measure >= 4 else [ticks_per_beat])
+                for tick in snare_ticks: rhythmic_patterns_in_measure["snare"].append({'start_tick': tick, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+
+            if hihat:
+                ticks_per_eighth = ticks_per_beat // 2
+                for i in range(int(ticks_per_measure / ticks_per_eighth)):
+                    rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': i * ticks_per_eighth, 'duration_ticks': ticks_per_eighth // 2, 'velocity': rng.randint(60, 90)})
+        else:
+            warn("Nessuna nota trovata per un pattern adattivo. Verrà usato un pattern fisso.")
+            if kick: rhythmic_patterns_in_measure["kick"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+            if snare: rhythmic_patterns_in_measure["snare"].append({'start_tick': ticks_per_beat, 'duration_ticks': ticks_per_beat // 8, 'velocity': 100})
+            if hihat: rhythmic_patterns_in_measure["hihat_closed"].append({'start_tick': 0, 'duration_ticks': ticks_per_beat // 2, 'velocity': 80})
+
+    instrument_names = {"kick": "Cassa", "snare": "Rullante", "hihat_closed": "Hi-hat"}
+
+    # Calcola il numero di misure necessarie per coprire l'intera durata del brano
     num_measures = int(np.ceil(total_ticks / ticks_per_measure))
-    for drum_name, hits in patterns.items():
-        if hits:
-            new_midi.tracks.append(_rb_render_track(drum_name, hits, num_measures, ticks_per_measure, total_ticks))
+    
+    for drum_note_name, patterns_in_measure in rhythmic_patterns_in_measure.items():
+        if not patterns_in_measure: continue
+        
+        new_drum_track = mido.MidiTrack()
+        new_drum_track.name = f"Ritmica: {instrument_names[drum_note_name]}"
+        new_drum_track.append(mido.Message('program_change', program=0, channel=9, time=0))
+        
+        all_drum_events = []
+        for i in range(num_measures):
+            current_measure_start_tick = i * ticks_per_measure
+            for event in patterns_in_measure:
+                start_abs_time = current_measure_start_tick + event['start_tick']
+                end_abs_time = start_abs_time + event['duration_ticks']
+                
+                # Aggiungi solo eventi che rientrano nella durata totale del brano
+                if start_abs_time < total_ticks:
+                    all_drum_events.append({'msg': mido.Message('note_on', note=DRUM_MAP[drum_note_name], velocity=event['velocity'], channel=9), 'abs_time': start_abs_time})
+                    all_drum_events.append({'msg': mido.Message('note_off', note=DRUM_MAP[drum_note_name], velocity=0, channel=9), 'abs_time': min(end_abs_time, total_ticks)})
+
+        all_drum_events.sort(key=lambda x: (x['abs_time'], 0 if x['msg'].type == 'note_off' else 1))
+        last_abs_time = 0
+        for event in all_drum_events:
+            delta_time = max(0, event['abs_time'] - last_abs_time)
+            new_msg = _clone(event['msg'], time=delta_time)
+            new_drum_track.append(new_msg)
+            last_abs_time = event['abs_time']
+        
+        # Aggiungi un messaggio finale per garantire che la traccia abbia la lunghezza corretta
+        new_drum_track.append(mido.MetaMessage('end_of_track', time=max(0, total_ticks - last_abs_time)))
+        
+        new_midi.tracks.append(new_drum_track)
+
     return new_midi
+
 
 
 # Mappatura General MIDI: numero programma → nome famiglia strumentale
@@ -2734,152 +2717,6 @@ def _split_type0_to_tracks(midi):
 
 @_trims_tail
 @_preserves_meta
-def _recomposer_style_config(style, tpb):
-    """Parametri del `style` del Recomposer (durate/pause in ticks, fattore velocity, passo di pitch)."""
-    style_configs = {
-        "ambient":             {"note_dur_range": (tpb * 2, tpb * 6),  "gap_range": (tpb // 2, tpb * 2),
-                                "vel_factor": 0.6,  "pitch_step": 4},
-        "drone":               {"note_dur_range": (tpb * 4, tpb * 8),  "gap_range": (tpb, tpb * 3),
-                                "vel_factor": 0.5,  "pitch_step": 7},
-        "minimal":             {"note_dur_range": (tpb // 2, tpb * 2), "gap_range": (tpb // 4, tpb),
-                                "vel_factor": 0.7,  "pitch_step": 2},
-        "armonico":            {"note_dur_range": (tpb // 2, tpb),     "gap_range": (tpb // 8, tpb // 4),
-                                "vel_factor": 0.85, "pitch_step": 3},
-        "elettronico":         {"note_dur_range": (tpb // 4, tpb // 2), "gap_range": (tpb // 8, tpb // 4),
-                                "vel_factor": 0.9,  "pitch_step": 0},
-        "minimalismo_ritmico": {"note_dur_range": (tpb // 4, tpb // 2), "gap_range": (tpb // 2, tpb * 2),
-                                "vel_factor": 0.8,  "pitch_step": 5},
-        "sperimentale":        {"note_dur_range": (tpb // 8, tpb * 3), "gap_range": (0, tpb * 2),
-                                "vel_factor": 1.0,  "pitch_step": 0},
-    }
-    return style_configs.get(style, style_configs["minimal"])
-
-
-def _recomposer_total_ticks(midi, tpb):
-    """Durata in ticks = fine della MUSICA (ultima nota), non la fine grezza del file:
-    un end_of_track / marker molto oltre l'ultima nota allungherebbe l'output di minuti."""
-    total_ticks = midi_last_note_tick(midi)
-    if total_ticks == 0:
-        for track in midi.tracks:
-            total_ticks = max(total_ticks, sum(msg.time for msg in track))
-    if total_ticks == 0:
-        total_ticks = tpb * 4 * 32  # fallback 32 battute
-    return total_ticks
-
-
-def _recomposer_pitch_picker(rng, cfg, weighted_pool):
-    """Ritorna pick_pitch(base): sceglie il prossimo pitch dal pool (vocabolario della traccia)."""
-    # Indice per il "pitch piu' vicino": valori unici ordinati + prima posizione nel pool,
-    # cosi' la parita' si risolve come min() (vince il primo del pool) ma in O(log n).
-    uniq = sorted(set(weighted_pool))
-    first_pos = {}
-    for i, p in enumerate(weighted_pool):
-        first_pos.setdefault(p, i)
-
-    def nearest_in_pool(candidate):
-        k = bisect.bisect_left(uniq, candidate)
-        if k == 0:
-            return uniq[0]
-        if k == len(uniq):
-            return uniq[-1]
-        lo, hi = uniq[k - 1], uniq[k]
-        d_lo, d_hi = candidate - lo, hi - candidate
-        if d_lo < d_hi:
-            return lo
-        if d_hi < d_lo:
-            return hi
-        return lo if first_pos[lo] < first_pos[hi] else hi
-
-    def pick_pitch(base=None):
-        if base is None or cfg["pitch_step"] == 0:
-            return rng.choice(weighted_pool)
-        direction = rng.choice([-1, 1])
-        return nearest_in_pool(base + direction * cfg["pitch_step"])
-
-    return pick_pitch
-
-
-def _recomposer_build_track(rng, cfg, style, tpb, total_ticks, weighted_pool,
-                            vel_min, vel_max, channel, track_name, instrument_header=None):
-    """Costruisce una nuova traccia dal pool di pitch di una traccia originale."""
-    if not weighted_pool:
-        return None
-    pick_pitch = _recomposer_pitch_picker(rng, cfg, weighted_pool)
-
-    new_track = mido.MidiTrack()
-    new_track.name = track_name
-    for h in (instrument_header or []):
-        new_track.append(h)
-
-    events = []
-    current_tick = 0
-    last_pitch = rng.choice(weighted_pool)
-
-    while current_tick < total_ticks:
-        pitch = max(0, min(127, pick_pitch(last_pitch)))
-        vel   = max(1, min(127, int(rng.randint(vel_min, vel_max) * cfg["vel_factor"])))
-        dur   = rng.randint(*cfg["note_dur_range"])
-        gap   = rng.randint(*cfg["gap_range"])
-
-        # Per elettronico: snappa sulla griglia
-        if style == "elettronico":
-            grid = tpb // 4
-            current_tick = (current_tick // grid) * grid
-            dur = (dur // grid) * grid or grid
-
-        note_end = min(current_tick + dur, total_ticks)
-        events.append(("on",  current_tick, pitch, vel, channel))
-        events.append(("off", note_end,      pitch, 0,  channel))
-
-        last_pitch = pitch
-        current_tick += dur + gap
-
-    # Ordina: note_off prima di note_on allo stesso tick
-    events.sort(key=lambda e: (e[1], 0 if e[0] == "off" else 1))
-
-    last_t = 0
-    for kind, tick, p, v2, ch in events:
-        delta = max(0, tick - last_t)
-        if kind == "on":
-            new_track.append(mido.Message("note_on",  note=p, velocity=v2, channel=ch, time=delta))
-        else:
-            new_track.append(mido.Message("note_off", note=p, velocity=0,  channel=ch, time=delta))
-        last_t = tick
-    return new_track
-
-
-def _recomposer_vocabulary(orig_track):
-    """(pitch, velocity, canale) di tutte le note_on della traccia."""
-    pitches, velocities, channels = [], [], []
-    for msg in orig_track:
-        if msg.type == 'note_on' and msg.velocity > 0:
-            pitches.append(msg.note)
-            velocities.append(msg.velocity)
-            channels.append(msg.channel)
-    return pitches, velocities, channels
-
-
-def _recomposer_velocity_range(velocities):
-    vel_min, vel_max = min(velocities), max(velocities)
-    if vel_min > vel_max:
-        vel_min, vel_max = vel_max, vel_min
-    vel_min = max(1, vel_min)
-    vel_max = min(127, vel_max)
-    if vel_min == vel_max:
-        vel_min = max(1, vel_max - 10)
-    return vel_min, vel_max
-
-
-def _copy_track(track, name=None):
-    """Copia integrale di una traccia (opzionalmente rinominata)."""
-    out = mido.MidiTrack()
-    if name is not None:
-        out.name = name
-    for msg in track:
-        out.append(_clone(msg))
-    return out
-
-
 @_keeps_tempo_map
 def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
     """
@@ -2894,53 +2731,227 @@ def midi_recomposer(original_midi, style, preserve_drums=None, seed=None):
     """
     rng = _rng(seed, "recomposer")
     preserve = _drums_preserved(preserve_drums)
+    from collections import Counter
 
     # File tipo 0: esplodi canali in tracce separate prima di ricomporre
     if original_midi.type == 0 or (len(original_midi.tracks) == 1 and
-            len({m.channel for t in original_midi.tracks for m in t if hasattr(m, 'channel')}) > 1):
+            len({m.channel for t in original_midi.tracks for m in t if hasattr(m,'channel')}) > 1):
         original_midi = _split_type0_to_tracks(original_midi)
 
     tpb = original_midi.ticks_per_beat
-    total_ticks = _recomposer_total_ticks(original_midi, tpb)
-    cfg = _recomposer_style_config(style, tpb)
+
+    # Durata totale in ticks = fine della MUSICA (ultima nota), non la fine grezza del file:
+    # un end_of_track / marker molto oltre l'ultima nota allungherebbe l'output di minuti.
+    total_ticks = midi_last_note_tick(original_midi)
+    if total_ticks == 0:
+        for track in original_midi.tracks:
+            t = sum(msg.time for msg in track)
+            total_ticks = max(total_ticks, t)
+    if total_ticks == 0:
+        total_ticks = tpb * 4 * 32  # fallback 32 battute
+
+    # --- DEFINIZIONE STILI ---
+    style_configs = {
+        "ambient": {
+            "note_dur_range": (tpb * 2, tpb * 6),
+            "gap_range":      (tpb // 2, tpb * 2),
+            "vel_factor":     0.6,
+            "pitch_step":     4,
+        },
+        "drone": {
+            "note_dur_range": (tpb * 4, tpb * 8),
+            "gap_range":      (tpb, tpb * 3),
+            "vel_factor":     0.5,
+            "pitch_step":     7,
+        },
+        "minimal": {
+            "note_dur_range": (tpb // 2, tpb * 2),
+            "gap_range":      (tpb // 4, tpb),
+            "vel_factor":     0.7,
+            "pitch_step":     2,
+        },
+        "armonico": {
+            "note_dur_range": (tpb // 2, tpb),
+            "gap_range":      (tpb // 8, tpb // 4),
+            "vel_factor":     0.85,
+            "pitch_step":     3,
+        },
+        "elettronico": {
+            "note_dur_range": (tpb // 4, tpb // 2),
+            "gap_range":      (tpb // 8, tpb // 4),
+            "vel_factor":     0.9,
+            "pitch_step":     0,
+        },
+        "minimalismo_ritmico": {
+            "note_dur_range": (tpb // 4, tpb // 2),
+            "gap_range":      (tpb // 2, tpb * 2),
+            "vel_factor":     0.8,
+            "pitch_step":     5,
+        },
+        "sperimentale": {
+            "note_dur_range": (tpb // 8, tpb * 3),
+            "gap_range":      (0, tpb * 2),
+            "vel_factor":     1.0,
+            "pitch_step":     0,
+        },
+    }
+
+    cfg = style_configs.get(style, style_configs["minimal"])
+
+    def build_track_from_pool(weighted_pool, vel_min, vel_max, channel, track_name, instrument_header=None):
+        """Costruisce una nuova traccia dal pool di pitch di una traccia originale."""
+        if not weighted_pool:
+            return None
+
+        # Indice per il "pitch piu' vicino": valori unici ordinati + prima posizione nel pool,
+        # cosi' la parita' si risolve come min() (vince il primo del pool) ma in O(log n).
+        _uniq = sorted(set(weighted_pool))
+        _first_pos = {}
+        for _i, _p in enumerate(weighted_pool):
+            _first_pos.setdefault(_p, _i)
+
+        def _nearest_in_pool(candidate):
+            k = bisect.bisect_left(_uniq, candidate)
+            if k == 0:
+                return _uniq[0]
+            if k == len(_uniq):
+                return _uniq[-1]
+            lo, hi = _uniq[k - 1], _uniq[k]
+            d_lo, d_hi = candidate - lo, hi - candidate
+            if d_lo < d_hi:
+                return lo
+            if d_hi < d_lo:
+                return hi
+            return lo if _first_pos[lo] < _first_pos[hi] else hi
+
+        def pick_pitch(base=None):
+            if base is None or cfg["pitch_step"] == 0:
+                return rng.choice(weighted_pool)
+            direction = rng.choice([-1, 1])
+            candidate = base + direction * cfg["pitch_step"]
+            return _nearest_in_pool(candidate)
+
+        def pick_vel():
+            v = rng.randint(vel_min, vel_max)
+            return max(1, min(127, int(v * cfg["vel_factor"])))
+
+        new_track = mido.MidiTrack()
+        new_track.name = track_name
+        for _h in (instrument_header or []):
+            new_track.append(_h)
+
+        events = []
+        current_tick = 0
+        last_pitch = rng.choice(weighted_pool)
+
+        while current_tick < total_ticks:
+            pitch = pick_pitch(last_pitch)
+            pitch = max(0, min(127, pitch))
+            vel   = pick_vel()
+            dur   = rng.randint(*cfg["note_dur_range"])
+            gap   = rng.randint(*cfg["gap_range"])
+
+            # Per elettronico: snappa sulla griglia
+            if style == "elettronico":
+                grid = tpb // 4
+                current_tick = (current_tick // grid) * grid
+                dur = (dur // grid) * grid or grid
+
+            note_end = min(current_tick + dur, total_ticks)
+            events.append(("on",  current_tick, pitch, vel, channel))
+            events.append(("off", note_end,      pitch, 0,  channel))
+
+            last_pitch = pitch
+            current_tick += dur + gap
+
+        # Ordina: note_off prima di note_on allo stesso tick
+        events.sort(key=lambda e: (e[1], 0 if e[0] == "off" else 1))
+
+        last_t = 0
+        for ev in events:
+            kind, tick, p, v2, ch = ev
+            delta = max(0, tick - last_t)
+            if kind == "on":
+                new_track.append(mido.Message("note_on",  note=p, velocity=v2, channel=ch, time=delta))
+            else:
+                new_track.append(mido.Message("note_off", note=p, velocity=0,  channel=ch, time=delta))
+            last_t = tick
+
+        return new_track
 
     new_midi = mido.MidiFile(ticks_per_beat=tpb)
+
     for track_idx, orig_track in enumerate(original_midi.tracks):
+        # --- Estrai nome traccia originale ---
         track_name = orig_track.name if hasattr(orig_track, 'name') and orig_track.name else f"Track {track_idx}"
-        pitches, velocities, channels = _recomposer_vocabulary(orig_track)
+
+        # --- Estrai pitches, velocities, canale dominante ---
+        pitches    = []
+        velocities = []
+        channels   = []
+        has_meta_only = True
+
+        for msg in orig_track:
+            if msg.type == 'note_on' and msg.velocity > 0:
+                pitches.append(msg.note)
+                velocities.append(msg.velocity)
+                channels.append(msg.channel)
+                has_meta_only = False
+            elif msg.type not in ('note_on', 'note_off'):
+                pass  # meta / control — non nota
 
         # Traccia senza note (es. traccia metadati/tempo) → copiala intatta
-        if not pitches:
-            new_midi.tracks.append(_copy_track(orig_track, name=track_name))
+        if has_meta_only or not pitches:
+            meta_track = mido.MidiTrack()
+            meta_track.name = track_name
+            for msg in orig_track:
+                meta_track.append(_clone(msg))
+            new_midi.tracks.append(meta_track)
             continue
 
-        dominant_channel = Counter(channels).most_common(1)[0][0]
+        # --- Canale dominante della traccia ---
+        channel_counts = Counter(channels)
+        dominant_channel = channel_counts.most_common(1)[0][0]
 
         # Batteria: traccia copiata intatta
         if preserve and dominant_channel == DRUM_CHANNEL:
-            new_midi.tracks.append(_copy_track(orig_track))
+            kept = mido.MidiTrack()
+            for msg in orig_track:
+                kept.append(_clone(msg))
+            new_midi.tracks.append(kept)
             continue
 
-        # Header strumento (program_change/bank select) da preservare
-        header = _extract_instrument_header(orig_track)
+        # --- Header strumento (program_change/bank select) da preservare ---
+        _recomp_header = _extract_instrument_header(orig_track)
 
-        # Pool di pitch pesato
+        # --- Pool di pitch pesato ---
+        pitch_counts = Counter(pitches)
         weighted_pool = []
-        for pitch, count in Counter(pitches).items():
+        for pitch, count in pitch_counts.items():
             weighted_pool.extend([pitch] * max(1, count))
 
-        vel_min, vel_max = _recomposer_velocity_range(velocities)
-        new_track = _recomposer_build_track(
-            rng, cfg, style, tpb, total_ticks, weighted_pool, vel_min, vel_max,
-            dominant_channel, track_name, instrument_header=header)
+        vel_min = min(velocities)
+        vel_max = max(velocities)
+        if vel_min > vel_max: vel_min, vel_max = vel_max, vel_min
+        vel_min = max(1, vel_min)
+        vel_max = min(127, vel_max)
+        if vel_min == vel_max: vel_min = max(1, vel_max - 10)
 
-        if new_track is None:
+        # --- Costruisci nuova traccia ---
+        new_track = build_track_from_pool(
+            weighted_pool, vel_min, vel_max,
+            dominant_channel, track_name, instrument_header=_recomp_header
+        )
+
+        if new_track is not None:
+            new_midi.tracks.append(new_track)
+        else:
             # Fallback: traccia vuota con nome originale (e strumento preservato)
-            new_track = mido.MidiTrack()
-            new_track.name = track_name
-            for h in header:
-                new_track.append(h)
-        new_midi.tracks.append(new_track)
+            empty = mido.MidiTrack()
+            empty.name = track_name
+            for _h in _recomp_header:
+                empty.append(_h)
+            new_midi.tracks.append(empty)
 
     return new_midi
 
